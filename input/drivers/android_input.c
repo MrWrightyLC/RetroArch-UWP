@@ -103,7 +103,7 @@ enum {
  * writers bound incoming keycodes, readers bound bind keysyms. */
 static uint8_t android_key_state[DEFAULT_MAX_PADS + 1][MAX_KEYS];
 
-#define ANDROID_KEYBOARD_PORT_INPUT_PRESSED(binds, id) (BIT_GET(android_key_state[ANDROID_KEYBOARD_PORT], rarch_keysym_lut[(binds)[(id)].key]))
+#define ANDROID_KEYBOARD_PORT_INPUT_PRESSED(binds, id) (BIT_GET(android_key_state[ANDROID_KEYBOARD_PORT], rarch_keysym_lut[RETRO_KEYBIND_KEY(&(binds)[(id)])]))
 
 #define ANDROID_KEYBOARD_INPUT_PRESSED(key) (BIT_GET(android_key_state[0], (key)))
 
@@ -308,6 +308,10 @@ bool android_keyboard_start(char **buffer_ptr, size_t *size_ptr,
    android_kbd_open       = true;
    slock_unlock(android_kbd_lock);
 
+   /* Suppress the built-in OSK for as long as the IME owns the line;
+    * without this both are drawn at once and both consume input. */
+   input_state_get_ptr()->flags |= INP_FLAG_NATIVE_KB_SHOWN;
+
    if ((env = jni_thread_getenv()))
    {
       jstring jlabel = label ? (*env)->NewStringUTF(env, label) : NULL;
@@ -335,6 +339,8 @@ void android_keyboard_end(void)
 
    if (!android_kbd_open || !android_kbd_lock)
       return;
+
+   input_state_get_ptr()->flags &= ~INP_FLAG_NATIVE_KB_SHOWN;
 
    slock_lock(android_kbd_lock);
    android_kbd_open       = false;
@@ -421,6 +427,7 @@ void android_keyboard_poll(void)
          android_kbd_open     = false;
          android_kbd_dirty    = false;
          android_kbd_finished = false;
+         input_state_get_ptr()->flags &= ~INP_FLAG_NATIVE_KB_SHOWN;
       }
       slock_unlock(android_kbd_lock);
    }
@@ -1115,6 +1122,12 @@ static void *android_input_init(const char *joypad_driver)
    android->quick_tap_time = 0;
 
    input_keymaps_init_keyboard_lut(rarch_key_map_android);
+
+   /* The IME is only reachable if the Java side resolved showKeyboard. */
+   if (android_app && android_app->showKeyboard)
+      input_state_get_ptr()->flags |=  INP_FLAG_NATIVE_KB_AVAIL;
+   else
+      input_state_get_ptr()->flags &= ~INP_FLAG_NATIVE_KB_AVAIL;
 
    frontend_android_get_version_sdk(&sdk);
 
@@ -2693,9 +2706,9 @@ static int16_t android_input_state(
             {
                for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
                {
-                  if (binds[port][i].valid)
+                  if (RETRO_KEYBIND_VALID(&binds[port][i]))
                   {
-                     if (     (binds[port][i].key && binds[port][i].key < RETROK_LAST)
+                     if (     (RETRO_KEYBIND_KEY(&binds[port][i]) && RETRO_KEYBIND_KEY(&binds[port][i]) < RETROK_LAST)
                            && ANDROID_KEYBOARD_PORT_INPUT_PRESSED(binds[port], i))
                         ret |= (1 << i);
                   }
@@ -2707,9 +2720,9 @@ static int16_t android_input_state(
 
          if (id < RARCH_BIND_LIST_END)
          {
-            if (binds[port][id].valid)
+            if (RETRO_KEYBIND_VALID(&binds[port][id]))
             {
-               if (     (binds[port][id].key && binds[port][id].key < RETROK_LAST)
+               if (     (RETRO_KEYBIND_KEY(&binds[port][id]) && RETRO_KEYBIND_KEY(&binds[port][id]) < RETROK_LAST)
                      && ANDROID_KEYBOARD_PORT_INPUT_PRESSED(binds[port], id)
                      && (id == RARCH_GAME_FOCUS_TOGGLE || !keyboard_mapping_blocked)
                      )
@@ -2885,6 +2898,10 @@ static void android_input_free_input(void *data)
    android_keycode_map_free((JNIEnv*)jni_thread_getenv());
 
    android_keyboard_free();
+
+   input_state_get_ptr()->flags &=
+      ~(INP_FLAG_NATIVE_KB_SHOWN | INP_FLAG_NATIVE_KB_AVAIL);
+
    free(data);
 }
 

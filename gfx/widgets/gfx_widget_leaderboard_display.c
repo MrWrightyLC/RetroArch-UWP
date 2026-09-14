@@ -432,7 +432,7 @@ static void gfx_widget_leaderboard_display_frame(void* data, void* userdata)
 #endif
 }
 
-void gfx_widgets_clear_leaderboard_displays(void)
+static void gfx_widgets_clear_leaderboard_displays_state(void)
 {
    gfx_widget_leaderboard_display_state_t* state = &p_w_leaderboard_display_st;
 
@@ -447,7 +447,14 @@ void gfx_widgets_clear_leaderboard_displays(void)
 #endif
 }
 
-void gfx_widgets_set_leaderboard_display(unsigned id, const char* value)
+void gfx_widgets_clear_leaderboard_displays(void)
+{
+   gfx_widgets_state_lock();
+   gfx_widgets_clear_leaderboard_displays_state();
+   gfx_widgets_state_unlock();
+}
+
+static void gfx_widgets_set_leaderboard_display_state(unsigned id, const char* value)
 {
    unsigned i;
    gfx_widget_leaderboard_display_state_t *state = &p_w_leaderboard_display_st;
@@ -528,7 +535,14 @@ void gfx_widgets_set_leaderboard_display(unsigned id, const char* value)
 #endif
 }
 
-void gfx_widgets_clear_challenge_displays(void)
+void gfx_widgets_set_leaderboard_display(unsigned id, const char* value)
+{
+   gfx_widgets_state_lock();
+   gfx_widgets_set_leaderboard_display_state(id, value);
+   gfx_widgets_state_unlock();
+}
+
+static void gfx_widgets_clear_challenge_displays_state(void)
 {
    gfx_widget_leaderboard_display_state_t* state = &p_w_leaderboard_display_st;
 
@@ -543,7 +557,14 @@ void gfx_widgets_clear_challenge_displays(void)
 #endif
 }
 
-void gfx_widgets_set_challenge_display(unsigned id, const char* badge)
+void gfx_widgets_clear_challenge_displays(void)
+{
+   gfx_widgets_state_lock();
+   gfx_widgets_clear_challenge_displays_state();
+   gfx_widgets_state_unlock();
+}
+
+static void gfx_widgets_set_challenge_display_state(unsigned id, const char* badge)
 {
    unsigned i;
    gfx_widget_leaderboard_display_state_t* state = &p_w_leaderboard_display_st;
@@ -612,7 +633,14 @@ void gfx_widgets_set_challenge_display(unsigned id, const char* badge)
       video_driver_texture_unload(&old_badge_id);
 }
 
-void gfx_widget_set_achievement_progress(const char* badge, const char* progress)
+void gfx_widgets_set_challenge_display(unsigned id, const char* badge)
+{
+   gfx_widgets_state_lock();
+   gfx_widgets_set_challenge_display_state(id, badge);
+   gfx_widgets_state_unlock();
+}
+
+static void gfx_widget_set_achievement_progress_state(const char* badge, const char* progress)
 {
    gfx_widget_leaderboard_display_state_t* state = &p_w_leaderboard_display_st;
    uintptr_t old_badge_id = state->progress_tracker.image;
@@ -642,16 +670,37 @@ void gfx_widget_set_achievement_progress(const char* badge, const char* progress
       video_driver_texture_unload(&old_badge_id);
 }
 
-void gfx_widget_set_cheevos_disconnect(bool value)
+void gfx_widget_set_achievement_progress(const char* badge, const char* progress)
+{
+   gfx_widgets_state_lock();
+   gfx_widget_set_achievement_progress_state(badge, progress);
+   gfx_widgets_state_unlock();
+}
+
+static void gfx_widget_set_cheevos_disconnect_state(bool value)
 {
    gfx_widget_leaderboard_display_state_t* state = &p_w_leaderboard_display_st;
    state->disconnected = value;
 }
 
-void gfx_widget_set_cheevos_set_loading(bool value)
+void gfx_widget_set_cheevos_disconnect(bool value)
+{
+   gfx_widgets_state_lock();
+   gfx_widget_set_cheevos_disconnect_state(value);
+   gfx_widgets_state_unlock();
+}
+
+static void gfx_widget_set_cheevos_set_loading_state(bool value)
 {
    gfx_widget_leaderboard_display_state_t* state = &p_w_leaderboard_display_st;
    state->loading = value ? 1 : 0;
+}
+
+void gfx_widget_set_cheevos_set_loading(bool value)
+{
+   gfx_widgets_state_lock();
+   gfx_widget_set_cheevos_set_loading_state(value);
+   gfx_widgets_state_unlock();
 }
 
 

@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <android/native_window.h>
 
+#include <compat/strl.h>
+
 #include "../../verbosity.h"
 #include "../video_display_server.h"
 #include "../../frontend/drivers/platform_unix.h"
@@ -575,5 +577,6 @@ const video_display_server_t dispserv_android = {
    NULL, /* modeline_delete */
    NULL, /* modeline_set */
    NULL, /* modeline_flush */
+   NULL, /* get_edid */
    "android"
 };

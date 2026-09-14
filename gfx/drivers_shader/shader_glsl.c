@@ -19,8 +19,6 @@
 
 #include <compat/strl.h>
 #include <compat/posix_string.h>
-#include <file/file_path.h>
-#include <streams/file_stream.h>
 #include <string/stdstring.h>
 
 #ifdef HAVE_CONFIG_H
@@ -33,6 +31,7 @@
 #endif
 
 #include "shader_glsl.h"
+#include "../video_shader_parse.h"
 #ifdef HAVE_REWIND
 #include "../../state_manager.h"
 #endif
@@ -103,6 +102,7 @@ struct shader_uniforms
    int final_vp_size;
 
    int frame_count;
+   int swap_count;
    int frame_direction;
    int frame_time_delta;
    float original_fps;
@@ -520,7 +520,7 @@ static bool gl_glsl_compile_program(
       if (!gl_glsl_compile_shader(
                glsl,
                program->vprg,
-               "#define VERTEX\n#define PARAMETER_UNIFORM\n#define _HAS_ORIGINALASPECT_UNIFORMS\n#define _HAS_FRAMETIME_UNIFORMS\n#define _HAS_SENSOR_UNIFORMS\n",
+               "#define VERTEX\n#define PARAMETER_UNIFORM\n#define _HAS_ORIGINALASPECT_UNIFORMS\n#define _HAS_FRAMETIME_UNIFORMS\n#define _HAS_SENSOR_UNIFORMS\n#define _HAS_SWAPCOUNT_UNIFORM\n",
                program_info->vertex))
       {
          RARCH_ERR("[GLSL] Failed to compile vertex shader #%u.\n", idx);
@@ -535,7 +535,7 @@ static bool gl_glsl_compile_program(
       RARCH_LOG("[GLSL] Found GLSL fragment shader.\n");
       program->fprg = glCreateShader(GL_FRAGMENT_SHADER);
       if (!gl_glsl_compile_shader(glsl, program->fprg,
-               "#define FRAGMENT\n#define PARAMETER_UNIFORM\n#define _HAS_ORIGINALASPECT_UNIFORMS\n#define _HAS_FRAMETIME_UNIFORMS\n#define _HAS_SENSOR_UNIFORMS\n",
+               "#define FRAGMENT\n#define PARAMETER_UNIFORM\n#define _HAS_ORIGINALASPECT_UNIFORMS\n#define _HAS_FRAMETIME_UNIFORMS\n#define _HAS_SENSOR_UNIFORMS\n#define _HAS_SWAPCOUNT_UNIFORM\n",
                program_info->fragment))
       {
          RARCH_ERR("[GLSL] Failed to compile fragment shader #%u.\n", idx);
@@ -599,11 +599,14 @@ static void gl_glsl_strip_parameter_pragmas(char *source, const char *str)
 static bool gl_glsl_load_source_path(struct video_shader_pass *pass,
       const char *path)
 {
-   int64_t len    = 0;
-   int64_t nitems = pass ? filestream_read_file(path,
-         (void**)&pass->source.string.vertex, &len) : 0;
+   int64_t len = 0;
 
-   if (nitems <= 0 || len <= 0)
+   /* Asked for by name: this driver does not open it. What comes back
+    * is ours to free, as before. */
+   if (     !pass
+         || !video_shader_source_read(path,
+               &pass->source.string.vertex, &len)
+         || len <= 0)
       return false;
 
    gl_glsl_strip_parameter_pragmas(pass->source.string.vertex,
@@ -799,6 +802,7 @@ static void gl_glsl_find_uniforms(glsl_shader_data_t *glsl,
    uni->final_vp_size    = gl_glsl_get_uniform(glsl, prog, "FinalViewportSize");
 
    uni->frame_count      = gl_glsl_get_uniform(glsl, prog, "FrameCount");
+   uni->swap_count       = gl_glsl_get_uniform(glsl, prog, "SwapCount");
    uni->frame_direction  = gl_glsl_get_uniform(glsl, prog, "FrameDirection");
    uni->frame_time_delta = gl_glsl_get_uniform(glsl, prog, "FrameTimeDelta");
    uni->original_fps         = gl_glsl_get_uniform(glsl, prog, "OriginalFPS");
@@ -1436,6 +1440,11 @@ static void gl_glsl_set_params(void *dat, void *shader_data)
 
       glUniform1i(uni->frame_count, frame_count);
    }
+
+   /* Not modulo'd: SwapCount counts what the display was shown, so a
+    * pass's frame_count_mod has nothing to say about it. */
+   if (uni->swap_count >= 0)
+      glUniform1i(uni->swap_count, (int)params->swap_counter);
 
    if (uni->frame_direction >= 0)
    {

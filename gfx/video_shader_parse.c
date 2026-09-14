@@ -209,10 +209,9 @@ static void video_shader_replace_wildcards_impl(
                      fill_pathname_parent_dir_name(content_dir_name,
                            rarch_path_basename,
                            sizeof(content_dir_name));
-                  if (content_dir_name[0] != '\0')
-                     strlcpy(content_dir_name,
-                           path_basename_nocompression(content_dir_name),
-                           sizeof(content_dir_name));
+                  /* fill_pathname_parent_dir_name() yields a bare
+                   * directory name, so there is no directory part
+                   * left to strip here. */
                   if (content_dir_name[0] != '\0')
                      path_remove_extension(content_dir_name);
 
@@ -298,10 +297,6 @@ static void video_shader_replace_wildcards_impl(
                   char preset_dir_name[DIR_MAX_LENGTH];
                   fill_pathname_parent_dir_name(preset_dir_name,
                         in_preset_path, sizeof(preset_dir_name));
-                  if (preset_dir_name[0] != '\0')
-                     strlcpy(preset_dir_name,
-                           path_basename_nocompression(preset_dir_name),
-                           sizeof(preset_dir_name));
                   if (preset_dir_name[0] != '\0')
                      path_remove_extension(preset_dir_name);
                   if (preset_dir_name[0] != '\0')
@@ -1029,9 +1024,147 @@ static struct video_shader_parameter *video_shader_parse_find_parameter(
  * from the #pragma parameter lines in the shader for each pass.
  *
  **/
+bool video_shader_source_resolve(const char *parent, const char *name,
+      char *s, size_t len)
+{
+   if (!name || !*name || !s || !len)
+      return false;
+
+   s[0] = '\0';
+
+   /* No parent: the reference is already a name of its own. */
+   if (!parent || !*parent)
+   {
+      strlcpy(s, name, len);
+      return true;
+   }
+
+   fill_pathname_resolve_relative(s, parent, name, len);
+   return s[0] != '\0';
+}
+
+const char *video_shader_source_ident_name(const char *ident)
+{
+   if (!ident || !*ident)
+      return NULL;
+   return path_basename_nocompression(ident);
+}
+
+bool video_shader_source_ident_is_slang(const char *ident)
+{
+   if (!ident || !*ident)
+      return false;
+   return string_is_equal(path_get_extension(ident), "slang");
+}
+
+bool video_shader_source_read(const char *ident, char **buf, int64_t *len)
+{
+   int64_t n  = 0;
+   void   *data = NULL;
+
+   if (!ident || !*ident || !buf)
+      return false;
+
+   *buf = NULL;
+   if (len)
+      *len = 0;
+
+   /* filestream_read_file() NUL terminates what it hands back, which
+    * is what a compiler wants of a source. */
+   if (!filestream_read_file(ident, &data, &n) || n <= 0)
+   {
+      if (data)
+         free(data);
+      return false;
+   }
+
+   *buf = (char*)data;
+   if (len)
+      *len = n;
+   return true;
+}
+
+/**
+ * video_shader_param_sources_changed:
+ * @shader            : Shader passes handle.
+ *
+ * Stamps @shader with the identity of every pass source its parameters
+ * are about to be resolved from - path, size and modification time, in
+ * pass order - and reports whether that is something other than what
+ * the stamp held.
+ *
+ * The stamp is taken ahead of the read, so a source rewritten while the
+ * walk is in progress is stamped as it stood beforehand and is read
+ * again on the next call.
+ *
+ * @return true if the parameters have to be resolved from the sources.
+ **/
+static bool video_shader_param_sources_changed(struct video_shader *shader)
+{
+   size_t i;
+   unsigned n   = 0;
+   bool changed = false;
+
+   for (i = 0; i < shader->passes; i++)
+   {
+      const char *path = shader->pass[i].source.path;
+      int64_t mtime    = 0;
+      int64_t size     = 0;
+      uint32_t hash    = 0;
+
+      if (!path || !*path)
+         continue;
+
+      /* A pass count past the stamp leaves nothing to compare the
+       * remainder against, so the whole set is resolved. */
+      if (n >= ARRAY_SIZE(shader->param_src_hash))
+      {
+         changed = true;
+         break;
+      }
+
+      hash = djb2_calculate(path);
+      size = path_get_size(path);
+
+      /* With no modification time there is nothing that distinguishes
+       * an edit in place, so such a source is read every time. */
+      if (!path_get_mtime(path, &mtime))
+         changed = true;
+
+      if (     shader->param_src_hash[n]  != hash
+            || shader->param_src_size[n]  != size
+            || shader->param_src_mtime[n] != mtime)
+         changed = true;
+
+      shader->param_src_hash[n]  = hash;
+      shader->param_src_size[n]  = size;
+      shader->param_src_mtime[n] = mtime;
+      n++;
+   }
+
+   if (shader->param_src_count != n)
+      changed = true;
+
+   shader->param_src_count = n;
+
+   return changed;
+}
+
 void video_shader_resolve_parameters(struct video_shader *shader)
 {
    size_t i;
+
+   /* A pass contributes what its source declares, so a walk over the
+    * same sources yields the same set again and only the reset to
+    * initial values is still owed. This is what holds nudging the pass
+    * count in the menu - which appends or drops a pass carrying no
+    * source of its own - to a stat per pass. */
+   if (!video_shader_param_sources_changed(shader))
+   {
+      for (i = 0; i < shader->num_parameters; i++)
+         shader->parameters[i].current = shader->parameters[i].initial;
+      return;
+   }
 
    shader->num_parameters = 0;
 
@@ -1057,7 +1190,7 @@ void video_shader_resolve_parameters(struct video_shader *shader)
           * it should be the same implementation, but supporting
           * #include directives */
          slang_preprocess_parse_parameters_cached(path, shader,
-               include_cache);
+               (unsigned)i, include_cache);
       }
 
       glslang_include_cache_free(include_cache);
@@ -1071,11 +1204,12 @@ void video_shader_resolve_parameters(struct video_shader *shader)
          uint8_t *buf                 = NULL;
          int64_t buf_len              = 0;
 
-         if (!path || !*path || !path_is_valid(path))
+         if (!path || !*path)
             continue;
 
-         /* Read file contents */
-         if (filestream_read_file(path, (void**)&buf, &buf_len))
+         /* Through the same door the drivers use, so a source is
+          * fetched one way whoever wants it */
+         if (video_shader_source_read(path, (char**)&buf, &buf_len))
          {
             size_t line_index         = 0;
             struct string_list lines  = {0};

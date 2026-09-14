@@ -187,7 +187,15 @@ enum input_driver_state_flags
    INP_FLAG_DEFERRED_WAIT_KEYS       = (1 << 8),
    INP_FLAG_WAIT_INPUT_RELEASE       = (1 << 9),
    INP_FLAG_MENU_PRESS_PENDING       = (1 << 10),
-   INP_FLAG_MENU_PRESS_CANCEL        = (1 << 11)
+   INP_FLAG_MENU_PRESS_CANCEL        = (1 << 11),
+   /* A system-provided keyboard panel is on screen and owns text
+    * entry. Set and cleared by whichever input driver put it there,
+    * once per poll; read through input_osk_native_active(). */
+   INP_FLAG_NATIVE_KB_SHOWN          = (1 << 12),
+   /* This device has a native keyboard panel the frontend could use
+    * in place of the built-in OSK. Published the same way; read
+    * through input_osk_native_available(). */
+   INP_FLAG_NATIVE_KB_AVAIL          = (1 << 13)
 };
 
 #ifdef HAVE_BSV_MOVIE
@@ -588,6 +596,12 @@ typedef struct
    const input_device_driver_t   *secondary_joypad;      /* ptr alignment */
    const retro_keybind_set *libretro_input_binds[MAX_USERS];
 #ifdef HAVE_COMMAND
+   /* Bumped whenever the command interfaces below are torn down. A
+    * command that reinitialises the input driver - LOAD_CONTENT,
+    * DRIVERS_REINIT - frees the very object whose poll dispatched it;
+    * the dispatcher compares this before and after and stops when it
+    * has changed rather than touch that object again. */
+   unsigned command_generation;
    command_t *command[MAX_CMD_DRIVERS];
 #endif
 #ifdef HAVE_BSV_MOVIE
@@ -1207,6 +1221,9 @@ const char *joypad_driver_name(unsigned i);
 void joypad_driver_reinit(void *data, const char *joypad_driver_name);
 
 #ifdef HAVE_COMMAND
+/* See command_generation in input_driver_state_t. */
+unsigned input_driver_command_generation(void);
+
 void input_driver_init_command(
       input_driver_state_t *input_st,
       settings_t *settings);

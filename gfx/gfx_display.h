@@ -134,6 +134,12 @@ typedef struct gfx_display_ctx_driver
    enum gfx_display_driver_type type;
    const char *ident;
    bool handles_transform;
+   /* Whether a draw may carry more geometry than one quad's four
+    * vertices. A driver that walks coords->vertices can take a strip
+    * of them in one call; one that reads a fixed four - because it
+    * ends in a blit rather than a rasteriser - must be handed a quad
+    * at a time. */
+   bool handles_vertex_strip;
    /* Enables and disables scissoring */
    void (*scissor_begin)(void *data, unsigned video_width,
          unsigned video_height,
@@ -262,6 +268,10 @@ void gfx_display_draw_bg(
       struct video_coords *coords,
       void *userdata,
       bool add_opacity, float opacity_override);
+
+void gfx_display_draw(gfx_display_ctx_driver_t *dispctx,
+      gfx_display_ctx_draw_t *draw, void *userdata,
+      unsigned video_width, unsigned video_height);
 
 void gfx_display_draw_quad(
       gfx_display_t *p_disp,

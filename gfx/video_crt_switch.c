@@ -106,12 +106,12 @@ static void crt_aspect_ratio_switch(
    /* We only force aspect ratio for the core provided setting */
    if (video_aspect_ratio_idx != ASPECT_RATIO_CORE)
    {
-      RARCH_LOG("[CRT] Aspect ratio forced by user: %f.\n", video_st->aspect_ratio);
+      RARCH_LOG("[CRT] Aspect ratio forced by user: %f.\n", VIDEO_DRIVER_ASPECT_RATIO(video_st));
       return;
    }
 
    /* Send aspect float to video_driver */
-   video_st->aspect_ratio         = fly_aspect;
+   video_driver_aspect_ratio_put(&video_st->aspect_ratio_bits, fly_aspect);
    RARCH_LOG("[CRT] Setting aspect ratio: %f.\n", fly_aspect);
    RARCH_LOG("[CRT] Setting screen size: %dx%d.\n",
          width, height);
@@ -201,6 +201,12 @@ static void crt_apply_menu_preset(videocrt_switch_t *p_switch,
       case 4:
          RARCH_LOG("[CRT] CRT mode: %d - Selected from ini.\n", crt_mode);
          break;
+      case 5:
+         /* The range limits the display reports; the block itself is
+          * read once the display server is bound */
+         modeline_set_monitor(p_switch->gen, "edid");
+         RARCH_LOG("[CRT] CRT mode: %d - edid.\n", crt_mode);
+         break;
       default:
          break;
    }
@@ -248,6 +254,53 @@ static bool crt_load_config_ini(videocrt_switch_t *p_switch)
    modeline_ini_load(p_switch->gen, ini_file);
    modeline_parse_options(p_switch->gen);
    return true;
+}
+
+/* Point the ops table at the display server instance that is up
+ * right now and open its modeline path. The instance is torn down
+ * and rebuilt under a full video init (content load and close go
+ * through the main deinit), so this runs at engine init and again
+ * after crt_switch_display_server_lost() dropped the old table. */
+static void crt_bind_display_server(videocrt_switch_t *p_switch)
+{
+   video_modeline_gen_t *gen = p_switch->gen;
+
+   memset(&p_switch->ops, 0, sizeof(p_switch->ops));
+   p_switch->ops_valid = false;
+   p_switch->ops_lost  = false;
+   if (!p_switch->khr_ctx && video_display_server_get_modeline_ops(&p_switch->ops))
+   {
+      if (p_switch->ops.open && !p_switch->ops.open(p_switch->ops.data, &gen->disp))
+      {
+         RARCH_ERR("[CRT] Display server could not open the modeline path, generating only.\n");
+         memset(&p_switch->ops, 0, sizeof(p_switch->ops));
+      }
+      else
+         p_switch->ops_valid = true;
+   }
+   p_switch->ops.name = p_switch->ops_valid ? video_display_server_get_ident() : "dummy";
+}
+
+void crt_switch_display_server_lost(videocrt_switch_t *p_switch, void *data)
+{
+   if (!p_switch->gen || !p_switch->ops_valid || p_switch->ops.data != data)
+      return;
+
+   /* The server closes its modeline path as it goes down, which
+    * puts the desktop timing back on the wire, and the ops table
+    * points into memory that is about to be freed. Drop the table,
+    * forget what was current, and make the next frame's request
+    * look new so the mode is applied again through the rebound
+    * server. */
+   memset(&p_switch->ops, 0, sizeof(p_switch->ops));
+   p_switch->ops.name       = "dummy";
+   p_switch->ops_valid      = false;
+   p_switch->ops_lost       = true;
+   p_switch->gen->current   = NULL;
+   p_switch->ra_tmp_height  = 0;
+   p_switch->ra_tmp_width   = 0;
+   p_switch->ra_tmp_core_hz = 0.0f;
+   RARCH_LOG("[CRT] Display server going down, rebinding on the next switch.\n");
 }
 
 static bool crt_engine_init(videocrt_switch_t *p_switch,
@@ -299,19 +352,44 @@ static bool crt_engine_init(videocrt_switch_t *p_switch,
       modeline_ini_load(gen, "display0.ini");
       modeline_parse_options(gen);
 
-      memset(&p_switch->ops, 0, sizeof(p_switch->ops));
-      p_switch->ops_valid = false;
-      if (!p_switch->khr_ctx && video_display_server_get_modeline_ops(&p_switch->ops))
+      crt_bind_display_server(p_switch);
+
+      /* The display's EDID, now that a server is up to read it; the
+       * "edid" preset (menu mode or an ini's monitor line) takes its
+       * ranges from it */
       {
-         if (p_switch->ops.open && !p_switch->ops.open(p_switch->ops.data, &gen->disp))
+         int n = video_display_server_get_edid(gen->edid, sizeof(gen->edid));
+         gen->edid_len = n > 0 ? (size_t)n : 0;
+         if (!strcmp(gen->monitor, "edid"))
          {
-            RARCH_ERR("[CRT] Display server could not open the modeline path, generating only.\n");
-            memset(&p_switch->ops, 0, sizeof(p_switch->ops));
+            if (gen->edid_len)
+            {
+               int i;
+               double hmax = 0.0;
+               int want    = gen->super_width;
+               int fit;
+               modeline_set_monitor(gen, "edid");
+               /* The super resolution the block's maximum pixel clock
+                * can carry at the top of the display's horizontal
+                * band; a wider one the user chose is stepped down
+                * rather than handed to the display as a mode it will
+                * reject */
+               for (i = 0; i < MODELINE_MAX_RANGES; i++)
+                  if (gen->range[i].hfreq_max > hmax)
+                     hmax = gen->range[i].hfreq_max;
+               fit = modeline_edid_super_width(gen->edid, gen->edid_len, hmax, want);
+               if (want > 2 && fit != want)
+               {
+                  RARCH_LOG("[CRT] Super width %d exceeds the display's stated pixel clock at %.1f kHz; using %d.\n",
+                        want, hmax / 1000.0, fit);
+                  modeline_set_user_mode(gen, fit, 0, 0);
+                  gen->super_width = fit;
+               }
+            }
+            else
+               RARCH_WARN("[CRT] The display server could not read the display's EDID; the edid preset falls back to generic_15.\n");
          }
-         else
-            p_switch->ops_valid = true;
       }
-      p_switch->ops.name = p_switch->ops_valid ? video_display_server_get_ident() : "dummy";
 
       p_switch->rtn = modeline_list_init(gen, &p_switch->ops) ? 0 : -1;
       RARCH_LOG("[CRT] Engine rtn %d.\n", p_switch->rtn);
@@ -324,6 +402,14 @@ static bool crt_engine_init(videocrt_switch_t *p_switch,
          crt_load_config_ini(p_switch);
          crt_apply_server_policy(p_switch);
       }
+   }
+
+   else if (p_switch->ops_lost && p_switch->rtn >= 0)
+   {
+      /* Engine alive, display server rebuilt underneath it */
+      crt_bind_display_server(p_switch);
+      if (p_switch->ops_valid)
+         RARCH_LOG("[CRT] Rebound to display server \"%s\".\n", p_switch->ops.name);
    }
 
    if (p_switch->rtn >= 0)
@@ -384,7 +470,7 @@ static void switch_res_crt(
             we update the current values and make adjustments */
          strlcpy(core_name,   current_core_name,   sizeof(core_name));
          strlcpy(content_dir, current_content_dir, sizeof(content_dir));
-         strlcpy(content_name, current_content_name, sizeof(current_content_name));
+         strlcpy(content_name, current_content_name, sizeof(content_name));
          RARCH_LOG("[CRT] Current running core: %s.\n", core_name);
          crt_adjust_ini(p_switch);
          p_switch->hh_core = false;
@@ -547,6 +633,7 @@ void crt_destroy_modes(videocrt_switch_t *p_switch)
    }
    memset(&p_switch->ops, 0, sizeof(p_switch->ops));
    p_switch->ops_valid = false;
+   p_switch->ops_lost  = false;
 }
 
 void crt_switch_res_core(
@@ -623,7 +710,7 @@ void crt_switch_res_core(
          video_driver_state_t *video_st = video_state_get_ptr();
          float fly_aspect               = (float)p_switch->fly_aspect;
          RARCH_LOG("[CRT] Restoring aspect ratio: %f.\n", fly_aspect);
-         video_st->aspect_ratio         = fly_aspect;
+         video_driver_aspect_ratio_put(&video_st->aspect_ratio_bits, fly_aspect);
          command_event(CMD_EVENT_VIDEO_APPLY_STATE_CHANGES, NULL);
       }
    }

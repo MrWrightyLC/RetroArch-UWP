@@ -536,6 +536,7 @@ struct menu_state
    unsigned input_driver_flushing_input;
    menu_dialog_t dialog_st;
    enum menu_action prev_action;
+   enum menu_input_dialog_kb_text_type input_dialog_kb_text_type;
 #ifdef HAVE_RUNAHEAD
    unsigned int runahead_mode;
 #endif
@@ -569,6 +570,12 @@ struct menu_state
    char input_dialog_kb_label[256];
 #endif
    unsigned char kb_key_state[RETROK_LAST];
+
+   /* The entry generic_menu_iterate() looks at once a frame. Here
+    * rather than on its stack: a menu_entry_t is 3872 bytes, which put
+    * that frame at 4312 where this tree allows four thousand. One is
+    * looked at a time, on the thread that iterates. */
+   menu_entry_t iterate_entry;
 };
 
 typedef struct menu_content_ctx_defer_info

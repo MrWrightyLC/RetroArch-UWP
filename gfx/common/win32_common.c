@@ -29,6 +29,75 @@
 #define IDI_ICON 1
 
 #include <windows.h>
+#ifndef _XBOX
+/* win32_dwm_last_vblank_time() reads the compositor's last vblank
+ * through DwmGetCompositionTimingInfo, resolved at runtime: dwmapi is
+ * not linked, and its header is not included either, since the SDKs
+ * the oldest MSVC job builds with do not have it. The structure below
+ * is DWM_TIMING_INFO exactly as the SDK lays it out; only cbSize and
+ * qpcVBlank are read, but the size must match for the call to accept
+ * it, so every field is here. UNSIGNED_RATIO is two UINT32s, and the
+ * SDK declares the whole thing byte-packed, which changes its size. */
+#pragma pack(push, 1)
+typedef struct
+{
+   UINT32 uiNumerator;
+   UINT32 uiDenominator;
+} win32_dwm_ratio_t;
+
+typedef struct
+{
+   UINT32 cbSize;
+   win32_dwm_ratio_t rateRefresh;
+   ULONGLONG qpcRefreshPeriod;
+   win32_dwm_ratio_t rateCompose;
+   ULONGLONG qpcVBlank;
+   ULONGLONG cRefresh;
+   UINT cDXRefresh;
+   ULONGLONG qpcCompose;
+   ULONGLONG cFrame;
+   UINT cDXPresent;
+   ULONGLONG cRefreshFrame;
+   ULONGLONG cFrameSubmitted;
+   UINT cDXPresentSubmitted;
+   ULONGLONG cFrameConfirmed;
+   UINT cDXPresentConfirmed;
+   ULONGLONG cRefreshConfirmed;
+   UINT cDXRefreshConfirmed;
+   ULONGLONG cFramesLate;
+   UINT cFramesOutstanding;
+   ULONGLONG cFrameDisplayed;
+   ULONGLONG qpcFrameDisplayed;
+   ULONGLONG cRefreshFrameDisplayed;
+   ULONGLONG cFrameComplete;
+   ULONGLONG qpcFrameComplete;
+   ULONGLONG cFramePending;
+   ULONGLONG qpcFramePending;
+   ULONGLONG cFramesDisplayed;
+   ULONGLONG cFramesComplete;
+   ULONGLONG cFramesPending;
+   ULONGLONG cFramesAvailable;
+   ULONGLONG cFramesDropped;
+   ULONGLONG cFramesMissed;
+   ULONGLONG cRefreshNextDisplayed;
+   ULONGLONG cRefreshNextPresented;
+   ULONGLONG cRefreshesDisplayed;
+   ULONGLONG cRefreshesPresented;
+   ULONGLONG cRefreshStarted;
+   ULONGLONG cPixelsReceived;
+   ULONGLONG cPixelsDrawn;
+   ULONGLONG cBuffersEmpty;
+} win32_dwm_timing_info_t;
+#pragma pack(pop)
+
+/* Where the SDK header exists, the local layout is checked against it
+ * at compile time; a mismatch is a build error, not a wrong vblank. */
+#if defined(__MINGW32__) || defined(__MINGW64__)
+#include <dwmapi.h>
+typedef char win32_dwm_timing_info_size_check[
+   sizeof(win32_dwm_timing_info_t) == sizeof(DWM_TIMING_INFO) ? 1 : -1];
+#endif
+#endif
 #endif /* !defined(_XBOX) */
 #include <math.h>
 #include <wchar.h>
@@ -61,6 +130,7 @@
 #include "../../verbosity.h"
 #include "../../paths.h"
 #include "../../retroarch.h"
+#include "../../audio/audio_driver.h"
 #include "../../tasks/task_content.h"
 #include "../../tasks/tasks_internal.h"
 #include "../../core_info.h"
@@ -618,252 +688,125 @@ uint16_t win32_get_keyboard_mods(void)
 }
 
 #if !defined(_XBOX)
-/* A title bar drag, a border resize, or an open menu enters a modal
- * loop inside DefWindowProc that does not return until the user lets
- * go. The run loop lives on this thread, so for that whole time no
- * frame runs, no audio is written, and the frame limiter falls behind
- * by the length of the drag.
- *
- * The loop does dispatch posted messages, so for its duration a helper
- * thread sleeps at the content rate on the high resolution timer and
- * posts a tick; the tick runs one iteration with RUNLOOP_PACE_EXTERNAL
- * set, which makes the iteration return as soon as the frame is out
- * instead of sleeping until the next one. Content and audio keep their
- * rate, and the loop has the mouse back within a frame's work, not a
- * frame's period. Where there is no thread to be had the fallback is
- * WM_TIMER, whose coarse cadence still beats a freeze.
- *
- * Every API here dates from Windows 95; the constants an older SDK
- * lacks are defined below. */
-
-/* Chosen not to collide with anything else that might use timers or
- * WM_APP messages on the main window. */
-#define WIN32_MODAL_TIMER_ID 0x5241
-#define WM_RA_MODAL_TICK     (WM_APP + 0x52)
-
-#ifndef WM_APP
-#define WM_APP 0x8000
+#ifndef WM_ENTERSIZEMOVE
+#define WM_ENTERSIZEMOVE 0x0231
 #endif
-#ifndef USER_TIMER_MINIMUM
-#define USER_TIMER_MINIMUM 0x0000000A
+#ifndef WM_EXITSIZEMOVE
+#define WM_EXITSIZEMOVE  0x0232
 #endif
 #ifndef WM_ENTERMENULOOP
 #define WM_ENTERMENULOOP 0x0211
 #endif
 #ifndef WM_EXITMENULOOP
-#define WM_EXITMENULOOP 0x0212
-#endif
-#ifndef WM_ENTERSIZEMOVE
-#define WM_ENTERSIZEMOVE 0x0231
-#endif
-#ifndef WM_EXITSIZEMOVE
-#define WM_EXITSIZEMOVE 0x0232
+#define WM_EXITMENULOOP  0x0212
 #endif
 
-typedef struct
+/* Title-bar drags, border resizes and menu bars run a modal loop inside
+ * DefWindowProc that does not return until the user lets go. With
+ * non-threaded video the run loop is on this thread, so content pauses
+ * for the duration - that is the norm for a windowed game and is not
+ * changed here. What is done: the audio driver is stopped so the sink
+ * does not underrun and pop, and a plain timer keeps the last frame on
+ * screen at the current window size. Nothing in here runs the run
+ * loop, the menu, input or the task queue; running those nested inside
+ * a captured-mouse modal loop is what 91920289 did and why it was
+ * reverted.
+ *
+ * Size/move and menu loops can nest (system menu opened while sizing):
+ * arm on the first entry, disarm on the last exit. One timer for the
+ * process; the window that armed it owns it, so the companion and the
+ * main window never kill each other's. */
+#define WIN32_SIZEMOVE_TIMER_ID 0x5241
+
+static uint8_t win32_sizemove_depth;
+static bool    win32_sizemove_stopped_audio;
+/* The routed window changed size since the last present. A move never
+ * invalidates the client area - the compositor keeps the last buffer -
+ * so a plain drag presents nothing at all. */
+static bool    win32_sizemove_dirty;
+static HWND    win32_sizemove_timer_hwnd;
+
+void win32_sizemove_enter(HWND hwnd)
 {
-#ifdef HAVE_THREADS
-   sthread_t *thread;
-   /* Signalled to start a clock session; the thread parks on it
-    * between sessions rather than being created per drag, which
-    * would also leave retro_sleep()'s per-thread timer handle behind
-    * each time. Both events auto-reset. */
-   HANDLE wake;
-   HANDLE parked;
-#endif
-   HWND hwnd;
-   /* Set once a tick is posted and cleared when it is consumed, so a
-    * main thread that falls behind gets one message, not a backlog. */
-   retro_atomic_int_t pending;
-   retro_atomic_int_t stop;
-   retro_atomic_int_t quit;
-   /* Size/move and menu loops can nest (a menu opened from the system
-    * menu of a window being sized is the one case), so arm on the
-    * first entry and disarm on the last exit. */
-   uint8_t depth;
-} win32_modal_t;
-
-static win32_modal_t win32_modal;
-
-#ifdef HAVE_THREADS
-static void win32_modal_clock(void *data)
-{
-   win32_modal_t *m = (win32_modal_t*)data;
-
-   for (;;)
-   {
-      retro_time_t next;
-
-      WaitForSingleObject(m->wake, INFINITE);
-      if (retro_atomic_load_acquire_int(&m->quit))
-         break;
-
-      next = cpu_features_get_time_usec();
-      while (!retro_atomic_load_acquire_int(&m->stop))
-      {
-         /* core_hz is written on the main thread and only read here;
-          * a torn read costs one oddly timed tick, nothing worse. */
-         retro_time_t period = runloop_content_frame_time_us(
-               video_state_get_ptr()->core_hz);
-         retro_time_t now    = cpu_features_get_time_usec();
-         retro_time_t wait;
-
-         next += period;
-         wait  = next - now;
-         if (wait > 0)
-            retro_sleep_us((unsigned)wait);
-         else
-            next = now; /* fell behind: no burst, just resume */
-
-         if (retro_atomic_cas_int(&m->pending, 0, 1))
-            PostMessage(m->hwnd, WM_RA_MODAL_TICK, 0, 0);
-      }
-
-      SetEvent(m->parked);
-   }
-}
-
-/* One thread for the life of the process, created on first use. NULL
- * on any failure, in which case the WM_TIMER fallback is used. */
-static sthread_t *win32_modal_thread_get(win32_modal_t *m)
-{
-   if (m->thread)
-      return m->thread;
-
-   if (!m->wake   && !(m->wake   = CreateEvent(NULL, FALSE, FALSE, NULL)))
-      return NULL;
-   if (!m->parked && !(m->parked = CreateEvent(NULL, FALSE, FALSE, NULL)))
-      return NULL;
-
-   retro_atomic_store_release_int(&m->quit, 0);
-   return (m->thread = sthread_create(win32_modal_clock, m));
-}
-#endif
-
-static void win32_modal_enter(HWND hwnd)
-{
-   win32_modal_t *m = &win32_modal;
-
-   if (m->depth++)
+   if (win32_sizemove_depth++)
       return;
-
-   /* With threaded video this window, and so this loop, belong to the
-    * video thread; the run loop is elsewhere and is not blocked. */
+   /* The window lives on the video thread; the run loop is elsewhere
+    * and keeps going on its own. */
    if (video_driver_is_threaded())
       return;
 
-   m->hwnd = hwnd;
-   retro_atomic_store_release_int(&m->pending, 0);
-   retro_atomic_store_release_int(&m->stop, 0);
-   runloop_state_get_ptr()->pace_external = true;
-   g_win32_flags |= WIN32_CMN_FLAG_MODAL_TIMER;
+   /* A user who pressed P already stopped the driver and must not get
+    * it restarted on release. audio_driver_stop() returns false when
+    * the driver is not alive, so the latch is a real transition. */
+   win32_sizemove_stopped_audio = false;
+   if (!(runloop_state_get_ptr()->flags & RUNLOOP_FLAG_PAUSED))
+      win32_sizemove_stopped_audio = audio_driver_stop();
 
-#ifdef HAVE_THREADS
-   if (win32_modal_thread_get(m))
-   {
-      SetEvent(m->wake);
+   win32_sizemove_dirty = false;
+   if (SetTimer(hwnd, WIN32_SIZEMOVE_TIMER_ID, 16, NULL))
+      win32_sizemove_timer_hwnd = hwnd;
+}
+
+void win32_sizemove_exit(HWND hwnd)
+{
+   (void)hwnd;
+   if (!win32_sizemove_depth || --win32_sizemove_depth)
       return;
+   if (video_driver_is_threaded())
+      return;
+
+   if (win32_sizemove_timer_hwnd)
+   {
+      KillTimer(win32_sizemove_timer_hwnd, WIN32_SIZEMOVE_TIMER_ID);
+      win32_sizemove_timer_hwnd = NULL;
    }
+   /* A failed start clears AUDIO_FLAG_ACTIVE for the session; say so. */
+   if (win32_sizemove_stopped_audio && !audio_driver_start(false))
+      RARCH_WARN("[Win32] Audio did not restart after a window size/move.\n");
+   win32_sizemove_stopped_audio = false;
+}
+
+/* A routed window is going away mid-drag. No audio restart: the driver
+ * may already be gone, and audio_driver_start() failing mutes the
+ * session. */
+void win32_sizemove_abort(void)
+{
+   if (win32_sizemove_timer_hwnd)
+      KillTimer(win32_sizemove_timer_hwnd, WIN32_SIZEMOVE_TIMER_ID);
+   win32_sizemove_timer_hwnd    = NULL;
+   win32_sizemove_depth         = 0;
+   win32_sizemove_stopped_audio = false;
+   win32_sizemove_dirty         = false;
+}
+
+/* WM_TIMER with WIN32_SIZEMOVE_TIMER_ID, delivered on the thread that
+ * owns the window, which is the thread that created the driver: the
+ * video thread when video is threaded, the run loop's otherwise.
+ * Either way the two calls below land on the thread that may touch
+ * the driver, and video_thread_frame() takes its direct path when it
+ * finds itself already on the video thread. Presents only after a resize: with vsync on, a
+ * present blocks for a refresh, and one per tick starved the modal
+ * loop on D3D12 and Vulkan (drag lagged the mouse, picture refreshed
+ * late). Then the same two calls the run loop makes per frame and
+ * nothing else: the driver's alive() is where win32_check_window()
+ * consumes WIN32_CMN_FLAG_RESIZED and arms the swapchain resize, and
+ * video_driver_cached_frame() then presents the last frame into the
+ * resized chain - the pause picture. current_video and data have
+ * independent lifetimes during teardown, hence both checks. */
+void win32_sizemove_tick(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+
+   if (!win32_sizemove_depth)
+      return;
+   if (!win32_sizemove_dirty)
+      return;
+   win32_sizemove_dirty = false;
+   if (video_st->current_video && video_st->data)
+      video_st->current_video->alive(video_st->data);
+   video_driver_cached_frame();
+}
 #endif
-   SetTimer(hwnd, WIN32_MODAL_TIMER_ID, USER_TIMER_MINIMUM, NULL);
-}
-
-/* Stops the clock whatever the nesting depth: the last exit message,
- * a quit from inside a tick, and a window going away mid-drag all
- * end here. */
-static void win32_modal_stop(HWND hwnd)
-{
-   win32_modal_t *m = &win32_modal;
-
-   m->depth = 0;
-   if (!(g_win32_flags & WIN32_CMN_FLAG_MODAL_TIMER))
-      return;
-
-#ifdef HAVE_THREADS
-   if (m->thread)
-   {
-      /* The clock is inside a sleep of at most one frame; once it has
-       * parked it cannot post again until the next wake. */
-      retro_atomic_store_release_int(&m->stop, 1);
-      WaitForSingleObject(m->parked, INFINITE);
-   }
-   else
-#endif
-      KillTimer(hwnd, WIN32_MODAL_TIMER_ID);
-
-   /* A tick that was posted before the stop is still in the queue;
-    * the flag clear below makes it a no-op when it arrives. */
-   g_win32_flags &= ~WIN32_CMN_FLAG_MODAL_TIMER;
-   runloop_state_get_ptr()->pace_external = false;
-}
-
-static void win32_modal_exit(HWND hwnd)
-{
-   win32_modal_t *m = &win32_modal;
-
-   if (!m->depth || --m->depth)
-      return;
-   win32_modal_stop(hwnd);
-}
-
-/* The window is going away. Any session is ended and the thread, if
- * one was ever started, is joined. */
-static void win32_modal_deinit(HWND hwnd)
-{
-   win32_modal_t *m = &win32_modal;
-
-   win32_modal_stop(hwnd);
-#ifdef HAVE_THREADS
-   if (m->thread)
-   {
-      retro_atomic_store_release_int(&m->quit, 1);
-      SetEvent(m->wake);
-      sthread_join(m->thread);
-      m->thread = NULL;
-   }
-   if (m->wake)
-   {
-      CloseHandle(m->wake);
-      m->wake   = NULL;
-   }
-   if (m->parked)
-   {
-      CloseHandle(m->parked);
-      m->parked = NULL;
-   }
-#endif
-}
-
-static void win32_modal_tick(HWND hwnd)
-{
-   win32_modal_t *m = &win32_modal;
-   int ret;
-
-   retro_atomic_store_release_int(&m->pending, 0);
-
-   if (!(g_win32_flags & WIN32_CMN_FLAG_MODAL_TIMER))
-      return;
-
-   /* The iteration pumps this thread's queue, and a tick pulled out
-    * there would land here again, inside the iteration it belongs to. */
-   if (g_win32_flags & WIN32_CMN_FLAG_MODAL_TICK)
-      return;
-
-   /* A quit that was already accepted is reported by the main loop's
-    * own next iteration; repeating it here would run the shutdown
-    * work once per tick until the loop lets go. */
-   if (runloop_state_get_ptr()->flags & RUNLOOP_FLAG_SHUTDOWN_INITIATED)
-      return;
-
-   g_win32_flags |= WIN32_CMN_FLAG_MODAL_TICK;
-   ret            = runloop_iterate();
-   task_queue_check();
-   g_win32_flags &= ~WIN32_CMN_FLAG_MODAL_TICK;
-
-   if (ret == -1)
-      win32_modal_stop(hwnd);
-}
-#endif /* !defined(_XBOX) */
 
 static LRESULT CALLBACK wnd_proc_common(
       bool *quit, HWND hwnd, UINT message,
@@ -911,7 +854,7 @@ static LRESULT CALLBACK wnd_proc_common(
       case WM_DESTROY:
       case WM_QUIT:
 #if !defined(_XBOX)
-         win32_modal_deinit(hwnd);
+         win32_sizemove_abort();
 #endif
          g_win32_flags |= WIN32_CMN_FLAG_QUIT;
          *quit          = true;
@@ -922,19 +865,19 @@ static LRESULT CALLBACK wnd_proc_common(
 #if !defined(_XBOX)
       case WM_ENTERSIZEMOVE:
       case WM_ENTERMENULOOP:
-         win32_modal_enter(hwnd);
+         win32_sizemove_enter(hwnd);
          break;
       case WM_EXITSIZEMOVE:
       case WM_EXITMENULOOP:
-         win32_modal_exit(hwnd);
-         break;
-      case WM_RA_MODAL_TICK:
-         win32_modal_tick(hwnd);
+         win32_sizemove_exit(hwnd);
          break;
       case WM_TIMER:
-         if (wparam == WIN32_MODAL_TIMER_ID)
-            win32_modal_tick(hwnd);
-         break;
+         /* Someone else's timer falls through to DefWindowProc. */
+         if (wparam != WIN32_SIZEMOVE_TIMER_ID)
+            break;
+         win32_sizemove_tick();
+         *quit = true;
+         return 0;
 #endif
       case WM_SIZE:
          /* Do not send resize message if we minimize. */
@@ -947,6 +890,9 @@ static LRESULT CALLBACK wnd_proc_common(
                g_win32_resize_width  = LOWORD(lparam);
                g_win32_resize_height = HIWORD(lparam);
                g_win32_flags        |= WIN32_CMN_FLAG_RESIZED;
+#if !defined(_XBOX)
+               win32_sizemove_dirty  = true;
+#endif
             }
          }
          *quit = true;
@@ -1150,16 +1096,15 @@ static LRESULT CALLBACK wnd_proc_common_internal(HWND hwnd,
       case WM_QUIT:
       case WM_MOVE:
       case WM_SIZE:
-      case WM_GETMINMAXINFO:
-      case WM_COMMAND:
 #if !defined(_XBOX)
       case WM_ENTERSIZEMOVE:
       case WM_EXITSIZEMOVE:
       case WM_ENTERMENULOOP:
       case WM_EXITMENULOOP:
       case WM_TIMER:
-      case WM_RA_MODAL_TICK:
 #endif
+      case WM_GETMINMAXINFO:
+      case WM_COMMAND:
 #ifdef HAVE_THREADS
       case WM_BROWSER_OPEN_RESULT:
       case WM_BROWSER_CANCELLED:
@@ -1243,16 +1188,15 @@ static LRESULT CALLBACK wnd_proc_winraw_common_internal(HWND hwnd,
       case WM_QUIT:
       case WM_MOVE:
       case WM_SIZE:
-      case WM_GETMINMAXINFO:
-      case WM_COMMAND:
 #if !defined(_XBOX)
       case WM_ENTERSIZEMOVE:
       case WM_EXITSIZEMOVE:
       case WM_ENTERMENULOOP:
       case WM_EXITMENULOOP:
       case WM_TIMER:
-      case WM_RA_MODAL_TICK:
 #endif
+      case WM_GETMINMAXINFO:
+      case WM_COMMAND:
 #ifdef HAVE_THREADS
       case WM_BROWSER_OPEN_RESULT:
       case WM_BROWSER_CANCELLED:
@@ -1462,16 +1406,15 @@ static LRESULT CALLBACK wnd_proc_common_dinput_internal(HWND hwnd,
       case WM_QUIT:
       case WM_MOVE:
       case WM_SIZE:
-      case WM_GETMINMAXINFO:
-      case WM_COMMAND:
 #if !defined(_XBOX)
       case WM_ENTERSIZEMOVE:
       case WM_EXITSIZEMOVE:
       case WM_ENTERMENULOOP:
       case WM_EXITMENULOOP:
       case WM_TIMER:
-      case WM_RA_MODAL_TICK:
 #endif
+      case WM_GETMINMAXINFO:
+      case WM_COMMAND:
 #ifdef HAVE_THREADS
       case WM_BROWSER_OPEN_RESULT:
       case WM_BROWSER_CANCELLED:
@@ -1971,6 +1914,45 @@ void win32_clip_window(bool state)
 }
 #endif
 
+
+typedef HRESULT (WINAPI *win32_dwm_timing_fn)(HWND, win32_dwm_timing_info_t*);
+
+retro_time_t win32_dwm_last_vblank_time(void)
+{
+#ifdef _XBOX
+   return 0;
+#else
+   win32_dwm_timing_info_t info;
+   static win32_dwm_timing_fn get_timing;
+   static bool                resolved;
+   static LARGE_INTEGER       freq;
+
+   /* dwmapi does not exist before Vista and the tree still builds for
+    * older targets, so the entry point is resolved once at runtime, as
+    * the D3DKMT ones above are. */
+   if (!resolved)
+   {
+      HMODULE dwm = LoadLibrary("dwmapi.dll");
+      resolved    = true;
+      if (dwm)
+         get_timing = (win32_dwm_timing_fn)GetProcAddress(dwm,
+               "DwmGetCompositionTimingInfo");
+   }
+   if (!get_timing)
+      return 0;
+
+   memset(&info, 0, sizeof(info));
+   info.cbSize = sizeof(info);
+   if (FAILED(get_timing(NULL, &info)))
+      return 0;
+   if (!info.qpcVBlank)
+      return 0;
+   if (!freq.QuadPart && !QueryPerformanceFrequency(&freq))
+      return 0;
+   return (retro_time_t)((info.qpcVBlank / freq.QuadPart * 1000000)
+        + (info.qpcVBlank % freq.QuadPart * 1000000 / freq.QuadPart));
+#endif
+}
 
 #ifdef _XBOX
 static HWND GetForegroundWindow(void) { return main_window.hwnd; }

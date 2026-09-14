@@ -294,18 +294,12 @@ static void *gfx_ctx_w_vk_get_context_data(void *data) { return &win32_vk.contex
 static uint32_t gfx_ctx_w_vk_get_flags(void *data)
 {
    uint32_t flags             = 0;
-   uint8_t present_mode_count = 16;
-   uint8_t i                  = 0;
 
-   /* Check for FIFO_RELAXED_KHR capability */
-   for (i = 0; i < present_mode_count; i++)
-   {
-      if (win32_vk.context.present_modes[i] == VK_PRESENT_MODE_FIFO_RELAXED_KHR)
-      {
-         BIT32_SET(flags, GFX_CTX_FLAGS_ADAPTIVE_VSYNC);
-         break;
-      }
-   }
+   /* What the swapchain settled when it was made, rather than a walk of
+    * present_modes while the thread that draws rewrites it */
+   if (retro_atomic_load_acquire_int(
+            &win32_vk.context.supports_adaptive_vsync))
+      BIT32_SET(flags, GFX_CTX_FLAGS_ADAPTIVE_VSYNC);
 
 #if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
    BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_SLANG);
@@ -315,6 +309,16 @@ static uint32_t gfx_ctx_w_vk_get_flags(void *data)
 }
 
 static void gfx_ctx_w_vk_set_flags(void *data, uint32_t flags) { }
+
+/* The compositor's vertical blank: on current Windows a Vulkan swapchain
+ * presents through DXGI under DWM, so this is the same signal the D3D
+ * drivers read from their swapchain, and it does not need the ICD to
+ * expose display timing - which NVIDIA's Windows driver does not. */
+static retro_time_t gfx_ctx_w_vk_last_present_time(void *data)
+{
+   (void)data;
+   return win32_dwm_last_vblank_time();
+}
 
 const gfx_ctx_driver_t gfx_ctx_w_vk = {
    gfx_ctx_w_vk_init,
@@ -350,5 +354,6 @@ const gfx_ctx_driver_t gfx_ctx_w_vk = {
    NULL,                            /* make_current */
    NULL,                            /* create_surface */
    NULL                             /* destroy_surface */,
-   gfx_ctx_w_vk_presentable
+   gfx_ctx_w_vk_presentable,
+   gfx_ctx_w_vk_last_present_time
 };

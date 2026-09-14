@@ -86,6 +86,7 @@
 #include <compat/getopt.h>
 #include <compat/posix_string.h>
 #include <file/file_path.h>
+#include <streams/rzip_stream.h>
 #include <retro_miscellaneous.h>
 #include <lists/dir_list.h>
 #ifdef __MACH__
@@ -201,6 +202,7 @@
 #include "gfx/video_display_server.h"
 #ifdef HAVE_THREADS
 #include "gfx/video_thread_wrapper.h"
+#include "gfx/video_thread_hw.h"
 #endif
 #ifdef HAVE_BLUETOOTH
 #include "bluetooth/bluetooth_driver.h"
@@ -346,9 +348,6 @@ struct rarch_state
 
    struct retro_perf_counter *perf_counters_rarch[MAX_COUNTERS];
 
-#ifdef HAVE_THREAD_STORAGE
-   sthread_tls_t rarch_tls;               /* unsigned alignment */
-#endif
    unsigned perf_ptr_rarch;
    uint32_t flags;
 
@@ -373,10 +372,6 @@ void libnx_apply_overclock(void);
 #endif
 
 static struct rarch_state rarch_st        = {0};
-
-#ifdef HAVE_THREAD_STORAGE
-static const void *MAGIC_POINTER          = (void*)(uintptr_t)0x0DEFACED;
-#endif
 
 static access_state_t access_state_st     = {0};
 static struct global global_driver_st     = {0}; /* retro_time_t alignment */
@@ -1303,6 +1298,12 @@ static size_t find_driver_nonempty(
          return strlcpy(s, cloud_sync_drivers[i]->ident, len);
    }
 #endif
+   else if (!strcmp(label, "ui_companion_driver"))
+   {
+      const char *ident = ui_companion_wimp_find_ident(i);
+      if (ident)
+         return strlcpy(s, ident, len);
+   }
    return 0;
 }
 
@@ -1496,7 +1497,7 @@ static void driver_adjust_system_rates(
    {
       float timing_skew_hz          = video_refresh_rate;
 
-      if (video_st->flags & VIDEO_FLAG_CRT_SWITCHING_ACTIVE)
+      if (retro_atomic_load_acquire_int(&video_st->crt_switching_active))
          timing_skew_hz             = input_fps;
       video_st->core_hz             = input_fps;
 
@@ -1557,7 +1558,7 @@ void driver_set_nonblock_state(void)
    bool adaptive_vsync         = settings->bools.video_adaptive_vsync;
    unsigned swap_interval      = runloop_get_video_swap_interval(
          settings->uints.video_swap_interval);
-   bool video_driver_active    = (video_st->flags  & VIDEO_FLAG_ACTIVE) ? true : false;
+   bool video_driver_active    = (video_st->main_flags  & VIDEO_FLAG_ACTIVE) ? true : false;
    bool audio_driver_active    = (AUDIO_FLAGS_GET(audio_st)  & AUDIO_FLAG_ACTIVE) ? true : false;
    bool runloop_force_nonblock = (runloop_st->flags & RUNLOOP_FLAG_FORCE_NONBLOCK) ? true : false;
 
@@ -1590,9 +1591,6 @@ void drivers_init(
    audio_driver_state_t *audio_st    = audio_state_get_ptr();
    input_driver_state_t *input_st    = input_state_get_ptr();
    video_driver_state_t *video_st    = video_state_get_ptr();
-#ifdef HAVE_MICROPHONE
-   microphone_driver_state_t *mic_st = microphone_state_get_ptr();
-#endif
 #ifdef HAVE_MENU
    struct menu_state *menu_st     = menu_state_get_ptr();
 #endif
@@ -1637,6 +1635,13 @@ void drivers_init(
                verbosity_enabled))
          retroarch_fail(1, "video_driver_init_internal()");
 
+#ifdef HAVE_THREADS
+      /* An OpenGL core under the threaded wrapper renders on this
+       * thread with a context of its own; it must be current here
+       * before context_reset creates the core's objects in it. */
+      if (video_driver_thread_wrapper_active())
+         video_thread_hw_bind_core_context(video_state_get_ptr()->data);
+#endif
       if (   !video_driver_cache_context_ack_test()
             && hwr->context_reset)
          hwr->context_reset();
@@ -1777,6 +1782,7 @@ void drivers_init(
          VIDEO_FLAG_FORCE_FULLSCREEN) ? true : false;
       bool video_is_fullscreen    = settings->bools.video_fullscreen
                                  || rarch_force_fullscreen;
+      unsigned output_size        = VIDEO_DRIVER_OUTPUT_SIZE(video_st);
 
       p_dispwidget->active= gfx_widgets_init(
             p_disp,
@@ -1784,8 +1790,8 @@ void drivers_init(
             settings,
             (uintptr_t)&p_dispwidget->active,
             video_is_threaded,
-            video_st->width,
-            video_st->height,
+            VIDEO_DRIVER_OUTPUT_WIDTH(output_size),
+            VIDEO_DRIVER_OUTPUT_HEIGHT(output_size),
             video_is_fullscreen,
             settings->paths.directory_assets,
             settings->paths.path_font);
@@ -1970,6 +1976,10 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
 
    if (flags & DRIVER_VIDEO_AND_INPUT_MASK)
    {
+      /* video_driver_free_internal() releases driver memory the
+       * cached frame can point into (a lent software framebuffer),
+       * so retire while that memory is still mapped. */
+      video_driver_cached_frame_retire();
       video_driver_free_internal();
 #ifdef HAVE_THREADS
       slock_free(video_st->display_lock);
@@ -1978,7 +1988,6 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
       video_st->context_lock      = NULL;
 #endif
       video_st->data              = NULL;
-      video_driver_cached_frame_invalidate();
    }
 
    if (flags & DRIVER_AUDIO_MASK)
@@ -2027,15 +2036,16 @@ static void retroarch_deinit_drivers(struct retro_callbacks *cbs)
 
 #if defined(HAVE_MODELINE)
    /* Switchres deinit */
-   if (video_st->flags & VIDEO_FLAG_CRT_SWITCHING_ACTIVE)
+   if (retro_atomic_load_acquire_int(&video_st->crt_switching_active))
       crt_destroy_modes(&video_st->crt_switch_st);
 #endif
 
    /* Video */
    video_display_server_destroy();
 
+   video_st->main_flags &= ~VIDEO_FLAG_ACTIVE;
    video_driver_modify_disp_flags(0,
-         VIDEO_FLAG_ACTIVE      | VIDEO_FLAG_USE_RGBA      |
+         VIDEO_FLAG_USE_RGBA    |
          VIDEO_FLAG_HDR_SUPPORT | VIDEO_FLAG_CACHE_CONTEXT);
    video_driver_cache_context_ack_clear();
    video_st->record_gpu_buffer          = NULL;
@@ -2344,6 +2354,17 @@ static struct string_list *string_list_new_special(
          for (i = 0; camera_drivers[i]; i++)
          {
             const char *opt  = camera_drivers[i]->ident;
+            *len            += strlen(opt) + 1;
+
+            string_list_append(s, opt, attr);
+         }
+         break;
+      case STRING_LIST_UI_COMPANION_DRIVERS:
+         for (i = 0; ; i++)
+         {
+            const char *opt  = ui_companion_wimp_find_ident(i);
+            if (!opt)
+               break;
             *len            += strlen(opt) + 1;
 
             string_list_append(s, opt, attr);
@@ -3007,6 +3028,12 @@ enum rarch_content_type path_is_media_type(const char *path)
 #endif
 #if defined(HAVE_AUDIOMIXER) && defined(HAVE_RAAC)
       case FILE_TYPE_AAC:
+#endif
+#if defined(HAVE_AUDIOMIXER) && defined(HAVE_RAC3)
+      case FILE_TYPE_AC3:
+#endif
+#if defined(HAVE_AUDIOMIXER) && defined(HAVE_RLPCM)
+      case FILE_TYPE_LPCM:
 #endif
 #if defined(HAVE_AUDIOMIXER) && defined(HAVE_ROPUS)
       case FILE_TYPE_OPUS:
@@ -3792,6 +3819,11 @@ bool command_event(enum event_command cmd, void *data)
 
             runloop_msg_queue_push(_msg, strlen(_msg), 1, 60, true, NULL,
                   MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+            /* The toggle is instant while the filter keeps the core's
+             * pixel format; one that changes it (ntsc_crt) needs the
+             * driver set up again for the frames it now receives */
+            if (video_driver_filter_changes_format())
+               command_event(CMD_EVENT_REINIT, NULL);
 #endif
          }
          break;
@@ -4180,14 +4212,15 @@ bool command_event(enum event_command cmd, void *data)
                      VIDEO_FLAG_FORCE_FULLSCREEN) ? true : false;
                bool video_is_fullscreen = settings->bools.video_fullscreen
                      || force_fs;
+               unsigned output_size     = VIDEO_DRIVER_OUTPUT_SIZE(video_st);
                p_dispwidget->active     = gfx_widgets_init(
                      disp_get_ptr(),
                      anim_get_ptr(),
                      settings,
                      (uintptr_t)&p_dispwidget->active,
                      VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st),
-                     video_st->width,
-                     video_st->height,
+                     VIDEO_DRIVER_OUTPUT_WIDTH(output_size),
+                     VIDEO_DRIVER_OUTPUT_HEIGHT(output_size),
                      video_is_fullscreen,
                      settings->paths.directory_assets,
                      settings->paths.path_font);
@@ -4239,6 +4272,12 @@ bool command_event(enum event_command cmd, void *data)
       case CMD_EVENT_CHEATS_APPLY:
 #ifdef HAVE_CHEATS
          cheat_manager_apply_cheats(settings->bools.notification_show_cheats_applied);
+#endif
+         break;
+      case CMD_EVENT_SAVE_COMPRESSION_CODEC_APPLY:
+#ifdef HAVE_COMPRESSION
+         rzipstream_set_write_codec(settings->uints.save_compression_codec == 1
+               ? RZIP_CODEC_ZSTD : RZIP_CODEC_DEFLATE);
 #endif
          break;
       case CMD_EVENT_REWIND_DEINIT:
@@ -4396,6 +4435,7 @@ bool command_event(enum event_command cmd, void *data)
 #ifdef HAVE_OVERLAY
          {
             bool *check_rotation           = (bool*)data;
+            unsigned output_size;
             video_driver_state_t
                *video_st                   = video_state_get_ptr();
             input_driver_state_t *input_st = input_state_get_ptr();
@@ -4409,7 +4449,7 @@ bool command_event(enum event_command cmd, void *data)
 
             ol->index                      = ol->next_index;
             ol->active                     = &ol->overlays[ol->index];
-            ((struct overlay *)ol->active)->viewport_override_logged = false;
+            video_driver_set_overlay_viewport(ol->active);
 
             input_overlay_opacity          = (ol->flags & INPUT_OVERLAY_IS_OSK)
                   ? settings->floats.input_osk_overlay_opacity
@@ -4425,12 +4465,13 @@ bool command_event(enum event_command cmd, void *data)
             command_event(CMD_EVENT_VIDEO_SET_ASPECT_RATIO, NULL);
 
             /* Check orientation, if required */
+            output_size = VIDEO_DRIVER_OUTPUT_SIZE(video_st);
             if (inp_overlay_auto_rotate)
                if (check_rotation)
                   if (*check_rotation)
                      input_overlay_auto_rotate_(
-                           video_st->width,
-                           video_st->height,
+                           VIDEO_DRIVER_OUTPUT_WIDTH(output_size),
+                           VIDEO_DRIVER_OUTPUT_HEIGHT(output_size),
                            settings->bools.input_overlay_enable,
                            ol);
          }
@@ -4806,7 +4847,7 @@ bool command_event(enum event_command cmd, void *data)
 #ifdef HAVE_OVERLAY
          {
             overlay_layout_desc_t layout_desc;
-            video_driver_state_t *video_st = video_state_get_ptr();
+            unsigned output_size;
             input_driver_state_t *input_st = input_state_get_ptr();
             input_overlay_t *ol            = input_st->overlay_ptr;
 
@@ -4839,10 +4880,11 @@ bool command_event(enum event_command cmd, void *data)
                layout_desc.auto_scale              = settings->bools.input_overlay_auto_scale;
             }
 
+            output_size = VIDEO_DRIVER_OUTPUT_SIZE(video_state_get_ptr());
             input_overlay_set_scale_factor(ol,
                   &layout_desc,
-                  video_st->width,
-                  video_st->height);
+                  VIDEO_DRIVER_OUTPUT_WIDTH(output_size),
+                  VIDEO_DRIVER_OUTPUT_HEIGHT(output_size));
          }
 #endif
          break;
@@ -4930,7 +4972,7 @@ bool command_event(enum event_command cmd, void *data)
 #endif
          if (uico_st->flags & UICO_ST_FLAG_IS_ON_FOREGROUND)
          {
-#ifdef HAVE_QT
+#ifdef HAVE_COMPANION_WIMP
             bool desktop_menu_enable = settings->bools.desktop_menu_enable;
             bool ui_companion_toggle = settings->bools.ui_companion_toggle;
 #else
@@ -5117,6 +5159,8 @@ bool command_event(enum event_command cmd, void *data)
          config_set_defaults(global_get_ptr());
          break;
       case CMD_EVENT_MENU_SAVE_CURRENT_CONFIG:
+         /* Same as at quit: the companion's live layout first. */
+         ui_companion_event_command(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG);
 #if !defined(HAVE_DYNAMIC)
          config_save_file_salamander();
 #endif
@@ -5787,7 +5831,7 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_UI_COMPANION_TOGGLE:
          {
-#ifdef HAVE_QT
+#ifdef HAVE_COMPANION_WIMP
             bool desktop_menu_enable = settings->bools.desktop_menu_enable;
             bool ui_companion_toggle = settings->bools.ui_companion_toggle;
 #else
@@ -6583,11 +6627,7 @@ int rarch_main(int argc, char *argv[], void *data)
    if (runloop_is_inited())
       driver_uninit(DRIVERS_CMD_ALL, (enum driver_lifetime_flags)0);
 
-#ifdef HAVE_THREAD_STORAGE
-   sthread_tls_create(&p_rarch->rarch_tls);
-   sthread_tls_set(&p_rarch->rarch_tls, MAGIC_POINTER);
-#endif
-   video_driver_modify_disp_flags(VIDEO_FLAG_ACTIVE, 0);
+   video_state_get_ptr()->main_flags |=  VIDEO_FLAG_ACTIVE;
    AUDIO_FLAGS_SET(audio_state_get_ptr(), AUDIO_FLAG_ACTIVE);
 
    {
@@ -6624,7 +6664,7 @@ int rarch_main(int argc, char *argv[], void *data)
    settings = config_get_ptr();
 
    ui_companion_driver_init_first(
-#ifdef HAVE_QT
+#ifdef HAVE_COMPANION_WIMP
          settings->bools.desktop_menu_enable,
          settings->bools.ui_companion_toggle,
 #else
@@ -6645,9 +6685,7 @@ int rarch_main(int argc, char *argv[], void *data)
    {
       int ret;
       bool app_exit     = false;
-#ifdef HAVE_QT
-      ui_companion_qt.application->process_events();
-#endif
+      ui_companion_driver_wimp_iterate();
       ret = runloop_iterate();
 
       task_queue_check();
@@ -6656,18 +6694,20 @@ int rarch_main(int argc, char *argv[], void *data)
    steam_poll();
 #endif
 
-#ifdef HAVE_QT
-      app_exit = ui_companion_qt.application->exiting;
-#endif
+      /* Whichever desktop companion is active, not Qt specifically. */
+      app_exit = ui_companion_driver_wimp_exiting();
 
       if (ret == -1 || app_exit)
       {
-#ifdef HAVE_QT
-         ui_companion_qt.application->quit();
-#endif
+         ui_companion_driver_wimp_quit();
          break;
       }
    }
+
+   /* Close the desktop companion window while its message pump and the
+    * drivers are still alive; leaving it for main_exit's teardown lets a
+    * native (Win32) companion window outlive the pump and hang. */
+   ui_companion_driver_wimp_deinit();
 
    main_exit(data);
 #endif
@@ -7042,7 +7082,7 @@ static void retroarch_print_features(void)
 #ifdef HAVE_ZLIB
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_ZLIB,            "zlib",            "zlib support");
 #endif
-#if defined(HAVE_ZSTD) || defined(HAVE_RZSTD)
+#ifdef HAVE_RZSTD
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_ZSTD,            "zstd",            "Zstandard support");
 #endif
 #ifdef HAVE_FFMPEG
@@ -8443,7 +8483,7 @@ bool retroarch_main_init(int argc, char *argv[])
    core_info_set_savestate_probe(retroarch_core_info_savestate_probe);
 
    input_st->osk_idx             = OSK_LOWERCASE_LATIN;
-   video_driver_modify_disp_flags(VIDEO_FLAG_ACTIVE, 0);
+   video_state_get_ptr()->main_flags |=  VIDEO_FLAG_ACTIVE;
    AUDIO_FLAGS_SET(audio_state_get_ptr(), AUDIO_FLAG_ACTIVE);
 
    if (setjmp(global->error_sjlj_context) > 0)
@@ -9139,9 +9179,6 @@ bool retroarch_ctl(enum rarch_ctl_state state, void *data)
 
             runloop_is_inited_clear();
 
-#ifdef HAVE_THREAD_STORAGE
-            sthread_tls_delete(&p_rarch->rarch_tls);
-#endif
          }
          break;
 #ifdef HAVE_CONFIGFILE
@@ -9505,6 +9542,11 @@ bool retroarch_main_quit(void)
    video_driver_state_t*video_st = video_state_get_ptr();
    settings_t *settings          = config_get_ptr();
    bool config_save_on_exit      = settings->bools.config_save_on_exit;
+
+   /* Let the desktop companion snapshot its window/dock layout into
+    * settings_t before the config is written below; its own
+    * deinit runs only after the run loop has left, too late. */
+   ui_companion_event_command(CMD_EVENT_QUIT);
 
    /* Restore video driver before saving */
    video_driver_restore_cached(settings);

@@ -589,6 +589,12 @@ typedef struct xmb_handle
     * every frame the ticker ran. */
    char  *wrap_scratch;
    size_t wrap_scratch_cap;
+
+   /* What a pointer press needs to look at an entry with. Here rather
+    * than on the frame of xmb_render(), which runs every frame: a
+    * menu_entry_t is 3872 bytes, and the frame measured 4312 where this
+    * tree allows four thousand. One is looked at a time. */
+   menu_entry_t render_entry;
 } xmb_handle_t;
 
 /* Constant color templates — safe to share across threads.
@@ -1198,8 +1204,8 @@ static void xmb_draw_icon(
       }
 #endif
       if (draw.height > 0 && draw.width > 0)
-         if (dispctx && dispctx->draw)
-            dispctx->draw(&draw, userdata, video_width, video_height);
+         gfx_display_draw(dispctx, &draw, userdata,
+               video_width, video_height);
    }
 
    coords.color         = (const float*)color;
@@ -1214,8 +1220,8 @@ static void xmb_draw_icon(
    }
 #endif
    if (draw.height > 0 && draw.width > 0)
-      if (dispctx && dispctx->draw)
-         dispctx->draw(&draw, userdata, video_width, video_height);
+      gfx_display_draw(dispctx, &draw, userdata,
+            video_width, video_height);
 }
 
 static void xmb_draw_text(
@@ -1866,6 +1872,16 @@ static void xmb_update_dynamic_wallpaper(xmb_handle_t *xmb, bool reset)
 
 static void xmb_update_savestate_thumbnail_path(void *data, unsigned i)
 {
+   /* Off the frame: two paths and a menu_entry_t came to 8008 bytes
+    * where this tree allows four thousand. This runs when the selection
+    * moves, not every frame, so one allocation costs less than the
+    * frame did. */
+   struct savestate_thumb_scratch
+   {
+      menu_entry_t entry;
+      char old_path[PATH_MAX_LENGTH];
+      char path[PATH_MAX_LENGTH];
+   } *scratch;
    xmb_handle_t *xmb        = (xmb_handle_t*)data;
    settings_t *settings     = config_get_ptr();
    bool savestate_thumbnail;
@@ -1878,56 +1894,57 @@ static void xmb_update_savestate_thumbnail_path(void *data, unsigned i)
     * used heap allocation for a value that lives in a fixed-size
     * char[PATH_MAX_LENGTH] ivar.  Same fix pattern as the materialui
     * equivalent (93449d3): stack buffer, after the NULL guard. */
-   char old_path[PATH_MAX_LENGTH];
+   char *old_path;
+
+   if (!(scratch = (struct savestate_thumb_scratch*)malloc(sizeof(*scratch))))
+      return;
+   old_path = scratch->old_path;
 
    if (!xmb)
-      return;
-
+      { free(scratch); return; }
    savestate_thumbnail        = settings->bools.savestate_thumbnail_enable;
-   strlcpy(old_path, xmb->savestate_thumbnail_file_path, sizeof(old_path));
+   strlcpy(old_path, xmb->savestate_thumbnail_file_path, PATH_MAX_LENGTH);
 
    if (xmb->skip_thumbnail_reset)
-      return;
-
+      { free(scratch); return; }
    xmb->savestate_thumbnail_file_path[0] = '\0';
 
    /* Savestate thumbnails are only relevant
     * when viewing the running quick menu or state slots */
    if (!((xmb->is_quick_menu && menu_is_running_quick_menu()) || xmb->is_state_slot))
-      return;
-
+      { free(scratch); return; }
    xmb->fullscreen_thumbnails_available = false;
 
    if (savestate_thumbnail)
    {
-      menu_entry_t entry;
+      menu_entry_t *entry = &scratch->entry;
 
-      MENU_ENTRY_INITIALIZE(entry);
-      entry.flags |= MENU_ENTRY_FLAG_LABEL_ENABLED;
-      menu_entry_get(&entry, 0, i, NULL, true);
+      MENU_ENTRY_INITIALIZE((*entry));
+      entry->flags |= MENU_ENTRY_FLAG_LABEL_ENABLED;
+      menu_entry_get(entry, 0, i, NULL, true);
 
-      if (*entry.label)
+      if (*entry->label)
       {
-         unsigned _state_slot = string_to_unsigned(entry.label);
+         unsigned _state_slot = string_to_unsigned(entry->label);
          if (     _state_slot == MENU_ENUM_LABEL_STATE_SLOT
-               || string_is_equal(entry.label, MENU_ENUM_LABEL_STATE_SLOT_RUN_STR)
-               || string_is_equal(entry.label, MENU_ENUM_LABEL_STATE_SLOT_STR)
-               || string_is_equal(entry.label, MENU_ENUM_LABEL_LOAD_STATE_STR)
-               || string_is_equal(entry.label, MENU_ENUM_LABEL_SAVE_STATE_STR))
+               || string_is_equal(entry->label, MENU_ENUM_LABEL_STATE_SLOT_RUN_STR)
+               || string_is_equal(entry->label, MENU_ENUM_LABEL_STATE_SLOT_STR)
+               || string_is_equal(entry->label, MENU_ENUM_LABEL_LOAD_STATE_STR)
+               || string_is_equal(entry->label, MENU_ENUM_LABEL_SAVE_STATE_STR))
          {
-            char path[PATH_MAX_LENGTH];
+            char *path = scratch->path;
             runloop_state_t *runloop_st = runloop_state_get_ptr();
             int state_slot              = settings->ints.state_slot;
 
             /* State slot dropdown */
             if (     _state_slot == MENU_ENUM_LABEL_STATE_SLOT
-                  || string_is_equal(entry.label, MENU_ENUM_LABEL_STATE_SLOT_RUN_STR))
+                  || string_is_equal(entry->label, MENU_ENUM_LABEL_STATE_SLOT_RUN_STR))
             {
                state_slot         = i - 1;
                xmb->is_state_slot = true;
             }
 
-            gfx_savestate_thumbnail_get_path(path, sizeof(path),
+            gfx_savestate_thumbnail_get_path(path, PATH_MAX_LENGTH,
                   runloop_st->name.savestate, state_slot);
 
             strlcpy(xmb->savestate_thumbnail_file_path, path,
@@ -1946,6 +1963,7 @@ static void xmb_update_savestate_thumbnail_path(void *data, unsigned i)
          }
       }
    }
+   free(scratch);
 }
 
 static void xmb_update_thumbnail_image(void *data)
@@ -5953,8 +5971,9 @@ XMB_NOINLINE static int xmb_draw_item(
        * buffer sits in a frame that is entered once per visible entry
        * per frame. */
       char entry_path[sizeof(entry.path)];
-      strlcpy(entry_path, entry.path, sizeof(entry_path));
-      fill_pathname(entry_path, path_basename(entry_path), "",
+      /* Source from entry.path so the copy never overlaps its own
+       * destination; fortified strlcpy() traps on overlap. */
+      fill_pathname(entry_path, path_basename(entry.path), "",
             sizeof(entry_path));
       if (*entry_path)
          strlcpy(entry.path, entry_path, sizeof(entry.path));
@@ -8022,9 +8041,12 @@ static void xmb_render(void *data,
 
    /* Advance animated thumbnails (animated WebP) once per frame on the
     * main thread. No-op for still images. */
-   gfx_thumbnail_animate(&xmb->thumbnails.right);
-   gfx_thumbnail_animate(&xmb->thumbnails.left);
-   gfx_thumbnail_animate(&xmb->thumbnails.icon);
+   gfx_thumbnail_animate(&xmb->thumbnails.right,
+            menu_driver_get_current_time());
+   gfx_thumbnail_animate(&xmb->thumbnails.left,
+            menu_driver_get_current_time());
+   gfx_thumbnail_animate(&xmb->thumbnails.icon,
+            menu_driver_get_current_time());
 
    /* Fire deferred dynamic-icon repopulate once input has settled.
     * Set by xmb_populate_entries when it wanted to run the work but
@@ -8281,7 +8303,7 @@ static void xmb_render(void *data,
             && ((pointer_y < margin_top)
             || (pointer_x > margin_right)))
       {
-         menu_entry_t entry;
+         menu_entry_t *entry = &xmb->render_entry;
          bool get_entry = false;
 
          switch (xmb->pointer.press_direction)
@@ -8319,8 +8341,8 @@ static void xmb_render(void *data,
 
          if (get_entry)
          {
-            MENU_ENTRY_INITIALIZE(entry);
-            menu_entry_get(&entry, 0, selection, NULL, true);
+            MENU_ENTRY_INITIALIZE((*entry));
+            menu_entry_get(entry, 0, selection, NULL, true);
          }
 
          switch (xmb->pointer.press_direction)
@@ -8329,13 +8351,13 @@ static void xmb_render(void *data,
                /* Note: Direction is inverted, since 'up' should
                 * move list upwards */
                if (pointer_x > margin_right)
-                  xmb_menu_entry_action(xmb, &entry, selection, MENU_ACTION_DOWN);
+                  xmb_menu_entry_action(xmb, entry, selection, MENU_ACTION_DOWN);
                break;
             case MENU_INPUT_PRESS_DIRECTION_DOWN:
                /* Note: Direction is inverted, since 'down' should
                 * move list downwards */
                if (pointer_x > margin_right)
-                  xmb_menu_entry_action(xmb, &entry, selection, MENU_ACTION_UP);
+                  xmb_menu_entry_action(xmb, entry, selection, MENU_ACTION_UP);
                break;
             case MENU_INPUT_PRESS_DIRECTION_LEFT:
                /* Navigate left
@@ -8344,7 +8366,7 @@ static void xmb_render(void *data,
                 * which is actually a movement to the *right* */
                if (pointer_y < margin_top)
                   xmb_menu_entry_action(xmb,
-                        &entry, selection,
+                        entry, selection,
                           (xmb->depth == 1)
                         ? MENU_ACTION_RIGHT
                         : MENU_ACTION_LEFT);
@@ -8356,7 +8378,7 @@ static void xmb_render(void *data,
                 * which is actually a movement to the *left* */
                if (pointer_y < margin_top)
                   xmb_menu_entry_action(xmb,
-                        &entry, selection,
+                        entry, selection,
                           (xmb->depth == 1)
                         ? MENU_ACTION_LEFT
                         : MENU_ACTION_RIGHT);
@@ -8372,7 +8394,7 @@ static void xmb_render(void *data,
    if (xmb->thumbnails.pending_icons != XMB_PENDING_THUMBNAIL_NONE)
    {
       /* Walk the visible range and dispatch async stream requests for
-       * each unresolved entry. We deliberately do NOT sync-load on
+       * each unresolved entry-> We deliberately do NOT sync-load on
        * the main thread here. Doing so blocks the main thread long
        * enough (PNG/JPEG decode + GPU texture upload, repeated for
        * 10–20 entries) that the runloop misses several
@@ -8603,8 +8625,8 @@ XMB_NOINLINE static void xmb_draw_bg(
       gfx_display_set_alpha(draw.color, coord_white[3]);
       gfx_display_draw_bg(p_disp, &draw, &coords, userdata, true, menu_wallpaper_opacity);
 
-      if (dispctx->draw)
-         dispctx->draw(&draw, userdata, video_width, video_height);
+      gfx_display_draw(dispctx, &draw, userdata,
+            video_width, video_height);
    }
    /* Draw empty color theme gradient */
    else
@@ -8615,8 +8637,8 @@ XMB_NOINLINE static void xmb_draw_bg(
       gfx_display_set_alpha(draw.color, coord_white[3]);
       gfx_display_draw_bg(p_disp, &draw, &coords, userdata, true, alpha);
 
-      if (dispctx->draw)
-         dispctx->draw(&draw, userdata, video_width, video_height);
+      gfx_display_draw(dispctx, &draw, userdata,
+            video_width, video_height);
    }
 
 #ifdef HAVE_SHADERPIPELINE
@@ -8655,8 +8677,8 @@ XMB_NOINLINE static void xmb_draw_bg(
          dispctx->draw_pipeline(&draw, p_disp,
                userdata, video_width, video_height);
 
-      if (dispctx->draw)
-         dispctx->draw(&draw, userdata, video_width, video_height);
+      gfx_display_draw(dispctx, &draw, userdata,
+            video_width, video_height);
    }
 #endif
 
@@ -8699,8 +8721,7 @@ XMB_NOINLINE static void xmb_draw_dark_layer(
       dispctx->blend_begin(userdata);
    gfx_display_draw_bg(p_disp, &draw, &coords, userdata, true, MIN(xmb->alpha, alpha));
    if (draw.height > 0 && draw.width > 0)
-      if (dispctx && dispctx->draw)
-         dispctx->draw(&draw, userdata, width, height);
+      gfx_display_draw(dispctx, &draw, userdata, width, height);
    if (dispctx->blend_end)
       dispctx->blend_end(userdata);
 }

@@ -275,6 +275,7 @@ typedef struct
       uint32_t                   rotation;
       uint32_t                   total_subframes;
       uint32_t                   current_subframe;
+      uint32_t                   swap_count;
       float                      core_aspect;
       float                      core_aspect_rot;
 
@@ -1856,6 +1857,7 @@ static bool d3d10_shader_load_step(void *data,
                &d3d10->pass[i].core_aspect_rot,
                &d3d10->pass[i].total_subframes,
                &d3d10->pass[i].current_subframe,
+               &d3d10->pass[i].swap_count,
             }
          };
 
@@ -2072,6 +2074,7 @@ static bool d3d10_gfx_set_shader(void* data,
             &d3d10->pass[i].core_aspect_rot, /* OriginalAspectRotated */
             &d3d10->pass[i].total_subframes, /* TotalSubFrames */
             &d3d10->pass[i].current_subframe,/* CurrentSubFrame */
+            &d3d10->pass[i].swap_count, /* SwapCount */
          }
       };
       /* clang-format on */
@@ -3083,6 +3086,7 @@ static bool d3d10_gfx_frame(
               d3d10->pass[i].total_subframes = video_info->shader_subframes;
 
            d3d10->pass[i].current_subframe = 1;
+           d3d10->pass[i].swap_count       = (uint32_t)video_info->swap_count;
          }
 
          for (j = 0; j < SLANG_CBUFFER_MAX; j++)
@@ -3471,6 +3475,7 @@ static bool d3d10_gfx_frame(
             {
                d3d10->pass[m].total_subframes = video_info->shader_subframes;
                d3d10->pass[m].current_subframe = k+1;
+               d3d10->pass[m].swap_count       = (uint32_t)(video_info->swap_count + k);
             }
          if (!d3d10_gfx_frame(d3d10, NULL, 0, 0, frame_count, 0, msg,
                   video_info))
@@ -4008,6 +4013,7 @@ gfx_display_ctx_driver_t gfx_display_ctx_d3d10 = {
    &d3d10_font,
    GFX_VIDEO_DRIVER_DIRECT3D10,
    "d3d10",
+   true,
    true,
    gfx_display_d3d10_scissor_begin,
    gfx_display_d3d10_scissor_end

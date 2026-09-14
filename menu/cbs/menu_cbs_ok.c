@@ -183,7 +183,7 @@ static int (funcname)(const char *path, const char *label, unsigned type, size_t
    return generic_action_ok(path, label, type, idx, entry_idx, _id, _flush); \
 }
 
-#define DEFAULT_ACTION_DIALOG_START(funcname, _label, _idx, _cb) \
+#define DEFAULT_ACTION_DIALOG_START_TYPE(funcname, _label, _idx, _cb, _text_type) \
 static int (funcname)(const char *path, const char *label_setting, unsigned type, size_t idx, size_t entry_idx) \
 { \
    menu_input_ctx_line_t line; \
@@ -191,11 +191,15 @@ static int (funcname)(const char *path, const char *label_setting, unsigned type
    line.label_setting = label_setting; \
    line.type          = type; \
    line.idx           = (_idx); \
+   line.text_type     = (_text_type); \
    line.cb            = _cb; \
    if (!menu_input_dialog_start(&line)) \
       return -1; \
    return 0; \
 }
+
+#define DEFAULT_ACTION_DIALOG_START(funcname, _label, _idx, _cb) \
+   DEFAULT_ACTION_DIALOG_START_TYPE(funcname, _label, _idx, _cb, MENU_INPUT_DIALOG_KB_TYPE_TEXT)
 
 
 #define DEFAULT_ACTION_OK_START_BUILTIN_CORE(funcname, _id) \
@@ -332,8 +336,8 @@ static enum msg_hash_enums action_ok_dl_to_enum(unsigned lbl)
          return MENU_ENUM_LABEL_DEFERRED_MIXER_STREAM_SETTINGS_LIST;
       case ACTION_OK_DL_ACCOUNTS_LIST:
          return MENU_ENUM_LABEL_DEFERRED_ACCOUNTS_LIST;
-      case ACTION_OK_DL_ACHIEVEMENTS_HARDCORE_PAUSE_LIST:
-         return MENU_ENUM_LABEL_DEFERRED_ACCOUNTS_LIST;
+      case ACTION_OK_DL_ACHIEVEMENTS_SUBMENU_LIST:
+         return MENU_ENUM_LABEL_DEFERRED_ACHIEVEMENTS_SUBMENU_LIST;
       case ACTION_OK_DL_INPUT_SETTINGS_LIST:
          return MENU_ENUM_LABEL_DEFERRED_INPUT_SETTINGS_LIST;
       case ACTION_OK_DL_INPUT_MENU_SETTINGS_LIST:
@@ -1756,7 +1760,7 @@ int generic_action_ok_displaylist_push(
       }
          break;
       case ACTION_OK_DL_ACCOUNTS_LIST:
-      case ACTION_OK_DL_ACHIEVEMENTS_HARDCORE_PAUSE_LIST:
+      case ACTION_OK_DL_ACHIEVEMENTS_SUBMENU_LIST:
       case ACTION_OK_DL_INPUT_SETTINGS_LIST:
       case ACTION_OK_DL_INPUT_MENU_SETTINGS_LIST:
       case ACTION_OK_DL_INPUT_TURBO_FIRE_SETTINGS_LIST:
@@ -3560,6 +3564,7 @@ static int action_ok_wifi(const char *path, const char *label_setting,
       line.label_setting = label_setting;
       line.type          = type;
       line.idx           = (unsigned)idx;
+      line.text_type     = MENU_INPUT_DIALOG_KB_TYPE_PASSWORD;
       line.cb            = menu_input_wifi_cb;
       if (!menu_input_dialog_start(&line))
          return -1;
@@ -3937,9 +3942,11 @@ static int action_ok_video_filter_remove(const char *path,
       return -1;
    if (*settings->paths.path_softfilter_plugin)
    {
-      /* Unload video filter */
+      /* Unload video filter. The driver was set up for its output
+       * (pixel format and scale), so set it up again without it, as
+       * the reset does */
       settings->paths.path_softfilter_plugin[0] = '\0';
-      video_driver_filter_free();
+      command_event(CMD_EVENT_REINIT, NULL);
       /* Refresh menu */
       menu_st->flags         |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH
                              |  MENU_ST_FLAG_PREVENT_POPULATE;
@@ -3999,20 +4006,22 @@ static void menu_input_st_string_cb_cheat_file_save_as(
 }
 #endif
 
-DEFAULT_ACTION_DIALOG_START(action_ok_enable_settings,
+DEFAULT_ACTION_DIALOG_START_TYPE(action_ok_enable_settings,
    msg_hash_to_str(MSG_INPUT_ENABLE_SETTINGS_PASSWORD),
    (unsigned)entry_idx,
-   menu_input_st_string_cb_enable_settings)
+   menu_input_st_string_cb_enable_settings,
+   MENU_INPUT_DIALOG_KB_TYPE_PASSWORD)
 #ifdef HAVE_CHEATS
 DEFAULT_ACTION_DIALOG_START(action_ok_cheat_file_save_as,
    msg_hash_to_str(MSG_INPUT_CHEAT_FILENAME),
    (unsigned)idx,
    menu_input_st_string_cb_cheat_file_save_as)
 #endif
-DEFAULT_ACTION_DIALOG_START(action_ok_disable_kiosk_mode,
+DEFAULT_ACTION_DIALOG_START_TYPE(action_ok_disable_kiosk_mode,
    msg_hash_to_str(MSG_INPUT_KIOSK_MODE_PASSWORD),
    (unsigned)entry_idx,
-   menu_input_st_string_cb_disable_kiosk_mode)
+   menu_input_st_string_cb_disable_kiosk_mode,
+   MENU_INPUT_DIALOG_KB_TYPE_PASSWORD)
 static int action_ok_rename_entry(const char *path,
       const char *label_setting, unsigned type, size_t idx, size_t entry_idx)
 {
@@ -4024,6 +4033,7 @@ static int action_ok_rename_entry(const char *path,
    line.label_setting                 = label_setting;
    line.type                          = type;
    line.idx                           = (unsigned)entry_idx;
+   line.text_type                     = MENU_INPUT_DIALOG_KB_TYPE_TEXT;
    line.cb                            = menu_input_st_string_cb_rename_entry;
 
    if (!menu_input_dialog_start(&line))
@@ -4310,7 +4320,6 @@ static int action_ok_remap_file_flush(const char *path,
    /* Log result */
    if (ret)
    {
-      /* TODO/FIXME - localize */
       RARCH_LOG(
             "[Remap] Saved input remapping options to \"%s\".\n",
             path_remapfile ? path_remapfile : "UNKNOWN");
@@ -4320,7 +4329,6 @@ static int action_ok_remap_file_flush(const char *path,
    }
    else
    {
-      /* TODO/FIXME - localize */
       RARCH_LOG(
             "[Remap] Failed to save input remapping options to \"%s\".\n",
             path_remapfile ? path_remapfile : "UNKNOWN");
@@ -5222,6 +5230,9 @@ static int action_ok_halt_replay(const char *path,
    return 0;
 }
 
+#ifdef HAVE_CHEEVOS
+/* Both of these are bound by the achievement entries below, which are
+ * compiled only with achievements on. */
 static int action_ok_close_submenu(const char* path,
    const char* label, unsigned type, size_t idx, size_t entry_idx)
 {
@@ -5235,6 +5246,7 @@ static int action_ok_cheevos_toggle_hardcore_mode(const char *path,
    action_cancel_pop_default(path, label, type, idx);
    return generic_action_ok_command(CMD_EVENT_RESUME);
 }
+#endif
 
 static int action_ok_undo_load_state(const char *path,
       const char *label, unsigned type, size_t idx, size_t entry_idx)
@@ -6780,6 +6792,7 @@ static int action_ok_add_entry_to_new_playlist(const char *path,
    line.label_setting         = NULL;
    line.type                  = 0;
    line.idx                   = 0;
+   line.text_type             = MENU_INPUT_DIALOG_KB_TYPE_TEXT;
    line.cb                    = (string_is_equal(label, (char*)MENU_ENUM_LABEL_CREATE_NEW_PLAYLIST_STR) ?
                                       action_input_add_entry_to_new_playlist :
                                       action_input_add_entry_to_new_playlist_quickmenu);
@@ -7065,7 +7078,7 @@ STATIC_DEFAULT_ACTION_OK_FUNC(action_ok_steam_settings_list, ACTION_OK_DL_STEAM_
 STATIC_DEFAULT_ACTION_OK_FUNC(action_ok_push_core_manager_steam_list, ACTION_OK_DL_CORE_MANAGER_STEAM_LIST)
 #endif
 #ifdef HAVE_CHEEVOS
-DEFAULT_ACTION_OK_FUNC(action_ok_push_achievements_hardcore_pause_list, ACTION_OK_DL_ACHIEVEMENTS_HARDCORE_PAUSE_LIST)
+DEFAULT_ACTION_OK_FUNC(action_ok_push_achievements_submenu, ACTION_OK_DL_ACHIEVEMENTS_SUBMENU_LIST)
 #endif
 DEFAULT_ACTION_OK_FUNC(action_ok_push_core_information_list, ACTION_OK_DL_CORE_INFORMATION_LIST)
 #ifdef HAVE_MIST
@@ -9661,12 +9674,15 @@ static int menu_cbs_init_bind_ok_compare_label(menu_file_list_cbs_t *cbs,
          {MENU_ENUM_LABEL_CORE_DELETE,                         action_ok_core_delete},
          {MENU_ENUM_LABEL_CORE_CREATE_BACKUP,                  action_ok_core_create_backup},
          {MENU_ENUM_LABEL_DELETE_PLAYLIST,                     action_ok_delete_playlist},
+#ifdef HAVE_CHEEVOS
+         {MENU_ENUM_LABEL_CHEEVOS_MENU_SUBMENU,                action_ok_push_achievements_submenu},
          {MENU_ENUM_LABEL_ACHIEVEMENT_PAUSE_MENU,              action_ok_push_default},
          {MENU_ENUM_LABEL_ACHIEVEMENT_PAUSE,                   action_ok_cheevos_toggle_hardcore_mode},
          {MENU_ENUM_LABEL_ACHIEVEMENT_PAUSE_CANCEL,            action_ok_close_submenu},
          {MENU_ENUM_LABEL_ACHIEVEMENT_RESUME,                  action_ok_cheevos_toggle_hardcore_mode},
          {MENU_ENUM_LABEL_ACHIEVEMENT_RESUME_CANCEL,           action_ok_close_submenu },
          {MENU_ENUM_LABEL_ACHIEVEMENT_RESUME_REQUIRES_RELOAD,  action_ok_close_submenu },
+#endif
 #ifdef HAVE_MICROPHONE
          {MENU_ENUM_LABEL_MICROPHONE_SETTINGS,                 action_ok_push_microphone_settings_list},
 #endif
@@ -9690,6 +9706,8 @@ static int menu_cbs_init_bind_ok_compare_label(menu_file_list_cbs_t *cbs,
          {MENU_ENUM_LABEL_CORE_INPUT_REMAPPING_OPTIONS,        action_ok_push_default},
          {MENU_ENUM_LABEL_DISC_INFORMATION,                    action_ok_push_default},
          {MENU_ENUM_LABEL_SYSTEM_INFORMATION,                  action_ok_push_default},
+         {MENU_ENUM_LABEL_DISPLAY_INFORMATION,                 action_ok_push_default},
+         {MENU_ENUM_LABEL_DISPLAY_EDID_INFORMATION,            action_ok_push_default},
          {MENU_ENUM_LABEL_NETWORK_INFORMATION,                 action_ok_push_default},
          {MENU_ENUM_LABEL_ACHIEVEMENT_LIST,                    action_ok_push_default},
          {MENU_ENUM_LABEL_DISK_OPTIONS,                        action_ok_push_default},

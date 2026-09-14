@@ -226,29 +226,12 @@ typedef struct
     * data_transfer_free(anim_dt); anim_buf itself must not be
     * freed). */
    void *anim;
+   /* Shared preview session (gfx_anim_preview_t*) over anim / anim_dt:
+    * the window feeder and the preview audio. Non-owning. */
+   void *anim_sess;
    void *anim_buf;
    struct data_transfer *anim_dt; /* transfer owning anim_buf (and the
                                       adopted nbio handle beneath it)   */
-   /* Preview audio on a WINDOWED handle.  anim_buf is a sliding
-    * mapping there, only partly resident, so the mixer cannot be
-    * handed a copy of it - it needs the whole container.  This is a
-    * second, independent read of the same file, pumped a frame
-    * budget at a time by gfx_thumbnail_animate and handed over when
-    * complete.  NULL on every other path, where anim_buf is already
-    * the whole file and the hand-off is immediate. */
-   struct data_transfer *anim_audio_dt;
-   /* Windowed preview audio: the mixer borrows this window's mapping
-    * for the container and is told, through params.avail and
-    * audio_driver_mixer_stream_set_avail, how much of it is resident.
-    * anim_audio_hi is that figure - never above the committed
-    * frontier, which is what keeps a stale feeder a stall rather than
-    * a read of reserved pages.  anim_audio_slot is the mixer slot the
-    * feeder follows with audio_driver_mixer_stream_byte_tell. */
-   size_t anim_audio_hi;
-   int    anim_audio_slot;
-   char *anim_audio_path;  /* strdup'd source for the read above; only
-                              set on windowed handles, freed by
-                              gfx_thumbnail_anim_close */
    /* Decode-worker ping-pong job pair (HAVE_THREADS builds): while
     * the frame held in one job waits for its due time, the other is
     * already decoding its successor.  anim_job_upload selects which
@@ -275,6 +258,14 @@ typedef struct
    uint8_t anim_read_pending; /* adopted nbio read still in flight;
                                  animation/audio held at the static
                                  frame until it completes */
+   /* Asynchronous upload bookkeeping (threaded video). upload_seq is
+    * bumped by gfx_thumbnail_reset(); a completed upload whose seq no
+    * longer matches was superseded and is unloaded on delivery.
+    * anim_inflight is set while one animation frame is on its way to
+    * the video thread; further frames are skipped until it lands, so
+    * a slow present never queues frames faster than it shows them. */
+   uint16_t upload_seq;
+   uint8_t anim_inflight;
    uint8_t anim_windowed;  /* anim_dt is a sliding window fed from the
                               decoder frontier during playback, not a
                               buffer pumped to completion: residency is
@@ -306,10 +297,7 @@ static INLINE void gfx_thumbnail_init_blank(gfx_thumbnail_t *t)
    t->anim            = NULL;
    t->anim_buf        = NULL;
    t->anim_dt         = NULL;
-   t->anim_audio_dt   = NULL;
-   t->anim_audio_hi   = 0;
-   t->anim_audio_slot = -1;
-   t->anim_audio_path = NULL;
+   t->anim_sess       = NULL;
    t->anim_job        = NULL;
    t->anim_job2       = NULL;
    t->anim_buf_len    = 0;
@@ -326,6 +314,8 @@ static INLINE void gfx_thumbnail_init_blank(gfx_thumbnail_t *t)
    t->anim_job_upload = 0;
    t->anim_read_pending = 0;
    t->anim_windowed   = 0;
+   t->upload_seq      = 0;
+   t->anim_inflight   = 0;
 }
 
 /* Holds all configuration parameters associated
@@ -467,7 +457,13 @@ void gfx_thumbnail_reset(gfx_thumbnail_t *thumbnail);
  * thread, for every on-screen thumbnail. Non-animated thumbnails and
  * non-WebP image types return immediately (single flag test), so this
  * is safe and near-free to call for every thumbnail unconditionally. */
-void gfx_thumbnail_animate(gfx_thumbnail_t *thumbnail);
+/* @current_time is the frame's monotonic timestamp, as sampled once
+ * per iteration by the runloop and handed to gfx_animation_update():
+ * this function reads no clock of its own, so every thumbnail
+ * advanced in a frame paces off one coherent 'now', and a harness can
+ * drive it with synthetic time. */
+void gfx_thumbnail_animate(gfx_thumbnail_t *thumbnail,
+      retro_time_t current_time);
 
 /* Stream processing */
 

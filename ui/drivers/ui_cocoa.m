@@ -649,6 +649,20 @@ static ui_application_t ui_application_cocoa = {
 - (void)keyDown:(NSEvent *)event { }
 - (void)keyUp:(NSEvent *)event { }
 
+/* Another window of this app took the keyboard - the desktop companion,
+ * a panel. Every key that is down right now will be released into that
+ * window, so this window never sees the key-up: the key stays "held" in
+ * apple_key_state, and a held key is exactly what the menu's flush-and-
+ * wait-for-release (menu_st->input_driver_flushing_input) waits on -
+ * for ever, since the release never arrives. That was the desktop
+ * companion's "keyboard does not come back after closing it": the hotkey
+ * that opened it was still down when the companion took the keyboard.
+ * Same treatment as losing the application's active state. */
+- (void)windowDidResignKey:(NSNotification *)notification
+{
+   apple_input_keyboard_reset();
+}
+
 - (void)windowDidBecomeKey:(NSNotification *)notification
 {
    settings_t *settings             = config_get_ptr();
@@ -1127,6 +1141,7 @@ static ui_application_t ui_application_cocoa = {
 #endif
        if (application)
           application->process_events();
+       ui_companion_driver_wimp_iterate();
 
        ret = runloop_iterate();
 
@@ -1138,22 +1153,27 @@ static ui_application_t ui_application_cocoa = {
 
        while (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.002, FALSE)
              == kCFRunLoopRunHandledSource);
-       if (ret == -1)
+       if (ret == -1 || ui_companion_driver_wimp_exiting())
        {
-#ifdef HAVE_QT
-          application->quit();
-#endif
+          ui_companion_driver_wimp_quit();
           break;
        }
     }
 
+    ui_companion_driver_wimp_deinit();
     main_exit(NULL);
 }
 #endif
 
-- (void)applicationDidBecomeActive:(NSNotification *)notification  { }
+/* Focus, published for the video worker: see cocoa_has_focus(). */
+void cocoa_publish_focus(bool focused);
+- (void)applicationDidBecomeActive:(NSNotification *)notification
+{
+   cocoa_publish_focus(true);
+}
 - (void)applicationWillResignActive:(NSNotification *)notification
 {
+   cocoa_publish_focus(false);
    apple_input_keyboard_reset();
 }
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)theApplication { return YES; }
@@ -1755,8 +1775,12 @@ static void ui_companion_cocoa_event_command(void *data, enum event_command cmd)
 {
    switch (cmd)
    {
+      /* Notifications only: the desktop companion (wimp driver)
+       * snapshots its layout on these, nothing is dispatched. */
       case CMD_EVENT_SHADERS_APPLY_CHANGES:
       case CMD_EVENT_SHADER_PRESET_LOADED:
+      case CMD_EVENT_QUIT:
+      case CMD_EVENT_MENU_SAVE_CURRENT_CONFIG:
          break;
       default: {
          id performer = [[CommandPerformer alloc] initWithData:data command:cmd];
@@ -1775,6 +1799,7 @@ ui_companion_driver_t ui_companion_cocoa = {
    ui_companion_cocoa_init,
    ui_companion_cocoa_deinit,
    ui_companion_cocoa_toggle,
+   NULL, /* iterate */
    ui_companion_cocoa_event_command,
    NULL, /* notify_refresh */
    NULL, /* msg_queue_push */

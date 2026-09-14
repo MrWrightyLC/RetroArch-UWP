@@ -58,7 +58,21 @@ typedef void (AL_APIENTRY *al_event_control_t)(ALsizei count,
 typedef void (AL_APIENTRY *al_event_callback_t)(al_event_proc_t callback,
       void *user);
 
-#define OPENAL_BUFSIZE 1024
+/* ALC_SOFT_device_clock, declared here for the same reason and
+ * resolved the same way: the device's own clock, in nanoseconds. Core
+ * OpenAL has nothing of the kind and Apple's framework does not carry
+ * this extension, so a library without it simply reports no clock and
+ * nothing here refers to a symbol it lacks. */
+#define ALC_DEVICE_CLOCK_SOFT 0x1600
+typedef int64_t al_clock_int64_t;
+typedef void (ALC_APIENTRY *al_get_integer64v_t)(ALCdevice *device,
+      ALCenum pname, ALsizei size, al_clock_int64_t *values);
+
+/* The unit queued to the source: 1024 bytes for stereo, as it always
+ * was, made a multiple of the frame for a wider layout (3072 for six
+ * channels), since a buffer's size must be whole frames. */
+#define OPENAL_BUFSIZE_BASE 1024
+#define OPENAL_BUFSIZE (al->bufsize)
 
 typedef struct al
 {
@@ -82,9 +96,39 @@ typedef struct al
    ALsizei num_buffers;
    int rate;
    ALenum format;
+   unsigned bufsize;     /* bytes per queued buffer, whole frames */
+   unsigned frame_size;  /* bytes per frame at the opened format */
+   uint32_t layout;      /* the frontend's mask the source plays */
    bool nonblock;
    bool is_paused;
    bool events;
+
+   /* The device clock, where the implementation counts one.
+    *
+    * ALC_SOFT_device_clock is an OpenAL Soft extension - core OpenAL
+    * has nothing of the kind, and Apple's implementation does not
+    * carry it - so it is asked for at open and simply absent where it
+    * is not offered. It reports the device's own clock in
+    * nanoseconds, which paired against the frames this driver has
+    * seen consumed is the rate the hardware is really running at.
+    *
+    * The frame count is quantised to a queued buffer, since that is
+    * when a buffer is reported processed. That shifts the line and
+    * leaves its slope alone, which is what the fit reads, so it costs
+    * nothing here - the same reason ALSA can fit a delay-corrected
+    * position.
+    *
+    * A fit over every sample, not two points: noise on a single
+    * anchor divides by the window and reads as drift. Touched from
+    * the frontend thread that calls frames_consumed(), and nowhere
+    * else. Nothing acts on it. */
+   al_get_integer64v_t clk_get;
+   al_clock_int64_t    clk_anchor_ns;
+   size_t       clk_anchor_frames;
+   int          clk_have_anchor;
+   double       clk_sx, clk_sy, clk_sxx, clk_sxy, clk_n;
+   int          clk_ppm;
+   int          clk_valid;
    /* Raised by the DISCONNECTED event: the device is not coming back,
     * so no wait for it has anything to wait for. */
    bool disconnected;
@@ -99,6 +143,12 @@ static void al_free(void *data)
 
    if (!al)
       return;
+
+   /* What the device clock was doing against the rate the source
+    * played at. Logged, never acted on, as with the other drivers. */
+   if (al->clk_valid)
+      RARCH_LOG("[OpenAL] Device clock, fitted from ALC_SOFT_device_clock:"
+            " %+d ppm against %d Hz.\n", al->clk_ppm, al->rate);
 
    /* Before the source and context go: the mixer thread may call back
     * until the callback is cleared. */
@@ -217,7 +267,6 @@ static void *al_list_new(void *u)
 
 
 static void *al_init(const char *device, unsigned rate, unsigned latency,
-      unsigned block_frames,
       unsigned *new_rate)
 {
    size_t _latency;
@@ -279,6 +328,16 @@ static void *al_init(const char *device, unsigned rate, unsigned latency,
    if (!al->handle)
       goto error;
 
+   /* The device clock, where this implementation counts one. An
+    * OpenAL Soft extension, so asked for rather than assumed: core
+    * OpenAL has nothing of the kind and Apple's does not carry it. */
+   if (alcIsExtensionPresent(al->handle, "ALC_SOFT_device_clock"))
+      al->clk_get = (al_get_integer64v_t)alcGetProcAddress(
+            al->handle, "alcGetInteger64vSOFT");
+   RARCH_LOG("[OpenAL] Device clock: %s.\n",
+         al->clk_get ? "reported by the implementation (ALC_SOFT_device_clock)"
+                     : "not offered by this implementation");
+
    al->ctx = alcCreateContext(al->handle, NULL);
    if (!al->ctx)
       goto error;
@@ -291,23 +350,72 @@ static void *al_init(const char *device, unsigned rate, unsigned latency,
    al->rate  = rate;
    *new_rate = rate;
 
-   if (alIsExtensionPresent("AL_EXT_FLOAT32"))
+   /* The layout the frontend asked for. AL_EXT_MCFORMATS gives quad,
+    * 5.1 and 7.1 formats in the WAV order (FL FR FC LFE BL BR SL SR),
+    * the frontend's mask order with the rear pair at the back, so
+    * those are what is reported; anything else, or a library without
+    * the extension, is stereo. */
    {
-      al->format      = alGetEnumValue("AL_FORMAT_STEREO_FLOAT32");
-      _latency        = latency * rate * 2 * sizeof(float);
-      RARCH_LOG("[OpenAL] Device supports float sample format\n");
-   }
-   else
-   {
-      al->format      = AL_FORMAT_STEREO16;
-      _latency        = latency * rate * 2 * sizeof(int16_t);
+      bool     have_float = alIsExtensionPresent("AL_EXT_FLOAT32");
+      bool     have_mc    = alIsExtensionPresent("AL_EXT_MCFORMATS");
+      uint32_t want       = audio_driver_requested_layout();
+      unsigned channels   = audio_layout_channels(want);
+      const char *name    = NULL;
+      al->layout          = AUDIO_LAYOUT_STEREO;
+      if (have_mc && channels == 8)
+      {
+         name       = have_float ? "AL_FORMAT_71CHN32" : "AL_FORMAT_71CHN16";
+         al->layout = AUDIO_LAYOUT_STEREO | AUDIO_SPEAKER_FRONT_CENTER | AUDIO_SPEAKER_LOW_FREQUENCY
+               | AUDIO_SPEAKER_BACK_LEFT | AUDIO_SPEAKER_BACK_RIGHT | AUDIO_SPEAKER_SIDE_LEFT | AUDIO_SPEAKER_SIDE_RIGHT;
+      }
+      else if (have_mc && (channels == 6 || channels == 5 || channels == 7))
+      {
+         name       = have_float ? "AL_FORMAT_51CHN32" : "AL_FORMAT_51CHN16";
+         al->layout = AUDIO_LAYOUT_STEREO | AUDIO_SPEAKER_FRONT_CENTER | AUDIO_SPEAKER_LOW_FREQUENCY
+               | AUDIO_SPEAKER_BACK_LEFT | AUDIO_SPEAKER_BACK_RIGHT;
+      }
+      else if (have_mc && channels == 4)
+      {
+         name       = have_float ? "AL_FORMAT_QUAD32" : "AL_FORMAT_QUAD16";
+         al->layout = AUDIO_LAYOUT_STEREO | AUDIO_SPEAKER_BACK_LEFT | AUDIO_SPEAKER_BACK_RIGHT;
+      }
+      else if (channels > 2)
+         RARCH_LOG("[OpenAL] Layout 0x%03x asked for %u channels; %s, opening stereo.\n",
+               want, channels, have_mc ? "no format for that count" : "the library has no AL_EXT_MCFORMATS");
+      al->format = 0;
+      if (name)
+      {
+         al->format = alGetEnumValue(name);
+         if (al->format == 0 || al->format == -1)
+         {
+            RARCH_WARN("[OpenAL] %s is not known to this library; opening stereo.\n", name);
+            al->layout = AUDIO_LAYOUT_STEREO;
+            al->format = 0;
+         }
+      }
+      if (!al->format)
+      {
+         if (have_float)
+            al->format = alGetEnumValue("AL_FORMAT_STEREO_FLOAT32");
+         else
+            al->format = AL_FORMAT_STEREO16;
+      }
+      if (have_float)
+         RARCH_LOG("[OpenAL] Device supports float sample format\n");
+      al->frame_size = audio_layout_channels(al->layout) * (have_float ? sizeof(float) : sizeof(int16_t));
+      al->bufsize    = OPENAL_BUFSIZE_BASE;
+      while (al->bufsize % al->frame_size)
+         al->bufsize += OPENAL_BUFSIZE_BASE;
+      if (al->layout != AUDIO_LAYOUT_STEREO)
+         RARCH_LOG("[OpenAL] Opened %s: layout 0x%03x.\n", name, al->layout);
+      _latency = latency * rate * al->frame_size;
    }
 
    al->num_buffers = (ALsizei)(_latency / (1000 * OPENAL_BUFSIZE));
    if (al->num_buffers < 2)
       al->num_buffers = 2;
 
-   RARCH_LOG("[OpenAL] Using %u buffers of %u bytes (%s format).\n", (unsigned)al->num_buffers, OPENAL_BUFSIZE, (al->format == AL_FORMAT_STEREO16) ? "integer" : "float");
+   RARCH_LOG("[OpenAL] Using %u buffers of %u bytes (%s format).\n", (unsigned)al->num_buffers, OPENAL_BUFSIZE, (al->frame_size == audio_layout_channels(al->layout) * sizeof(int16_t)) ? "integer" : "float");
 
    al->buffers = (ALuint*)calloc(al->num_buffers, sizeof(ALuint));
    al->res_buf = (ALuint*)calloc(al->num_buffers, sizeof(ALuint));
@@ -366,9 +474,7 @@ static bool al_unqueue_buffers(al_t *al)
     * played. Counted here, where they are collected, rather than from
     * a callback OpenAL does not offer. */
    retro_atomic_fetch_add_size(&al->consumed,
-         (size_t)val * (OPENAL_BUFSIZE
-            / (al->format == AL_FORMAT_STEREO16
-               ? 2 * sizeof(int16_t) : 2 * sizeof(float))));
+         (size_t)val * (OPENAL_BUFSIZE / al->frame_size));
    return true;
 }
 
@@ -564,20 +670,91 @@ static size_t al_wait_writable(void *data, size_t len)
  * estimator is already specified to tolerate, so the extra resolution
  * would buy nothing.
  */
+/* The device clock against the rate the source plays at - see the
+ * note on the fields. Sampled where the frontend reads the position,
+ * so the two are taken together. */
+static void al_clock_sample(al_t *al, size_t frames)
+{
+   al_clock_int64_t ns = 0;
+   double x, y, d;
+
+   if (!al->clk_get || !al->rate)
+      return;
+
+   al->clk_get(al->handle, ALC_DEVICE_CLOCK_SOFT, 1, &ns);
+   if (ns <= 0)
+      return;
+
+   if (!al->clk_have_anchor)
+   {
+      al->clk_anchor_ns     = ns;
+      al->clk_anchor_frames = frames;
+      al->clk_have_anchor   = 1;
+      al->clk_sx = al->clk_sy = al->clk_sxx = al->clk_sxy = al->clk_n = 0.0;
+      return;
+   }
+   if (ns <= al->clk_anchor_ns || frames < al->clk_anchor_frames)
+   {
+      /* The clock went backwards, or the source was rewound. */
+      al->clk_anchor_ns     = ns;
+      al->clk_anchor_frames = frames;
+      al->clk_sx = al->clk_sy = al->clk_sxx = al->clk_sxy = al->clk_n = 0.0;
+      return;
+   }
+
+   x = (double)(ns - al->clk_anchor_ns) / 1000000000.0;
+   y = (double)(frames - al->clk_anchor_frames);
+
+   al->clk_sx  += x;
+   al->clk_sy  += y;
+   al->clk_sxx += x * x;
+   al->clk_sxy += x * y;
+   al->clk_n   += 1.0;
+
+   d = al->clk_n * al->clk_sxx - al->clk_sx * al->clk_sx;
+   if (x >= 1.0 && d > 0.0)
+   {
+      double slope = (al->clk_n * al->clk_sxy - al->clk_sx * al->clk_sy) / d;
+      double ppm   = (slope / (double)al->rate - 1.0) * 1000000.0;
+      if (ppm > -100000.0 && ppm < 100000.0)
+      {
+         al->clk_ppm   = (int)ppm;
+         al->clk_valid = 1;
+      }
+   }
+}
+
 static size_t al_frames_consumed(void *data)
 {
-   al_t *al = (al_t*)data;
+   al_t  *al = (al_t*)data;
+   size_t n;
    if (!al)
       return 0;
-   return retro_atomic_load_acquire_size(&al->consumed);
+   n = retro_atomic_load_acquire_size(&al->consumed);
+   al_clock_sample(al, n);
+   return n;
+}
+
+/* The device clock, for the statistics overlay. */
+static bool al_device_clock_ppm(void *data, double *ppm)
+{
+   al_t *al = (al_t*)data;
+   if (!al || !al->clk_valid)
+      return false;
+   *ppm = (double)al->clk_ppm;
+   return true;
 }
 
 static bool al_use_float(void *data)
 {
    al_t *al = (al_t*)data;
-   if (al->format == AL_FORMAT_STEREO16)
-      return false;
-   return true;
+   return al->frame_size != audio_layout_channels(al->layout) * sizeof(int16_t);
+}
+
+static uint32_t al_layout(void *data)
+{
+   al_t *al = (al_t*)data;
+   return al ? al->layout : AUDIO_LAYOUT_STEREO;
 }
 
 static void al_device_list_free(void *u, void *slp)
@@ -604,5 +781,9 @@ audio_driver_t audio_openal = {
    al_buffer_size,
    NULL, /* write_raw */
    al_wait_writable,
-   al_frames_consumed
+   al_frames_consumed,
+   NULL, /* underruns */
+   al_layout,
+   NULL, /* frames_consumed_fallback */
+   al_device_clock_ppm
 };

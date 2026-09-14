@@ -73,6 +73,7 @@
 
 #include "../gfx/gfx_animation.h"
 #include "../input/input_driver.h"
+#include "../input/input_osk.h"
 #include "../input/input_remapping.h"
 #include "../performance_counters.h"
 #include "../version.h"
@@ -1656,7 +1657,7 @@ static bool menu_input_key_bind_poll_find_hold_pad(
       if (!found)
          continue;
 
-      output->key = (enum retro_key)b;
+      RETRO_KEYBIND_SET_KEY(output, (enum retro_key)b);
       return true;
    }
 
@@ -1772,7 +1773,7 @@ static bool menu_input_key_bind_poll_find_trigger_pad(
       if (!found)
          continue;
 
-      output->key = (enum retro_key)b;
+      RETRO_KEYBIND_SET_KEY(output, (enum retro_key)b);
       return true;
    }
 
@@ -2555,6 +2556,8 @@ static bool menu_driver_displaylist_push(
       path      = list->list[list->size - 1].path;
       label     = list->list[list->size - 1].label;
       type      = list->list[list->size - 1].type;
+
+      info.directory_ptr = list->list[list->size - 1].directory_ptr;
    }
 
    if (cbs)
@@ -3115,6 +3118,7 @@ static bool menu_shader_manager_save_preset_internal(
 {
    size_t _len;
    char fullname[NAME_MAX_LENGTH];
+   char buffer[DIR_MAX_LENGTH];
    bool ret                       = false;
    enum rarch_shader_type type    = RARCH_SHADER_NONE;
    char *preset_path              = NULL;
@@ -3143,7 +3147,6 @@ static bool menu_shader_manager_save_preset_internal(
    else
    {
       char basedir[DIR_MAX_LENGTH];
-      char buffer[DIR_MAX_LENGTH];
 
       for (i = 0; i < num_target_dirs; i++)
       {
@@ -3676,7 +3679,7 @@ MENU_NOINLINE static int menu_dialog_iterate(
 
 #ifdef HAVE_CHEEVOS
       case MENU_DIALOG_HELP_CHEEVOS_DESCRIPTION:
-         if (!rcheevos_menu_get_sublabel(p_dialog->current_id, s, len))
+         if (!rcheevos_menu_get_help_text(p_dialog->current_id, s, len))
             return 1;
          break;
 #endif
@@ -4609,6 +4612,7 @@ void menu_input_dialog_end(void)
    struct menu_state *menu_st                 = &menu_driver_state;
    menu_st->input_dialog_kb_type              = 0;
    menu_st->input_dialog_kb_idx               = 0;
+   menu_st->input_dialog_kb_text_type         = MENU_INPUT_DIALOG_KB_TYPE_TEXT;
    menu_st->flags                            &= ~MENU_ST_FLAG_INP_DLG_KB_DISPLAY;
    menu_st->input_dialog_kb_label[0]          = '\0';
    menu_st->input_dialog_kb_label_setting[0]  = '\0';
@@ -4844,13 +4848,13 @@ static bool menu_input_key_bind_custom_bind_keyboard_cb(
    uint64_t current_usec            = cpu_features_get_time_usec();
 
    /* Clear old mapping bit */
-   input_keyboard_mapping_bits(0, binds->buffer.key);
+   input_keyboard_mapping_bits(0, RETRO_KEYBIND_KEY(&binds->buffer));
 
    /* Store key in bind */
-   binds->buffer.key                = (enum retro_key)code;
+   RETRO_KEYBIND_SET_KEY(&binds->buffer, (enum retro_key)code);
 
    /* Store new mapping bit */
-   input_keyboard_mapping_bits(1, binds->buffer.key);
+   input_keyboard_mapping_bits(1, RETRO_KEYBIND_KEY(&binds->buffer));
 
    /* Write out the bind */
    *(binds->output)                 = binds->buffer;
@@ -5012,7 +5016,7 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
       struct menu_bind_state new_binds      = *_binds;
       unsigned bind_index                   = _binds->begin - MENU_SETTINGS_BIND_BEGIN;
       const struct retro_keybind *old_binds = &input_config_binds[new_binds.port][bind_index];
-      unsigned old_key                      = old_binds->key;
+      unsigned old_key                      = RETRO_KEYBIND_KEY(old_binds);
 
       input_st->flags                      &= ~INP_FLAG_KB_MAPPING_BLOCKED;
 
@@ -5123,10 +5127,10 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
          *(new_binds.output)                 = new_binds.buffer;
 
          /* Update keyboard mapping bits */
-         if (new_binds.buffer.key)
+         if (RETRO_KEYBIND_KEY(&new_binds.buffer))
          {
             input_keyboard_mapping_bits(0, old_key);
-            input_keyboard_mapping_bits(1, new_binds.buffer.key);
+            input_keyboard_mapping_bits(1, RETRO_KEYBIND_KEY(&new_binds.buffer));
          }
 
          /* Avoid new binds triggering things right away. */
@@ -5182,24 +5186,17 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
 }
 
 
-/* True when a platform-native text-entry panel currently owns the
- * keyboard line.  The built-in on-screen keyboard must not process
- * input in that case: both paths write into input_st->keyboard_line,
- * and input_event_osk_append() calls input_keyboard_line_append(),
- * which can realloc the buffer out from under state the native path
- * is holding.  Steam's OSK already had this guard open-coded at the
- * two call sites; the iOS native keyboard needs the same. */
-static bool menu_input_native_kb_active(void)
+/* input_osk_native_active() is true when a platform-native text-entry
+ * panel currently owns the keyboard line.  The built-in on-screen
+ * keyboard must not append in that case: both paths write into
+ * input_st->keyboard_line, and input_event_osk_append() calls
+ * input_keyboard_line_append(), which can realloc the buffer out from
+ * under state the native path is holding.  Every backend answers
+ * through that one function; see input/input_osk.h. */
+
+enum menu_input_dialog_kb_text_type menu_input_dialog_get_kb_text_type(void)
 {
-#ifdef HAVE_MIST
-   if (steam_has_osk_open())
-      return true;
-#endif
-#ifdef HAVE_COCOATOUCH
-   if (ios_keyboard_active())
-      return true;
-#endif
-   return false;
+   return menu_driver_state.input_dialog_kb_text_type;
 }
 
 bool menu_input_dialog_get_display_kb(void)
@@ -5658,7 +5655,9 @@ unsigned menu_event(
       /* Menu navigation stays suppressed for the whole OSK session
        * (the trigger clear below), but the built-in keyboard only
        * consumes input when no native panel owns the line. */
-      if (!menu_input_native_kb_active())
+      bool native_kb = input_osk_native_active();
+
+      if (!native_kb)
       {
       bool show_osk_symbols = input_event_osk_show_symbol_pages(menu_st->driver_data);
 
@@ -5739,6 +5738,25 @@ unsigned menu_event(
             input_keyboard_event(true, '\n', '\n', 0, RETRO_DEVICE_KEYBOARD);
       }
 
+      /* Scan: Clear the keyboard input window */
+      if (BIT256_GET_PTR(p_trigger_input, RETRO_DEVICE_ID_JOYPAD_Y))
+         input_keyboard_line_clear(input_st);
+
+      }
+      /* Cancel closes outright under a native panel: the panel owns
+       * the text, so feeding it a backspace here would only desync
+       * the two buffers. */
+      else if (BIT256_GET_PTR(p_trigger_input, menu_cancel_btn))
+         input_keyboard_event(true, '\n', '\n', 0, RETRO_DEVICE_KEYBOARD);
+
+      /* Closing the dialog stays available whichever keyboard is up.
+       * These two end the line through input_keyboard_event() and
+       * never reach input_event_osk_append(), so the realloc hazard
+       * the guard above exists for does not apply to them - and
+       * without them a native panel that emits no Return (webOS) or
+       * that the user has dismissed leaves the dialog with no way out
+       * from a pad at all. */
+
       /* Select: Clear and close the keyboard input window */
       if (BIT256_GET_PTR(p_trigger_input, RETRO_DEVICE_ID_JOYPAD_SELECT))
       {
@@ -5746,16 +5764,10 @@ unsigned menu_event(
          input_keyboard_event(true, '\n', '\n', 0, RETRO_DEVICE_KEYBOARD);
       }
 
-      /* Scan: Clear the keyboard input window */
-      if (BIT256_GET_PTR(p_trigger_input, RETRO_DEVICE_ID_JOYPAD_Y))
-         input_keyboard_line_clear(input_st);
-
       /* Start + Search: Send return key to close keyboard input window */
       if (     BIT256_GET_PTR(p_trigger_input, RETRO_DEVICE_ID_JOYPAD_START)
             || BIT256_GET_PTR(p_trigger_input, RETRO_DEVICE_ID_JOYPAD_X))
          input_keyboard_event(true, '\n', '\n', 0, RETRO_DEVICE_KEYBOARD);
-
-      }
 
       BIT256_CLEAR_ALL_PTR(p_trigger_input);
    }
@@ -5777,7 +5789,7 @@ unsigned menu_event(
          for (i = RETRO_DEVICE_ID_JOYPAD_L2; i <= RETRO_DEVICE_ID_JOYPAD_R3; i++)
          {
             if (     (menu_toggle_bind.joykey != NO_BTN && menu_toggle_bind.joykey == input_config_binds[0][i].joykey)
-                  || (menu_toggle_bind.key != RETROK_UNKNOWN && menu_toggle_bind.key == input_config_binds[0][i].key))
+                  || (RETRO_KEYBIND_KEY(&menu_toggle_bind) != RETROK_UNKNOWN && RETRO_KEYBIND_KEY(&menu_toggle_bind) == RETRO_KEYBIND_KEY(&input_config_binds[0][i])))
                onkeyup |= (1 << i);
          }
       }
@@ -6049,6 +6061,9 @@ MENU_NOINLINE static int menu_input_post_iterate(
    menu_file_list_cbs_t *cbs                       = selection_buf && selection_buf->size
       ? (menu_file_list_cbs_t*)selection_buf->list[selection].actiondata
       : NULL;
+   unsigned output_size                            = VIDEO_DRIVER_OUTPUT_SIZE(video_st);
+   unsigned output_width                           = VIDEO_DRIVER_OUTPUT_WIDTH(output_size);
+   unsigned output_height                          = VIDEO_DRIVER_OUTPUT_HEIGHT(output_size);
 
    MENU_ENTRY_INITIALIZE(entry);
    entry.flags |= MENU_ENTRY_FLAG_PATH_ENABLED
@@ -6140,7 +6155,7 @@ MENU_NOINLINE static int menu_input_post_iterate(
             /* Pointer is being held down
              * (i.e. for more than one frame) */
             float dpi = menu ? menu_input_get_dpi(menu, p_disp,
-                  video_st->width, video_st->height) : 0.0f;
+                  output_width, output_height) : 0.0f;
 
             /* > Update deltas + acceleration & detect press direction
              *   Note: We only do this if the pointer has moved above
@@ -6372,13 +6387,13 @@ MENU_NOINLINE static int menu_input_post_iterate(
              * line swallows the gesture outright - the enclosing
              * branch still runs so it does not fall through to
              * normal menu input. */
-            if (     !menu_input_native_kb_active()
+            if (     !input_osk_native_active()
                   && !(menu_input->pointer.flags & MENU_INP_PTR_FLG_DRAGGED))
             {
                if (     menu_st->driver_ctx
                      && menu_st->driver_ctx->osk_pointer_over_textbox
                      && menu_st->driver_ctx->osk_pointer_over_textbox(
-                        menu_st->userdata, x, y, video_st->width, video_st->height))
+                        menu_st->userdata, x, y, output_width, output_height))
                   input_st->osk_textbox_focus = true;
                else
                {
@@ -6439,7 +6454,7 @@ MENU_NOINLINE static int menu_input_post_iterate(
             {
                /* Pointer has moved - check if this is a swipe */
                float dpi = menu ? menu_input_get_dpi(menu, p_disp,
-                     video_st->width, video_st->height) : 0.0f;
+                     output_width, output_height) : 0.0f;
 
                if (     (dpi > 0.0f)
                      && (menu_input->pointer.press_duration <
@@ -7170,10 +7185,10 @@ bool menu_driver_ctl(enum rarch_menu_ctl_state state, void *data)
          break;
       case RARCH_MENU_CTL_OSK_PTR_AT_POS:
          {
-            video_driver_state_t
-               *video_st              = video_state_get_ptr();
-            unsigned width            = video_st->width;
-            unsigned height           = video_st->height;
+            unsigned output_size      = VIDEO_DRIVER_OUTPUT_SIZE(
+                  video_state_get_ptr());
+            unsigned width            = VIDEO_DRIVER_OUTPUT_WIDTH(output_size);
+            unsigned height           = VIDEO_DRIVER_OUTPUT_HEIGHT(output_size);
             menu_ctx_pointer_t *point = (menu_ctx_pointer_t*)data;
             if (!menu_st->driver_ctx || !menu_st->driver_ctx->osk_ptr_at_pos)
             {
@@ -7825,7 +7840,7 @@ static int generic_menu_iterate(
          break;
       case ITERATE_TYPE_DEFAULT:
          {
-            menu_entry_t entry;
+            menu_entry_t *entry = &menu_st->iterate_entry;
             menu_list_t *menu_list = menu_st->entries.list;
             size_t selection       = menu_st->selection_ptr;
             size_t menu_list_size  = menu_st->entries.list ? MENU_LIST_GET_SELECTION(menu_st->entries.list, 0)->size : 0;
@@ -7836,14 +7851,14 @@ static int generic_menu_iterate(
              * should not rely on a hack like this in order to work. */
             selection = MAX(MIN(selection, (menu_list_size - 1)), 0);
 
-            MENU_ENTRY_INITIALIZE(entry);
+            MENU_ENTRY_INITIALIZE((*entry));
             /* NOTE: If menu_entry_action() is modified,
              * will have to verify that these parameters
              * remain unused... */
-            entry.flags |= MENU_ENTRY_FLAG_PATH_ENABLED
+            entry->flags |= MENU_ENTRY_FLAG_PATH_ENABLED
                          | MENU_ENTRY_FLAG_LABEL_ENABLED;
-            menu_entry_get(&entry, 0, selection, NULL, false);
-            if ((ret = menu_entry_action(&entry,
+            menu_entry_get(entry, 0, selection, NULL, false);
+            if ((ret = menu_entry_action(entry,
                   selection, (enum menu_action)action)))
                return -1;
 
@@ -8461,6 +8476,7 @@ bool menu_input_dialog_start_search(void)
    steam_open_osk();
 #endif
    menu_st->flags                         |= MENU_ST_FLAG_INP_DLG_KB_DISPLAY;
+   menu_st->input_dialog_kb_text_type      = MENU_INPUT_DIALOG_KB_TYPE_TEXT;
    strlcpy(menu_st->input_dialog_kb_label,
          msg_hash_to_str(MENU_ENUM_LABEL_VALUE_SEARCH),
          sizeof(menu_st->input_dialog_kb_label));
@@ -8551,8 +8567,9 @@ bool menu_input_dialog_start(menu_input_ctx_line_t *line)
             line->label_setting,
             sizeof(menu_st->input_dialog_kb_label_setting));
 
-   menu_st->input_dialog_kb_type   = line->type;
-   menu_st->input_dialog_kb_idx    = line->idx;
+   menu_st->input_dialog_kb_type      = line->type;
+   menu_st->input_dialog_kb_idx       = line->idx;
+   menu_st->input_dialog_kb_text_type = line->text_type;
 
    input_keyboard_line_free(input_st);
 

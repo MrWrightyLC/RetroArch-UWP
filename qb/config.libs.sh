@@ -318,8 +318,10 @@ if [ "$OS" = 'Darwin' ]; then
    check_platform Darwin COCOA 'Cocoa is' true
    check_lib '' COREAUDIO "-framework AudioUnit" AudioUnitInitialize
    check_lib '' CORETEXT "-framework CoreText" CTFontCreateWithName
-   add_opt MODELINE no
-   add_opt CRTSWITCHRES no
+   # The modeline engine stays on: macOS cannot program a timing (the
+   # Apple display server has no modeline ops), but the engine also
+   # carries the EDID reader that System Information > Display
+   # Information > EDID shows, and that works here.
 
    # The microphone driver (audio/drivers/coreaudio_mic_macos.m) uses
    # C11 <stdatomic.h>, which requires a 10.6/10.7-era SDK or newer.
@@ -560,6 +562,7 @@ check_platform Win32 WASAPI 'WASAPI is' true
 check_platform Win32 XAUDIO 'XAudio is' true
 check_platform Win32 WINMM 'WinMM is' true
 check_platform Win32 ASIO 'ASIO is' true
+check_platform Win32 WDMKS 'WDM-KS is' true
 
 if [ "$HAVE_BLISSBOX" != 'no' ]; then
    # Linux resolves the pad type through hidraw and only falls back to

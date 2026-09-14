@@ -379,6 +379,13 @@ typedef struct
    char theme_preset_path[PATH_MAX_LENGTH];       /* Must be a fixed length array... */
    char theme_dynamic_path[PATH_MAX_LENGTH];      /* Must be a fixed length array... */
    char last_theme_dynamic_path[PATH_MAX_LENGTH]; /* Must be a fixed length array... */
+   /* What rendering one entry needs. Here rather than in the loop that
+    * renders them: a menu_entry_t is 3872 bytes on its own, and with
+    * the sublabel buffer beside it the frame came to 5912 - past what
+    * this tree allows, on a function that runs every frame. One entry
+    * is rendered at a time. */
+   menu_entry_t render_entry;
+   char render_sublabel_buf[MENU_LABEL_MAX_LENGTH];
    char menu_sublabel[MENU_LABEL_MAX_LENGTH];     /* Must be a fixed length array... */
 } rgui_t;
 
@@ -5307,9 +5314,14 @@ RGUI_NOINLINE static void rgui_render_osk(
    const char *input_str          = menu_input_dialog_get_buffer();
    struct menu_state *menu_st     = menu_state_get_ptr();
    const char *input_label        = menu_st->input_dialog_kb_label;
+   /* A system keyboard panel is up and owns text entry: draw the
+    * label and the entry field, but not a second set of keys on top
+    * of it. The grid is not iterated in that state either, so
+    * osk_grid may legitimately be empty. */
+   bool native_kb                 = input_osk_native_active();
 
    /* Sanity check 1 */
-   if (osk_ptr < 0 || osk_ptr >= 44 || !osk_grid[0])
+   if (!native_kb && (osk_ptr < 0 || osk_ptr >= 44 || !osk_grid[0]))
       return;
 
    key_text_offset_x      = 8;
@@ -5321,7 +5333,7 @@ RGUI_NOINLINE static void rgui_render_osk(
    ptr_width              = key_width  - (ptr_offset_x * 2);
    ptr_height             = key_height - (ptr_offset_y * 2);
    keyboard_width         = key_width  * OSK_CHARS_PER_LINE;
-   keyboard_height        = key_height * 4;
+   keyboard_height        = native_kb ? 0 : key_height * 4;
    keyboard_offset_x      = 10;
    keyboard_offset_y      = 10 + 15 + (2 * rgui->font_height_stride);
    input_label_max_length = (keyboard_width / rgui->font_width_stride);
@@ -5376,8 +5388,9 @@ RGUI_NOINLINE static void rgui_render_osk(
          rgui_color_rect(frame_buf_data, fb_width, fb_height,
                osk_x + 5, osk_y + 5, 1, osk_height - 10, shadow_color);
          /* Divider */
-         rgui_color_rect(frame_buf_data, fb_width, fb_height,
-               osk_x + 5, osk_y + keyboard_offset_y - 5, osk_width - 10, 1, shadow_color);
+         if (!native_kb)
+            rgui_color_rect(frame_buf_data, fb_width, fb_height,
+                  osk_x + 5, osk_y + keyboard_offset_y - 5, osk_width - 10, 1, shadow_color);
       }
 
       /* Frame */
@@ -5394,9 +5407,10 @@ RGUI_NOINLINE static void rgui_render_osk(
             osk_x, osk_y + 5, 5, osk_height - 5,
             border_dark_color, border_light_color, border_thickness);
       /* Divider */
-      rgui_fill_rect(frame_buf_data, fb_width, fb_height,
-            osk_x + 5, osk_y + keyboard_offset_y - 10, osk_width - 10, 5,
-            border_dark_color, border_light_color, border_thickness);
+      if (!native_kb)
+         rgui_fill_rect(frame_buf_data, fb_width, fb_height,
+               osk_x + 5, osk_y + keyboard_offset_y - 10, osk_width - 10, 5,
+               border_dark_color, border_light_color, border_thickness);
    }
 
    /* Draw input label text */
@@ -5544,6 +5558,9 @@ RGUI_NOINLINE static void rgui_render_osk(
    }
 
    /* Draw keyboard 'keys' */
+   if (native_kb)
+      return;
+
    for (key_index = 0; key_index < 44; key_index++)
    {
       unsigned key_row     = (unsigned)(key_index / OSK_CHARS_PER_LINE);
@@ -6245,7 +6262,7 @@ static void rgui_render(void *data, unsigned width, unsigned height,
       {
          char entry_title_buf[NAME_MAX_LENGTH];
          char type_str_buf[NAME_MAX_LENGTH];
-         menu_entry_t entry;
+         menu_entry_t *entry = &rgui->render_entry;
          const char *entry_value                     = NULL;
          size_t entry_title_max_len                  = 0;
          unsigned entry_value_len                    = 0;
@@ -6262,15 +6279,15 @@ static void rgui_render(void *data, unsigned width, unsigned height,
          type_str_buf[0]     = '\0';
 
          /* Get current entry */
-         MENU_ENTRY_INITIALIZE(entry);
-         entry.flags        |= MENU_ENTRY_FLAG_RICH_LABEL_ENABLED
+         MENU_ENTRY_INITIALIZE((*entry));
+         entry->flags        |= MENU_ENTRY_FLAG_RICH_LABEL_ENABLED
                              | MENU_ENTRY_FLAG_VALUE_ENABLED;
-         menu_entry_get(&entry, 0, (unsigned)i, NULL, true);
+         menu_entry_get(entry, 0, (unsigned)i, NULL, true);
 
-         if (entry.enum_idx == MENU_ENUM_LABEL_CHEEVOS_PASSWORD)
-            entry_value      = entry.password_value;
+         if (entry->enum_idx == MENU_ENUM_LABEL_CHEEVOS_PASSWORD)
+            entry_value      = entry->password_value;
          else
-            entry_value      = entry.value;
+            entry_value      = entry->value;
 
          /* Get base length of entry title field */
          entry_title_max_len = rgui->term_layout.width - (1 + 2);
@@ -6315,8 +6332,8 @@ static void rgui_render(void *data, unsigned width, unsigned height,
          /* Get 'type' of entry value component */
          entry_value_type = rgui_get_entry_value_type(
                entry_value,
-               entry.setting_type,
-               (entry.flags & MENU_ENTRY_FLAG_CHECKED) ? true : false,
+               entry->setting_type,
+               (entry->flags & MENU_ENTRY_FLAG_CHECKED) ? true : false,
                rgui_switch_icons);
 
          switch (entry_value_type)
@@ -6328,7 +6345,7 @@ static void rgui_render(void *data, unsigned width, unsigned height,
                 * down' to current value_maxlen */
                entry_value_len = rgui_full_width_layout
                      ? (unsigned)utf8len(entry_value)
-                     : entry.spacing;
+                     : entry->spacing;
 
                entry_value_len = (entry_value_len > rgui->term_layout.value_maxlen)
                      ? rgui->term_layout.value_maxlen
@@ -6362,10 +6379,10 @@ static void rgui_render(void *data, unsigned width, unsigned height,
          {
             ticker_smooth.selected    = entry_selected;
             ticker_smooth.field_width = (unsigned)(entry_title_max_len * rgui->font_width_stride);
-            if (*entry.rich_label)
-               ticker_smooth.src_str  = entry.rich_label;
+            if (*entry->rich_label)
+               ticker_smooth.src_str  = entry->rich_label;
             else
-               ticker_smooth.src_str  = entry.path;
+               ticker_smooth.src_str  = entry->path;
             ticker_smooth.dst_str     = entry_title_buf;
             ticker_smooth.dst_str_len = sizeof(entry_title_buf);
             ticker_smooth.x_offset    = &ticker_x_offset;
@@ -6377,10 +6394,10 @@ static void rgui_render(void *data, unsigned width, unsigned height,
             ticker.s                  = entry_title_buf;
             ticker.s_len              = sizeof(entry_title_buf);
             ticker.len                = entry_title_max_len;
-            if (*entry.rich_label)
-               ticker.str             = entry.rich_label;
+            if (*entry->rich_label)
+               ticker.str             = entry->rich_label;
             else
-               ticker.str             = entry.path;
+               ticker.str             = entry->path;
             ticker.selected           = entry_selected;
 
             gfx_animation_ticker(&ticker);
@@ -6530,7 +6547,7 @@ static void rgui_render(void *data, unsigned width, unsigned height,
       /* Print menu sublabel/core name (if required) */
       if (menu_show_sublabels && *rgui->menu_sublabel)
       {
-         char sublabel_buf[MENU_LABEL_MAX_LENGTH];
+         char *sublabel_buf = rgui->render_sublabel_buf;
          sublabel_buf[0] = '\0';
 
          if (use_smooth_ticker)
@@ -6539,7 +6556,7 @@ static void rgui_render(void *data, unsigned width, unsigned height,
             ticker_smooth.field_width = (rgui->term_layout.width - sublabel_len) * rgui->font_width_stride;
             ticker_smooth.src_str     = rgui->menu_sublabel;
             ticker_smooth.dst_str     = sublabel_buf;
-            ticker_smooth.dst_str_len = sizeof(sublabel_buf);
+            ticker_smooth.dst_str_len = MENU_LABEL_MAX_LENGTH;
             ticker_smooth.x_offset    = &ticker_x_offset;
 
             gfx_animation_ticker_smooth(&ticker_smooth);
@@ -6547,7 +6564,7 @@ static void rgui_render(void *data, unsigned width, unsigned height,
          else
          {
             ticker.s                  = sublabel_buf;
-            ticker.s_len              = sizeof(sublabel_buf);
+            ticker.s_len              = MENU_LABEL_MAX_LENGTH;
             ticker.len                = rgui->term_layout.width - sublabel_len;
             ticker.str                = rgui->menu_sublabel;
             ticker.selected           = true;
@@ -7673,51 +7690,61 @@ static void rgui_load_current_thumbnails(rgui_t *rgui, struct menu_state *menu_s
 
 static void rgui_update_savestate_thumbnail_path(void *data, unsigned i)
 {
+   /* Off the frame: a path and a menu_entry_t came to 5960 bytes where
+    * this tree allows four thousand. This runs when the selection
+    * moves, not every frame, so one allocation costs less than the
+    * frame did. */
+   struct rgui_savestate_thumb_scratch
+   {
+      menu_entry_t entry;
+      char path[PATH_MAX_LENGTH];
+   } *scratch;
    settings_t *settings     = config_get_ptr();
    rgui_t *rgui             = (rgui_t*)data;
    bool savestate_thumbnail = settings->bools.savestate_thumbnail_enable;
 
-   if (!rgui)
+   if (!(scratch = (struct rgui_savestate_thumb_scratch*)malloc(sizeof(*scratch))))
       return;
 
+   if (!rgui)
+      { free(scratch); return; }
    rgui->savestate_thumbnail_file_path[0] = '\0';
 
    /* Savestate thumbnails are only relevant
     * when viewing the running quick menu or state slots */
    if (!(   (rgui->flags & RGUI_FLAG_IS_QUICK_MENU && menu_is_running_quick_menu())
          || (rgui->flags & RGUI_FLAG_IS_STATE_SLOT)))
-      return;
-
+      { free(scratch); return; }
    if (savestate_thumbnail)
    {
-      menu_entry_t entry;
+      menu_entry_t *entry = &scratch->entry;
 
-      MENU_ENTRY_INITIALIZE(entry);
-      entry.flags |= MENU_ENTRY_FLAG_LABEL_ENABLED;
-      menu_entry_get(&entry, 0, i, NULL, true);
+      MENU_ENTRY_INITIALIZE((*entry));
+      entry->flags |= MENU_ENTRY_FLAG_LABEL_ENABLED;
+      menu_entry_get(entry, 0, i, NULL, true);
 
-      if (*entry.label)
+      if (*entry->label)
       {
-         unsigned _state_slot = string_to_unsigned(entry.label);
+         unsigned _state_slot = string_to_unsigned(entry->label);
          if (     _state_slot == MENU_ENUM_LABEL_STATE_SLOT
-               || string_is_equal(entry.label, MENU_ENUM_LABEL_STATE_SLOT_RUN_STR)
-               || string_is_equal(entry.label, MENU_ENUM_LABEL_STATE_SLOT_STR)
-               || string_is_equal(entry.label, MENU_ENUM_LABEL_LOAD_STATE_STR)
-               || string_is_equal(entry.label, MENU_ENUM_LABEL_SAVE_STATE_STR))
+               || string_is_equal(entry->label, MENU_ENUM_LABEL_STATE_SLOT_RUN_STR)
+               || string_is_equal(entry->label, MENU_ENUM_LABEL_STATE_SLOT_STR)
+               || string_is_equal(entry->label, MENU_ENUM_LABEL_LOAD_STATE_STR)
+               || string_is_equal(entry->label, MENU_ENUM_LABEL_SAVE_STATE_STR))
          {
-            char path[PATH_MAX_LENGTH];
+            char *path = scratch->path;
             runloop_state_t *runloop_st = runloop_state_get_ptr();
             int state_slot              = settings->ints.state_slot;
 
             /* State slot dropdown */
             if (     _state_slot == MENU_ENUM_LABEL_STATE_SLOT
-                  || string_is_equal(entry.label, MENU_ENUM_LABEL_STATE_SLOT_RUN_STR))
+                  || string_is_equal(entry->label, MENU_ENUM_LABEL_STATE_SLOT_RUN_STR))
             {
                state_slot          = i - 1;
                rgui->flags        |= RGUI_FLAG_IS_STATE_SLOT;
             }
 
-            gfx_savestate_thumbnail_get_path(path, sizeof(path),
+            gfx_savestate_thumbnail_get_path(path, PATH_MAX_LENGTH,
                   runloop_st->name.savestate, state_slot);
 
             strlcpy(rgui->savestate_thumbnail_file_path,
@@ -7726,6 +7753,7 @@ static void rgui_update_savestate_thumbnail_path(void *data, unsigned i)
          }
       }
    }
+   free(scratch);
 }
 
 static void rgui_reset_savestate_thumbnail(void *data)

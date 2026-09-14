@@ -206,7 +206,6 @@ static const struct
    char s_9834febe[489];
    char s_93805cc8_0[500];
    char s_93805cc8_1[134];
-   char s_b495662b[161];
    char s_9953f4e2[258];
    char s_79e212bd[6];
    char s_6342700c[10];
@@ -255,13 +254,13 @@ static const struct
    char s_35a1323d[17];
    char s_f72667c9[23];
    char s_adce4374[20];
+   char s_5984f4f9[7];
 #ifndef HAVE_DYNAMIC
    char s_e011fe61[52];
 #endif
    char s_4e447c6c[31];
    char s_d9a51d02[10];
    char s_12e77e8f[14];
-   char s_af6007a1[14];
    char s_da068369[18];
    char s_48c208ee[17];
    char s_a38cafbb[19];
@@ -615,6 +614,8 @@ static const struct
    char s_639f529e[20];
    char s_4927597c[14];
    char s_77b74366[15];
+   char s_ab49119c[7];
+   char s_ddf679b9[7];
    char s_3b7e9d77[12];
    char s_10342503[10];
    char s_d31f6d88[16];
@@ -1501,7 +1502,6 @@ static const struct
    char s_74b77b4a[14];
    char s_7534cfc9[7];
    char s_36259b63[26];
-   char s_37368130[14];
    char s_d51f54a2[15];
    char s_b35f573c[9];
    char s_1cad7751[11];
@@ -1939,6 +1939,7 @@ static const struct
    char s_519cd5f8[28];
    char s_43ac80a0[13];
    char s_6959ce80[15];
+   char s_aa628249[6];
    char s_ebe994b4[23];
    char s_1c62c301[9];
    char s_a8bb35b6[12];
@@ -3394,7 +3395,6 @@ static const struct
    char s_36033606[214];
    char s_2e69508b[361];
    char s_7e96b5ce[50];
-   char s_3547866d[157];
    char s_c2314d30[218];
 #if defined(RARCH_MOBILE)
    char s_82c9e375[190];
@@ -4379,8 +4379,6 @@ static const struct
    "a frequenza esatta del contenu",
    "to. \303\210 possibile lasciare attivo il VRR (frequenza di aggiornamento variabile) di sistema,"
    " purch\303\251 non si attivi questa impostazione.",
-   "Usa driver video multithread. Il suo utilizzo potrebbe migliorare le prestazioni, al costo di un"
-   "a possibile latenza maggiore e di un aumento degli scatti video.",
    "Sincronizza con Esact Content Framerate. Questa opzione equivale a forzare la velocit\303\240 di"
    " x1 pur consentendo un rapido avanzamento. Nessuna deviazione dalla frequenza di aggiornamento r"
    "ichiesta dal core, nessun controllo della velocit\303\240 dinamica del suono.",
@@ -4431,13 +4429,13 @@ static const struct
    "Modalit\303\240 vocale",
    "Lingua di destinazione",
    "URL del servizio IA",
+   "Sempre",
 #ifndef HAVE_DYNAMIC
    "Ricarica sempre il Core in esecuzione dei contenuti",
 #endif
    "Disconnetti Android workaround",
    "Icona App",
    "Risorse/Asset",
-   "Blocchi Frame",
    "Dispositivo audio",
    "Plugin Audio DSP",
    "Rimuovi plugin DSP",
@@ -4791,6 +4789,8 @@ static const struct
    "Controllo del disco",
    "Espelli Disco",
    "Inserire disco",
+   "Grezzo",
+   "Uscita",
    "Predefinito",
    "Scaricati",
    "Scarica un core",
@@ -5677,7 +5677,6 @@ static const struct
    "&Scarica Core",
    "&Aiuto",
    "Informazioni Su RetroArch",
-   "Collaboratori",
    "Documentazione",
    "Cancella",
    "&Strumenti",
@@ -6121,6 +6120,7 @@ static const struct
    "Sistema operativo front-end",
    "Versione Git",
    "Versione Lakka",
+   "Ritmo",
    "Fonte di alimentazione",
    "Caricato",
    "Caricamento",
@@ -8044,8 +8044,6 @@ static const struct
    "-reported, fornendo un miglioramento del ritmo dei frame quando si esegue e.. contenuto di 30 fp"
    "s su un display a 60 Hz o un contenuto di 60 fps su un display a 120 Hz.",
    "Cambia le impostazioni di sincronizzazione video.",
-   "Migliora le prestazioni al costo della latenza e di una maggiore incisione video. Usalo solo se "
-   "altrimenti non \303\250 possibile ottenere una velocit\303\240 maggiore.",
    "Tenta di migliorare le prestazioni usando i buffer di argomenti di Metal. Alcuni core potrebbero"
    " richiederli. Potrebbe compromettere alcuni shader, specialmente su hardware o versioni di siste"
    "ma operativo pi\303\271 datati.",
@@ -8697,7 +8695,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_it_blob_check[
-      (sizeof(msg_hash_it_blob) == (183704u
+      (sizeof(msg_hash_it_blob) == (183385u
 #ifdef ANDROID
        + 376u
 #endif
@@ -9294,7 +9292,6 @@ static const uint32_t msg_hash_it_ids[] =
    (uint32_t)MENU_ENUM_LABEL_HELP_VIDEO_SHADER_PRESET,
    (uint32_t)MENU_ENUM_LABEL_HELP_VIDEO_SHADER_SCALE_PASS,
    (uint32_t)MENU_ENUM_LABEL_HELP_VIDEO_SHADER_SUBFRAMES,
-   (uint32_t)MENU_ENUM_LABEL_HELP_VIDEO_THREADED,
    (uint32_t)MENU_ENUM_LABEL_HELP_VRR_RUNLOOP_ENABLE,
    (uint32_t)MENU_ENUM_LABEL_RUMBLE_PORT_16,
    (uint32_t)MENU_ENUM_LABEL_RUMBLE_TYPE_CHANGES,
@@ -9343,13 +9340,13 @@ static const uint32_t msg_hash_it_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_AI_SERVICE_SPEECH_MODE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AI_SERVICE_TARGET_LANG,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AI_SERVICE_URL,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_ALWAYS,
 #ifndef HAVE_DYNAMIC
    (uint32_t)MENU_ENUM_LABEL_VALUE_ALWAYS_RELOAD_CORE_ON_RUN_CONTENT,
 #endif
    (uint32_t)MENU_ENUM_LABEL_VALUE_ANDROID_INPUT_DISCONNECT_WORKAROUND,
    (uint32_t)MENU_ENUM_LABEL_VALUE_APPICON_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_ASSETS_DIRECTORY,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_BLOCK_FRAMES,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_DEVICE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_DSP_PLUGIN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_DSP_PLUGIN_REMOVE,
@@ -9703,6 +9700,8 @@ static const uint32_t msg_hash_it_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_OPTIONS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_TRAY_EJECT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_TRAY_INSERT,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_RAW,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_INFO_OUTPUT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DONT_CARE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOADED_FILE_DETECT_CORE_LIST,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOAD_CORE,
@@ -10589,7 +10588,6 @@ static const uint32_t msg_hash_it_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_FILE_UNLOAD_CORE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_HELP,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_HELP_ABOUT,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_HELP_ABOUT_CONTRIBUTORS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_HELP_DOCUMENTATION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_SEARCH_CLEAR,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_TOOLS,
@@ -11026,6 +11024,7 @@ static const uint32_t msg_hash_it_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_FRONTEND_OS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_GIT_VERSION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_LAKKA_VERSION,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_PACING,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_POWER_SOURCE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_POWER_SOURCE_CHARGED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_POWER_SOURCE_CHARGING,
@@ -12481,7 +12480,6 @@ static const uint32_t msg_hash_it_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SMOOTH,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SWAP_INTERVAL,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SYNCHRONIZATION_SETTINGS,
-   (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_THREADED,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_USE_METAL_ARG_BUFFERS,
 #if defined(RARCH_MOBILE)
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_PORTRAIT_X,

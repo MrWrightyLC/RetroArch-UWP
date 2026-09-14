@@ -90,23 +90,34 @@ static void sleep_us(int us)
 }
 
 static void *fake_init(const char *device, unsigned rate, unsigned latency,
-      unsigned block_frames, unsigned *new_rate)
+      unsigned *new_rate)
 {
    static int handle = 1;
-   (void)device; (void)latency; (void)block_frames;
+   (void)device; (void)latency;
    sleep_us(retro_atomic_load_acquire_int(&stall_init_us));
    if (new_rate)
       *new_rate = rate;
    return &handle;
 }
 
+static retro_atomic_int_t in_write = RETRO_ATOMIC_INT_INITIALIZER(0);
+static retro_atomic_int_t writes = RETRO_ATOMIC_INT_INITIALIZER(0);
+static retro_atomic_int_t format_errors = RETRO_ATOMIC_INT_INITIALIZER(0);
+static unsigned format_generation, controls;
+
 static ssize_t fake_write(void *data, const void *buf, size_t size)
 {
+   unsigned format = format_generation;
    (void)data; (void)buf;
+   retro_atomic_store_release_int(&in_write, 1);
    /* Stands in for a device that has stopped draining: the audio
     * thread is inside this call and cannot reach the loop to
     * acknowledge a stop. */
    sleep_us(retro_atomic_load_acquire_int(&stall_write_us));
+   if (format != format_generation)
+      retro_atomic_fetch_add_int(&format_errors, 1);
+   retro_atomic_fetch_add_int(&writes, 1);
+   retro_atomic_store_release_int(&in_write, 0);
    return (ssize_t)size;
 }
 
@@ -133,6 +144,9 @@ static size_t fake_wait_writable(void *data, size_t len)
    return len;
 }
 static size_t fake_buffer_size(void *data) { (void)data; return 8192; }
+/* A 5.1 device: the wrapper must hand this through, as it does
+ * use_float, or the frontend writes stereo into 6-channel frames. */
+static uint32_t fake_layout(void *data) { (void)data; return 0x60Fu; }
 
 static audio_driver_t fake_driver = {
    fake_init,
@@ -149,7 +163,10 @@ static audio_driver_t fake_driver = {
    fake_write_avail,
    fake_buffer_size,
    NULL,
-   fake_wait_writable
+   fake_wait_writable,
+   NULL, /* frames_consumed */
+   NULL, /* underruns */
+   fake_layout
 };
 
 /* The wrapper's loop calls audio_driver_callback(), which in the
@@ -177,6 +194,14 @@ bool audio_driver_callback(void)
    return true;
 }
 
+static void change_format(void *userdata)
+{
+   unsigned *value = (unsigned*)userdata;
+   CHECK(!retro_atomic_load_acquire_int(&in_write), "control overlapped native processing");
+   (*value)++;
+   controls++;
+}
+
 static double now_ms(void)
 {
    struct timespec ts;
@@ -199,14 +224,49 @@ int main(void)
     *    initial wait and block() has to come back from it. */
    STAGE(1);
    CHECK(audio_init_thread(&drv, &data, "fake", 48000, &new_rate, 64,
-            512, false, false, &fake_driver),
+            false, false, &fake_driver),
          "init against a responsive device failed");
    wrapper_drv = drv;
    wrapper_ctx = data;
+   audio_thread_apply_control(NULL, change_format, &format_generation);
+   audio_thread_apply_control(data, NULL, &format_generation);
+   audio_thread_apply_control(data, change_format, &format_generation);
+   CHECK(controls == 1 && !retro_atomic_load_acquire_int(&writes),
+         "control started the initial stopped wrapper");
+   CHECK(drv && drv->use_float && drv->use_float(data), "the wrapper does not report the inner driver's float");
+   CHECK(drv && drv->layout && drv->layout(data) == 0x60Fu,
+         "the wrapper does not report the inner driver's layout (0x%03x)", drv && drv->layout ? drv->layout(data) : 0);
    CHECK(drv && drv->stop(data), "stop before first start failed");
    CHECK(drv && drv->start(data, false), "first start failed");
    CHECK(retro_atomic_load_acquire_int(&warn_count) == 0,
          "a prompt init or stop was reported as running long");
+
+   /* Control preserves a stopped wrapper and waits for an active pass. */
+   CHECK(drv->stop(data), "control stop setup");
+   {
+      int before = retro_atomic_load_acquire_int(&writes);
+      audio_thread_apply_control(data, change_format, &format_generation);
+      sleep_us(20000);
+      CHECK(retro_atomic_load_acquire_int(&writes) == before,
+            "control resumed a stopped wrapper");
+   }
+   retro_atomic_store_release_int(&stall_write_us, 200000);
+   CHECK(drv->start(data, false), "control active setup");
+   for (i = 0; i < 1000 && !retro_atomic_load_acquire_int(&in_write); i++)
+      sleep_us(1000);
+   CHECK(retro_atomic_load_acquire_int(&in_write), "control did not meet an active pass");
+   t0 = now_ms();
+   audio_thread_apply_control(data, change_format, &format_generation);
+   t1 = now_ms();
+   CHECK(t1 - t0 >= 100.0, "control returned before active processing finished");
+   retro_atomic_store_release_int(&stall_write_us, 0);
+   {
+      int before = retro_atomic_load_acquire_int(&writes);
+      for (i = 0; i < 1000 && retro_atomic_load_acquire_int(&writes) == before; i++)
+         sleep_us(1000);
+      CHECK(retro_atomic_load_acquire_int(&writes) > before,
+            "control did not resume the running wrapper");
+   }
 
    /* 2. start()/stop() back to back, many times: the stop lands in
     *    the initial wait or the loop wait depending on scheduling,
@@ -219,6 +279,7 @@ int main(void)
          CHECK(false, "stop/start round-trip %u failed", i);
          break;
       }
+      audio_thread_apply_control(data, change_format, &format_generation);
       if ((i & 255) == 255)
          STAGE(2 + (int)(i >> 8));
    }
@@ -268,6 +329,10 @@ int main(void)
    CHECK(drv && drv->stop(data), "stop failed after space returned");
    CHECK(drv && drv->start(data, false), "start failed after space returned");
 
+   CHECK(controls == 2003, "control transactions lost: %u", controls);
+   CHECK(!retro_atomic_load_acquire_int(&format_errors), "format changed during native processing");
+   printf("audio control handoff: 2003 transactions, native passes protected\n");
+
    /* 5. Teardown joins the thread. */
    STAGE(22);
    if (drv)
@@ -282,7 +347,7 @@ int main(void)
    retro_atomic_store_release_int(&warn_count, 0);
    retro_atomic_store_release_int(&stall_init_us, 3 * 1000 * 1000);
    CHECK(audio_init_thread(&drv, &data, "fake", 48000, &new_rate, 64,
-            512, false, false, &fake_driver),
+            false, false, &fake_driver),
          "init against a slow device failed");
    CHECK(retro_atomic_load_acquire_int(&warn_count) == 1,
          "a slow init was reported %d times, expected once",

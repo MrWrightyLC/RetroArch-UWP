@@ -2540,14 +2540,27 @@ static void materialui_update_fullscreen_thumbnail_label(
 
 static void materialui_update_savestate_thumbnail_path(void *data, unsigned i)
 {
+   /* Off the frame: two paths and a menu_entry_t came to 8008 bytes
+    * where this tree allows four thousand. This runs when the selection
+    * moves, not every frame, so one allocation costs less than the
+    * frame did. */
+   struct savestate_thumb_scratch
+   {
+      menu_entry_t entry;
+      char old_path[PATH_MAX_LENGTH];
+      char path[PATH_MAX_LENGTH];
+   } *scratch;
    settings_t *settings     = config_get_ptr();
    materialui_handle_t *mui = (materialui_handle_t*)data;
    bool savestate_thumbnail;
-   char old_path[PATH_MAX_LENGTH];
+   char *old_path;
+
+   if (!(scratch = (struct savestate_thumb_scratch*)malloc(sizeof(*scratch))))
+      return;
+   old_path = scratch->old_path;
 
    if (!mui)
-      return;
-
+      { free(scratch); return; }
    savestate_thumbnail      = settings->bools.savestate_thumbnail_enable;
 
    /* Snapshot the current path before clearing it, so we can detect
@@ -2556,37 +2569,37 @@ static void materialui_update_savestate_thumbnail_path(void *data, unsigned i)
     * mirrors is itself a fixed-size char array) and avoids the leak
     * + potential NULL-deref of the previous strdup-before-NULL-check
     * construction. */
-   strlcpy(old_path, mui->savestate_thumbnail_file_path, sizeof(old_path));
+   strlcpy(old_path, mui->savestate_thumbnail_file_path, PATH_MAX_LENGTH);
 
    mui->savestate_thumbnail_file_path[0] = '\0';
 
    if (savestate_thumbnail)
    {
-      menu_entry_t entry;
+      menu_entry_t *entry = &scratch->entry;
 
-      MENU_ENTRY_INITIALIZE(entry);
-      entry.flags |= MENU_ENTRY_FLAG_LABEL_ENABLED;
-      menu_entry_get(&entry, 0, i, NULL, true);
+      MENU_ENTRY_INITIALIZE((*entry));
+      entry->flags |= MENU_ENTRY_FLAG_LABEL_ENABLED;
+      menu_entry_get(entry, 0, i, NULL, true);
 
-      if (*entry.label)
+      if (*entry->label)
       {
-         unsigned _state_slot = string_to_unsigned(entry.label);
+         unsigned _state_slot = string_to_unsigned(entry->label);
          if (     _state_slot == MENU_ENUM_LABEL_STATE_SLOT
-               || string_is_equal(entry.label, MENU_ENUM_LABEL_STATE_SLOT_RUN_STR)
-               || string_is_equal(entry.label, MENU_ENUM_LABEL_STATE_SLOT_STR)
-               || string_is_equal(entry.label, MENU_ENUM_LABEL_LOAD_STATE_STR)
-               || string_is_equal(entry.label, MENU_ENUM_LABEL_SAVE_STATE_STR))
+               || string_is_equal(entry->label, MENU_ENUM_LABEL_STATE_SLOT_RUN_STR)
+               || string_is_equal(entry->label, MENU_ENUM_LABEL_STATE_SLOT_STR)
+               || string_is_equal(entry->label, MENU_ENUM_LABEL_LOAD_STATE_STR)
+               || string_is_equal(entry->label, MENU_ENUM_LABEL_SAVE_STATE_STR))
          {
-            char path[PATH_MAX_LENGTH];
+            char *path = scratch->path;
             runloop_state_t *runloop_st = runloop_state_get_ptr();
             int state_slot              = settings->ints.state_slot;
 
             /* State slot dropdown */
             if (     _state_slot == MENU_ENUM_LABEL_STATE_SLOT
-                  || string_is_equal(entry.label, MENU_ENUM_LABEL_STATE_SLOT_RUN_STR))
+                  || string_is_equal(entry->label, MENU_ENUM_LABEL_STATE_SLOT_RUN_STR))
                state_slot    = i - 1;
 
-            gfx_savestate_thumbnail_get_path(path, sizeof(path),
+            gfx_savestate_thumbnail_get_path(path, PATH_MAX_LENGTH,
                   runloop_st->name.savestate, state_slot);
 
             /* Must let invalid be empty here as opposed to other drivers
@@ -2602,6 +2615,7 @@ static void materialui_update_savestate_thumbnail_path(void *data, unsigned i)
          }
       }
    }
+   free(scratch);
 }
 
 static void materialui_update_savestate_thumbnail_image(void *data)
@@ -2690,7 +2704,8 @@ static void materialui_draw_icon(
    {
       if (dispctx->draw)
          if (draw.height > 0 && draw.width > 0)
-            dispctx->draw(&draw, userdata, video_width, video_height);
+            gfx_display_draw(dispctx, &draw, userdata,
+                  video_width, video_height);
       if (dispctx->blend_end)
          dispctx->blend_end(userdata);
    }
@@ -4024,9 +4039,11 @@ static bool materialui_render_process_entry_playlist_thumb_list(
     * still images) */
    if (on_screen)
    {
-      gfx_thumbnail_animate(&node->thumbnails.primary);
+      gfx_thumbnail_animate(&node->thumbnails.primary,
+            menu_driver_get_current_time());
       if (mui->flags & MUI_FLAG_SECONDARY_THUMBNAIL_ENABLED)
-         gfx_thumbnail_animate(&node->thumbnails.secondary);
+         gfx_thumbnail_animate(&node->thumbnails.secondary,
+            menu_driver_get_current_time());
    }
 
    /* Load thumbnails for all on-screen entries
@@ -4076,8 +4093,10 @@ static bool materialui_render_process_entry_playlist_dual_icon(
     * still images) */
    if (on_screen)
    {
-      gfx_thumbnail_animate(&node->thumbnails.primary);
-      gfx_thumbnail_animate(&node->thumbnails.secondary);
+      gfx_thumbnail_animate(&node->thumbnails.primary,
+            menu_driver_get_current_time());
+      gfx_thumbnail_animate(&node->thumbnails.secondary,
+            menu_driver_get_current_time());
    }
 
    /* Load thumbnails for all on-screen entries
@@ -4133,8 +4152,10 @@ static bool materialui_render_process_entry_playlist_desktop(
     * still images) */
    if (is_on_screen)
    {
-      gfx_thumbnail_animate(&node->thumbnails.primary);
-      gfx_thumbnail_animate(&node->thumbnails.secondary);
+      gfx_thumbnail_animate(&node->thumbnails.primary,
+            menu_driver_get_current_time());
+      gfx_thumbnail_animate(&node->thumbnails.secondary,
+            menu_driver_get_current_time());
    }
 
    /* Load thumbnails for selected (and last
@@ -4228,7 +4249,7 @@ static bool materialui_render_process_entry_playlist_desktop(
             /* Get runtime info, if available */
             if (content_runtime_log || content_runtime_log_aggregate)
             {
-               if (entry->runtime_status == PLAYLIST_RUNTIME_UNKNOWN)
+               if (PLAYLIST_RUNTIME_STATUS(entry) == PLAYLIST_RUNTIME_UNKNOWN)
                   runtime_update_playlist(mui->playlist, playlist_idx);
 
                if (entry->runtime_str && *entry->runtime_str)
@@ -6822,7 +6843,8 @@ MUI_NOINLINE static void materialui_render_background(
             add_opacity, opacity_override);
       if (dispctx->draw)
          if (draw.height > 0 && draw.width > 0)
-            dispctx->draw(&draw, userdata, video_width, video_height);
+            gfx_display_draw(dispctx, &draw, userdata,
+                  video_width, video_height);
       if (dispctx->blend_end)
          dispctx->blend_end(userdata);
    }

@@ -298,19 +298,19 @@ static void gfx_widget_volume_timer_end(void *userdata)
    entry.target_value   = 0.0f;
    entry.userdata       = NULL;
 
-   gfx_animation_push(&entry);
+   gfx_animation_push_widget(&entry);
 
    entry.subject        = &state->text_alpha;
 
-   gfx_animation_push(&entry);
+   gfx_animation_push_widget(&entry);
 }
 
-void gfx_widget_volume_update_and_show(float new_volume, bool mute)
+static void gfx_widget_volume_update_and_show_state(float new_volume, bool mute)
 {
    gfx_timer_ctx_entry_t entry;
    gfx_widget_volume_state_t *state = &p_w_volume_st;
 
-   gfx_animation_kill_by_tag(&state->tag);
+   gfx_animation_kill_widget_by_tag(&state->tag);
 
    state->db         = new_volume;
    state->percent    = pow(10, new_volume/20);
@@ -322,7 +322,14 @@ void gfx_widget_volume_update_and_show(float new_volume, bool mute)
    entry.duration    = VOLUME_DURATION;
    entry.userdata    = NULL;
 
-   gfx_animation_timer_start(&state->timer, &entry);
+   gfx_animation_timer_start_widget(&state->timer, &entry);
+}
+
+void gfx_widget_volume_update_and_show(float new_volume, bool mute)
+{
+   gfx_widgets_state_lock();
+   gfx_widget_volume_update_and_show_state(new_volume, mute);
+   gfx_widgets_state_unlock();
 }
 
 static void gfx_widget_volume_layout(
@@ -387,7 +394,7 @@ static void gfx_widget_volume_free(void)
    gfx_widget_volume_state_t *state     = &p_w_volume_st;
 
    /* Kill all running animations */
-   gfx_animation_kill_by_tag(&state->tag);
+   gfx_animation_kill_widget_by_tag(&state->tag);
 
    state->alpha = 0.0f;
 }

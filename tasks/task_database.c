@@ -1470,6 +1470,28 @@ static enum scan_verdict task_database_iterate_crc_lookup(
          return database_info_list_iterate_next(db_state);
    }
 
+   /* The core-info gate is an in-memory string check; the size gate
+    * below costs a full walk of the database the first time it is
+    * consulted, because task_database_fill_db_min_max() builds the
+    * crc index in that walk.  Running the walk first meant every
+    * database in the directory was read end to end once per scan,
+    * including the ones no installed core claims and which can never
+    * match - 200 MB of .rdb reads to scan a 70 MB set with the
+    * shipped database directory.  Ask the cheap question first. */
+   if (!(_db->flags & DB_HANDLE_FLAG_SCAN_WITHOUT_CORE_MATCH))
+   {
+      if (!core_info_database_supports_content_path(
+            db_state->list->elems[db_state->list_index].data, name))
+         return database_info_list_iterate_next(db_state);
+
+      if (!path_contains_compressed_file)
+      {
+         if (core_info_database_match_archive_member(
+               db_state->list->elems[db_state->list_index].data))
+            return database_info_list_iterate_next(db_state);
+      }
+   }
+
    /* If size boundaries are not filled for this DB, run the queries */
    if (!(db_state->flags[db_state->list_index] & DB_STATE_FLAG_SIZE_CHECKED))
       task_database_fill_db_min_max(db_state);
@@ -1519,25 +1541,6 @@ static enum scan_verdict task_database_iterate_crc_lookup(
       database_info_list_t *hits = NULL;
 
       query[0] = '\0';
-
-      if (!(_db->flags & DB_HANDLE_FLAG_SCAN_WITHOUT_CORE_MATCH))
-      {
-         /* don't scan files that can't be in this database.
-          *
-          * Could be because of:
-          * - A matching core missing
-          * - Incompatible file extension */
-         if (!core_info_database_supports_content_path(
-               db_state->list->elems[db_state->list_index].data, name))
-            return database_info_list_iterate_next(db_state);
-
-         if (!path_contains_compressed_file)
-         {
-            if (core_info_database_match_archive_member(
-                  db_state->list->elems[db_state->list_index].data))
-               return database_info_list_iterate_next(db_state);
-         }
-      }
 
       /* Answer from this database's crc index when we can.  Building
        * it costs one walk - about what a single probe used to cost -
@@ -1589,6 +1592,16 @@ static enum scan_verdict task_database_iterate_crc_lookup(
 
          database_info_list_iterate_new(db_state, query);
       }
+
+      /* database_info_list_new_filtered() returns NULL when the .rdb
+       * cannot be opened or the query fails to compile.  Nothing below
+       * advances list_index on a NULL info, so every subsequent tick
+       * re-entered here with entry_index != 0, skipped the query and
+       * returned SCAN_VERDICT_CONTINUE - the scan hung on the first
+       * content file that reached an unreadable database.  A database
+       * that cannot answer is a database with no match: move on. */
+      if (!db_state->info)
+         return database_info_list_iterate_next(db_state);
    }
 
    /* Same shape as the serial lookup below: entry_index was used to
@@ -1853,7 +1866,10 @@ static int task_database_iterate_serial_lookup(
       free(serial_buf);
 
 serial_query_done:
-      ;
+      /* See the crc lookup: a database that cannot be queried must
+       * not leave list_index where it is, or the scan never ends. */
+      if (!db_state->info)
+         return database_info_list_iterate_next(db_state);
    }
 
    if (db_state->info)
@@ -1924,7 +1940,12 @@ static int task_database_iterate(
 {
 #ifdef DEBUG
    RARCH_DBG("[Scanner] Type %d, \"%s\" against \"%s\".\n", db->type, name, database_info_get_current_name(db_state));
-   RARCH_DBG("[Scanner] Size: min %ld actual %ld max %ld.\n", db_state->min_sizes[db_state->list_index], db_state->size, db_state->max_sizes[db_state->list_index]);
+   /* list_index == list->size is a valid state here (every database
+    * tried, the "against (null)" tick), and the size arrays have
+    * list->size entries - reading them unguarded was a one-past-the-
+    * end read on every content file under ASan. */
+   if (db_state->list && (size_t)db_state->list_index < db_state->list->size)
+      RARCH_DBG("[Scanner] Size: min %ld actual %ld max %ld.\n", db_state->min_sizes[db_state->list_index], db_state->size, db_state->max_sizes[db_state->list_index]);
 #endif
    switch (db->type)
    {
@@ -2188,16 +2209,16 @@ static bool manual_scan_end_flush_tick(
          entry.subsystem_ident   = NULL;
          entry.subsystem_name    = NULL;
          entry.subsystem_roms    = NULL;
-         entry.entry_slot        = 0;
-         entry.runtime_hours     = 0;
-         entry.runtime_minutes   = 0;
-         entry.runtime_seconds   = 0;
-         entry.last_played_year  = 0;
-         entry.last_played_month = 0;
-         entry.last_played_day   = 0;
-         entry.last_played_hour  = 0;
-         entry.last_played_minute= 0;
-         entry.last_played_second= 0;
+         PLAYLIST_SET_ENTRY_SLOT(&entry, 0);
+         PLAYLIST_SET_RUNTIME_HOURS(&entry, 0);
+         PLAYLIST_SET_RUNTIME_MINUTES(&entry, 0);
+         PLAYLIST_SET_RUNTIME_SECONDS(&entry, 0);
+         PLAYLIST_SET_LAST_PLAYED_YEAR(&entry, 0);
+         PLAYLIST_SET_LAST_PLAYED_MONTH(&entry, 0);
+         PLAYLIST_SET_LAST_PLAYED_DAY(&entry, 0);
+         PLAYLIST_SET_LAST_PLAYED_HOUR(&entry, 0);
+         PLAYLIST_SET_LAST_PLAYED_MINUTE(&entry, 0);
+         PLAYLIST_SET_LAST_PLAYED_SECOND(&entry, 0);
 
          /* Absence is proven: the existence check above said so, or
           * this is an m3u whose previous entries were just deleted.
@@ -3247,8 +3268,13 @@ static void task_manual_content_scan_handler(retro_task_t *task)
                      manual_scan->status = DATABASE_SCAN_ITERATE_NEXT;
                   break;
                case SCAN_VERDICT_ERROR:
+                  /* An error verdict leaves the per-file state where
+                   * it was, so treating it like CONTINUE re-ran the
+                   * same failing step every tick.  Give up on this
+                   * file and go to the next one. */
                   RARCH_ERR("[Scanner] Scanning of content unexpectedly failed for \"%s\"\n", content_path);
-                  /* fall through */
+                  manual_scan->status = DATABASE_SCAN_ITERATE_NEXT;
+                  break;
                case SCAN_VERDICT_CONTINUE:
                   break;
             }

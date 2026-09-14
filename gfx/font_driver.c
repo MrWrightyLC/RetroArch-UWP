@@ -31,6 +31,8 @@
 #include "video_thread_wrapper.h"
 #include <retro_atomic.h>
 
+#include <compat/strl.h>
+
 /* ------------------------------------------------------------------
  * Shared font file bytes.
  *
@@ -82,13 +84,17 @@ static font_file_use_t *font_file_uses;
  * the case this exists for.  The file read deliberately happens outside
  * the lock; spinning while another thread pulls megabytes off a memory
  * card would be far worse than the contention it avoids. */
-/* retro_atomic.h's fallback backend has no compare-and-swap: it is
- * selected precisely on the targets whose toolchains offer no
- * lock-free integer atomics, which are the single-core consoles, and
- * there the list is only ever touched from one thread.  Gate on the
- * primitive rather than on a platform list, so a target that gains
- * atomics gains the locking with them. */
-#if defined(HAVE_THREADS) && defined(retro_atomic_cas_int)
+/* Gate on the primitives rather than on a platform list, so a target
+ * that gains atomics gains the locking with them.  Both gates are
+ * needed: the fallback backend has no compare-and-swap at all, and the
+ * PS2 backend has one that is atomic but not lock-free, taken with the
+ * interrupts masked.  Spinning on it would hang the EE outright -- one
+ * core, and a kernel that reschedules only out of an interrupt, so the
+ * thread holding the word never runs again.  Those targets keep the
+ * unlocked path, where the list is only ever touched from one
+ * thread. */
+#if defined(HAVE_THREADS) && defined(retro_atomic_cas_int) \
+ && defined(RETRO_ATOMIC_LOCK_FREE)
 static retro_atomic_int_t font_file_lock_word;
 #define FONT_FILE_LOCK() \
    do { while (!retro_atomic_cas_int(&font_file_lock_word, 0, 1)) { } } while (0)
@@ -325,8 +331,11 @@ static const font_renderer_driver_t *font_renderer_shared_driver(
  * smooth ticker glyph width cache in gfx_animation.c) key their
  * entries on this value: font_data_t pointers can be recycled by
  * the allocator across free/create cycles, so pointer equality
- * alone cannot prove a cached entry still describes a live font */
-static uint32_t font_driver_generation = 0;
+ * alone cannot prove a cached entry still describes a live font.
+ * Atomic because the main thread bumps it while the threaded video
+ * worker reads it, drawing widgets during content. */
+static retro_atomic_int_t font_driver_generation
+   = RETRO_ATOMIC_INT_INITIALIZER(0);
 
 /* Every live font, so they can be rebuilt when the file behind them
  * should change. Singly linked through font_data_t::next. */
@@ -546,14 +555,14 @@ unsigned font_driver_reload_fonts(void)
    if (n)
       /* Derived data cached outside this file - ticker widths, menu
        * line heights - is now stale. */
-      font_driver_generation++;
+      retro_atomic_fetch_add_int(&font_driver_generation, 1);
 
    return n;
 }
 
 uint32_t font_driver_get_generation(void)
 {
-   return font_driver_generation;
+   return (uint32_t)retro_atomic_load_acquire_int(&font_driver_generation);
 }
 
 int font_renderer_create_default(
@@ -1295,7 +1304,12 @@ static void font_driver_release_renderer_state(
       font_free_cmd_t cmd;
       cmd.renderer      = renderer;
       cmd.renderer_data = renderer_data;
-      cmd.is_threaded   = is_threaded;
+      /* The renderer's is_threaded means "not on the context thread,
+       * bind it yourself": the GL renderers answer it with
+       * make_current(), and on release that unbinds the context from
+       * the calling thread. This call runs on the video thread, whose
+       * context is already current and must stay so. */
+      cmd.is_threaded   = false;
       video_thread_texture_handle(&cmd, font_driver_free_wrap);
       return;
    }
@@ -1312,7 +1326,7 @@ void font_driver_free(font_data_t *font)
       font_data_t **link      = &font_live;
 
       /* Invalidate any externally cached per-font derived data */
-      font_driver_generation++;
+      retro_atomic_fetch_add_int(&font_driver_generation, 1);
 
       while (*link)
       {
@@ -1444,9 +1458,11 @@ font_data_t *font_driver_init_first(
     * the wrapper is gone. */
    if (     threading_hint
          && video_driver_thread_wrapper_active())
+      /* Runs on the video thread, where the context is current;
+       * is_threaded would make a GL renderer rebind it from there. */
       ok = video_thread_font_init(&font_driver, &font_handle,
             video_data, font_path, font_size, backend, font_init_first,
-            is_threaded);
+            false);
    else
 #endif
    ok = font_init_first(&font_driver, &font_handle,
@@ -1578,7 +1594,7 @@ bool font_driver_reinit_osd(const char *font_path, float font_size)
 
    /* Derived data cached outside this file - the widgets' line
     * metrics, gfx_animation's ticker widths - is now stale. */
-   font_driver_generation++;
+   retro_atomic_fetch_add_int(&font_driver_generation, 1);
    return true;
 }
 

@@ -135,6 +135,7 @@ void android_app_set_window_settings(bool notch_write_over,
 #include "../verbosity.h"
 #include "../playlist.h"
 #include "../manual_content_scan.h"
+#include "../input/input_osk.h"
 #include "../input/input_remapping.h"
 
 #include "../tasks/tasks_internal.h"
@@ -680,6 +681,7 @@ static int setting_generic_action_ok_linefeed(
 {
    menu_input_ctx_line_t line;
    input_keyboard_line_complete_t cb = NULL;
+   enum menu_input_dialog_kb_text_type text_type = MENU_INPUT_DIALOG_KB_TYPE_TEXT;
 
    if (!setting)
       return -1;
@@ -691,9 +693,14 @@ static int setting_generic_action_ok_linefeed(
       case ST_SIZE:
       case ST_UINT:
          cb = menu_input_st_uint_cb;
+         /* menu_input_st_uint_cb() parses with strtoul(base 0), which
+          * accepts a '0x' prefix; a numeric keypad cannot type one. */
          break;
       case ST_INT:
+         /* menu_input_st_int_cb() takes digits only - already rejects
+          * a leading sign - so a numeric keypad loses nothing. */
          cb = menu_input_st_int_cb;
+         text_type = MENU_INPUT_DIALOG_KB_TYPE_NUMBER;
          break;
       case ST_FLOAT:
          cb = menu_input_st_float_cb;
@@ -701,6 +708,8 @@ static int setting_generic_action_ok_linefeed(
       case ST_STRING:
       case ST_STRING_OPTIONS:
          cb = menu_input_st_string_cb;
+         if (setting->ui_type == ST_UI_TYPE_PASSWORD_LINE_EDIT)
+            text_type = MENU_INPUT_DIALOG_KB_TYPE_PASSWORD;
          break;
       default:
          break;
@@ -710,6 +719,7 @@ static int setting_generic_action_ok_linefeed(
    line.label_setting = setting->name;
    line.type          = 0;
    line.idx           = 0;
+   line.text_type     = text_type;
    line.cb            = cb;
 
    if (!menu_input_dialog_start(&line))
@@ -822,18 +832,19 @@ static int setting_bind_action_start(rarch_setting_t *setting)
    keybind->joyaxis = AXIS_NONE;
 
    /* Clear old mapping bit */
-   input_keyboard_mapping_bits(0, keybind->key);
+   input_keyboard_mapping_bits(0, RETRO_KEYBIND_KEY(keybind));
 
    if (setting->index_offset)
       def_binds     = (struct retro_keybind*)retro_keybinds_rest;
 
    bind_type        = setting->bind_type;
 
-   keybind->key     = def_binds[bind_type - MENU_SETTINGS_BIND_BEGIN].key;
+   RETRO_KEYBIND_SET_KEY(keybind,
+         RETRO_KEYBIND_KEY(&def_binds[bind_type - MENU_SETTINGS_BIND_BEGIN]));
    keybind->mbutton = def_binds[bind_type - MENU_SETTINGS_BIND_BEGIN].mbutton;
 
    /* Store new mapping bit */
-   input_keyboard_mapping_bits(1, keybind->key);
+   input_keyboard_mapping_bits(1, RETRO_KEYBIND_KEY(keybind));
 
    return 0;
 }
@@ -2797,7 +2808,8 @@ static int setting_action_ok_bind_defaults(
    for ( i  = MENU_SETTINGS_BIND_BEGIN;
          i <= MENU_SETTINGS_BIND_LAST; i++, target++)
    {
-      target->key     = def_binds[i - MENU_SETTINGS_BIND_BEGIN].key;
+      RETRO_KEYBIND_SET_KEY(target,
+            RETRO_KEYBIND_KEY(&def_binds[i - MENU_SETTINGS_BIND_BEGIN]));
       target->joykey  = NO_BTN;
       target->joyaxis = AXIS_NONE;
       target->mbutton = NO_BTN;
@@ -3031,6 +3043,7 @@ static int setting_action_ok_color_rgb(rarch_setting_t *setting, size_t idx,
    line.label_setting = setting->name;
    line.type          = 0;
    line.idx           = 0;
+   line.text_type     = MENU_INPUT_DIALOG_KB_TYPE_TEXT;
    line.cb            = setting_action_ok_color_rgb_cb;
 
    if (!menu_input_dialog_start(&line))
@@ -3381,7 +3394,7 @@ static size_t setting_get_string_representation_state_slot(
    if (!setting)
       return 0;
    if (*setting->value.target.integer == -1)
-      return strlcpy_lit(s, "Auto", len);
+      return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_AUTO), len);
    return snprintf(s, len, "%d", *setting->value.target.integer);
 }
 
@@ -4588,11 +4601,11 @@ static size_t setting_get_string_representation_uint_xmb_layout(
       switch (*setting->value.target.unsigned_integer)
       {
          case 0:
-            return strlcpy_lit(s, "Auto", len);
+            return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_AUTO), len);
          case 1:
-            return strlcpy_lit(s, "Console", len);
+            return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_XMB_LAYOUT_CONSOLE), len);
          case 2:
-            return strlcpy_lit(s, "Handheld", len);
+            return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_XMB_LAYOUT_HANDHELD), len);
       }
    }
    return 0;
@@ -5350,16 +5363,16 @@ static size_t setting_get_string_representation_uint_audio_wasapi_sh_buffer_leng
    switch (*setting->value.target.integer)
    {
       case WASAPI_SH_BUFFER_AUDIO_LATENCY:
-         /* TODO/FIXME - localize */
-         _len += strlcpy_lit(s + _len, "Audio Latency", len - _len);
+         _len += strlcpy(s + _len,
+               msg_hash_to_str(MENU_ENUM_LABEL_VALUE_WASAPI_SH_BUFFER_AUDIO_LATENCY), len - _len);
          break;
       case WASAPI_SH_BUFFER_DEVICE_PERIOD:
-         /* TODO/FIXME - localize */
-         _len += strlcpy_lit(s + _len, "Device Period", len - _len);
+         _len += strlcpy(s + _len,
+               msg_hash_to_str(MENU_ENUM_LABEL_VALUE_WASAPI_SH_BUFFER_DEVICE_PERIOD), len - _len);
          break;
       case WASAPI_SH_BUFFER_CLIENT_BUFFER:
-         /* TODO/FIXME - localize */
-         _len += strlcpy_lit(s + _len, "Client Buffer", len - _len);
+         _len += strlcpy(s + _len,
+               msg_hash_to_str(MENU_ENUM_LABEL_VALUE_WASAPI_SH_BUFFER_CLIENT_BUFFER), len - _len);
          break;
       default:
          _len += snprintf(s + _len, len - _len, "%.1f ms",
@@ -5381,7 +5394,7 @@ static size_t setting_get_string_representation_uint_microphone_wasapi_sh_buffer
       return snprintf(s, len, "%u (%.1f ms)",
             *setting->value.target.integer,
             (float)*setting->value.target.integer * 1000 / settings->uints.audio_output_sample_rate);
-   return strlcpy_lit(s, "Auto", len);
+   return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_AUTO), len);
 }
 #endif
 #endif
@@ -7129,6 +7142,8 @@ static size_t setting_get_string_representation_uint_crt_switch_resolutions(
             return strlcpy_lit(s, "31 KHz, 120Hz", len);
          case CRT_SWITCH_INI:
             return strlcpy_lit(s, "INI", len);
+         case CRT_SWITCH_EDID:
+            return strlcpy_lit(s, "EDID", len);
       }
    }
    return 0;
@@ -7162,9 +7177,25 @@ static size_t setting_get_string_representation_uint_video_sdl_display_server(
          case VIDEO_SDL_DISPLAY_SERVER_OFF:
             return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_OFF), len);
          case VIDEO_SDL_DISPLAY_SERVER_AUTO:
-            return strlcpy_lit(s, "Auto", len);
+            return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_AUTO), len);
          case VIDEO_SDL_DISPLAY_SERVER_ALWAYS:
-            return strlcpy_lit(s, "Always", len);
+            return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_ALWAYS), len);
+      }
+   }
+   return 0;
+}
+
+static size_t setting_get_string_representation_uint_save_compression_codec(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   if (setting)
+   {
+      switch (*setting->value.target.unsigned_integer)
+      {
+         case 1:
+            return strlcpy(s, msg_hash_to_str(MSG_COMPRESSION_CODEC_ZSTD), len);
+         default:
+            return strlcpy(s, msg_hash_to_str(MSG_COMPRESSION_CODEC_DEFLATE), len);
       }
    }
    return 0;
@@ -7195,6 +7226,23 @@ static size_t setting_get_string_representation_uint_audio_resampler_quality(
          case RESAMPLER_QUALITY_NORMAL:
             return strlcpy(s, msg_hash_to_str(MSG_RESAMPLER_QUALITY_NORMAL),
                   len);
+      }
+   }
+   return 0;
+}
+
+static size_t setting_get_string_representation_uint_audio_output_layout(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   if (setting)
+   {
+      switch (*setting->value.target.unsigned_integer)
+      {
+         case 1:  return strlcpy(s, "4.0", len);
+         case 2:  return strlcpy(s, "5.1", len);
+         case 3:  return strlcpy(s, "5.1 Surround", len);
+         case 4:  return strlcpy(s, "7.1", len);
+         default: return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_AUDIO_OUTPUT_LAYOUT_STEREO), len);
       }
    }
    return 0;
@@ -7491,7 +7539,7 @@ static size_t setting_get_string_representation_retropad_bind(
          const struct retro_keybind *keyptr =
                &input_config_binds[0][retro_id];
 
-         return strlcpy(s, msg_hash_to_str(keyptr->enum_idx), len);
+         return strlcpy(s, msg_hash_to_str(RETRO_KEYBIND_ENUM_IDX(keyptr)), len);
       }
    }
    return 0;
@@ -8739,7 +8787,7 @@ static size_t setting_get_string_representation_smb_auth(
       case RETRO_SMB2_SEC_KRB5: /* SMB2_SEC_KRB5 */
          return strlcpy_lit(s, "Kerberos", len);
       default:
-         return strlcpy_lit(s, "KRB if available, NTLM if not", len);
+         return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_SMB_CLIENT_SEC_KRB_OR_NTLM), len);
    }
 }
 
@@ -11760,14 +11808,14 @@ static const setting_desc_t vid_desc_15[] = {
 };
 #endif
 
-#if (defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)) || (defined(HAVE_COCOA) && !defined(HAVE_COCOATOUCH)) || defined(HAVE_SDL3)
+#if (defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)) || (defined(HAVE_COCOA) && !defined(HAVE_COCOATOUCH)) || defined(HAVE_SDL3) && !defined(WEBOS)
 static const setting_desc_t vid_desc_16[] = {
 /* GENERATED: rows come from settings_def_video_window_save_position.h in order. */
 #include "../settings/settings_def_video_window_save_position.h"
 };
 #endif
 
-#if !((defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)) || (defined(HAVE_COCOA) && !defined(HAVE_COCOATOUCH)) || defined(HAVE_SDL3))
+#if !((defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)) || (defined(HAVE_COCOA) && !defined(HAVE_COCOATOUCH)) || defined(HAVE_SDL3) && !defined(WEBOS))
 static const setting_desc_t vid_desc_17[] = {
 /* GENERATED: rows come from settings_def_video_window_custom_size.h in order. */
 #include "../settings/settings_def_video_window_custom_size.h"
@@ -13152,7 +13200,7 @@ static void settings_build_drivers(
    {
 
          unsigned i, j = 0;
-         struct string_options_entry string_options_entries[14] = {{0}};
+         struct string_options_entry string_options_entries[15] = {{0}};
 
          START_GROUP(list, list_info, &group_info, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_DRIVER_SETTINGS), parent_group);
          MENU_SETTINGS_LIST_CURRENT_ADD_ENUM_IDX_PTR(list, list_info, MENU_ENUM_LABEL_DRIVER_SETTINGS);
@@ -13295,6 +13343,17 @@ static void settings_build_drivers(
          string_options_entries[j].values          = config_get_midi_driver_options();
 
          j++;
+
+#ifdef HAVE_COMPANION_WIMP
+         string_options_entries[j].target          = settings->arrays.ui_companion_driver;
+         string_options_entries[j].len             = sizeof(settings->arrays.ui_companion_driver);
+         string_options_entries[j].name_enum_idx   = MENU_ENUM_LABEL_UI_COMPANION_DRIVER;
+         string_options_entries[j].SHORT_enum_idx  = MENU_ENUM_LABEL_VALUE_UI_COMPANION_DRIVER;
+         string_options_entries[j].default_value   = config_get_default_ui_companion();
+         string_options_entries[j].values          = config_get_ui_companion_driver_options();
+
+         j++;
+#endif
 
          for (i = 0; i < j; i++)
          {
@@ -14621,7 +14680,7 @@ static void settings_build_video(
 #endif
 #if (defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)) ||  \
     (defined(HAVE_COCOA) && !defined(HAVE_COCOATOUCH)) ||     \
-    defined(HAVE_SDL3)
+    defined(HAVE_SDL3) && !defined(WEBOS)
             ADD_DESC(vid_desc_16);
 #else
             ADD_DESC(vid_desc_17);
@@ -15080,6 +15139,34 @@ static void settings_build_input(
                   general_read_handler,
                   SD_FLAG_NONE);
 #endif
+#ifdef HAVE_SDL3
+      {
+         /* Only meaningful when SDL3 is driving input and the device
+          * actually has a screen keyboard to offer, the same way the
+          * Android entries above are gated on the active input driver.
+          * A gl+udev desktop build compiled with SDL3 support should
+          * not show a toggle that does nothing. */
+         input_driver_state_t *st      = input_state_get_ptr();
+         input_driver_t *current_input = st->current_driver;
+         if (     current_input
+               && string_is_equal(current_input->ident, "sdl3")
+               && input_osk_native_available())
+            CONFIG_BOOL(
+                  list, list_info,
+                  &settings->bools.input_sdl3_system_keyboard,
+                  MENU_ENUM_LABEL_INPUT_SDL3_SYSTEM_KEYBOARD,
+                  MENU_ENUM_LABEL_VALUE_INPUT_SDL3_SYSTEM_KEYBOARD,
+                  DEFAULT_INPUT_SDL3_SYSTEM_KEYBOARD,
+                  MENU_ENUM_LABEL_VALUE_OFF,
+                  MENU_ENUM_LABEL_VALUE_ON,
+                  &group_info,
+                  &subgroup_info,
+                  parent_group,
+                  general_write_handler,
+                  general_read_handler,
+                  SD_FLAG_NONE);
+      }
+#endif
 
             ADD_DESC(inp_desc_10);
 
@@ -15269,7 +15356,7 @@ static void settings_build_input_hotkey(
          {
             if (!input_config_bind_map_get_meta(i))
                continue;
-#ifndef HAVE_QT
+#ifndef HAVE_COMPANION_WIMP
             if (i == RARCH_UI_COMPANION_TOGGLE)
                continue;
 #endif

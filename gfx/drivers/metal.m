@@ -152,7 +152,6 @@ typedef NS_ENUM(NSUInteger, ViewportResetMode) {
 
 /*! @brief captureEnabled allows previous frames to be read */
 @property (nonatomic, readwrite) bool captureEnabled;
-
 /*! @brief Returns the command buffer used for pre-render work,
  * such as mip maps and shader effects
  * */
@@ -357,6 +356,13 @@ typedef NS_ENUM(NSInteger, ViewDrawState)
 @property(nonatomic, readonly) ViewDrawState drawState;
 @property(nonatomic, readonly) struct video_shader *shader;
 @property(nonatomic, readwrite) uint64_t frameCount;
+/* SwapCount, TotalSubFrames and CurrentSubFrame for the shader chain,
+ * taken from the frame info each render: presents the display has
+ * seen before this one (advanced per shader sub-frame), the sub-frame
+ * count and the 1-based index of the one being drawn. */
+@property(nonatomic, readwrite) uint64_t swapCount;
+@property(nonatomic, readwrite) uint32_t totalSubframes;
+@property(nonatomic, readwrite) uint32_t currentSubframe;
 
 /* Final pass of the shader chain normally renders into the backbuffer
  * drawable.  When HDR is on, it must render into the HDR offscreen
@@ -421,6 +427,13 @@ typedef NS_ENUM(NSInteger, ViewDrawState)
 @property(nonatomic, readonly) Overlay *overlay;
 @property(nonatomic, readonly) Context *context;
 @property(nonatomic, readonly) Uniforms *viewportMVP;
+
+/* What the last frame said the menu filter should be:
+ * set_texture_frame() is applied by the video thread from
+ * thread_update_driver_state(), and reading the setting there races
+ * the menu writing it. Both users are MetalDriver - this was
+ * declared on Context, where nothing referred to it. */
+@property(nonatomic, readwrite) bool frameMenuLinearFilter;
 
 - (instancetype)initWithVideo:(const video_info_t *)video
                                        input:(input_driver_t **)input
@@ -4212,20 +4225,20 @@ static void metal_pull_cached_frame_cb(void *userdata,
        * uses these flags to gate the HDR menu options and to clamp the
        * user's selected mode to what the driver can actually do. */
       {
-         uint32_t disp_flags = video_driver_get_disp_flags();
+         uint32_t hdr_flags  = 0;
          bool edr_supported  = metal_display_supports_edr();
-         disp_flags &= ~(VIDEO_FLAG_HDR_SUPPORT
-                        | VIDEO_FLAG_HDR10_SUPPORT
-                        | VIDEO_FLAG_SCRGB_SUPPORT);
          if (edr_supported)
          {
             /* Both modes map to the same Metal surface path (swap the
              * CAMetalLayer pixel format + colour space), so whenever
              * EDR is available we advertise both. */
-            disp_flags |= VIDEO_FLAG_HDR10_SUPPORT | VIDEO_FLAG_SCRGB_SUPPORT;
-            disp_flags |= VIDEO_FLAG_HDR_SUPPORT;
+            hdr_flags |= VIDEO_FLAG_HDR10_SUPPORT | VIDEO_FLAG_SCRGB_SUPPORT;
+            hdr_flags |= VIDEO_FLAG_HDR_SUPPORT;
          }
-         video_driver_set_disp_flags(disp_flags);
+         video_driver_modify_disp_flags(hdr_flags,
+                 VIDEO_FLAG_HDR_SUPPORT
+               | VIDEO_FLAG_HDR10_SUPPORT
+               | VIDEO_FLAG_SCRGB_SUPPORT);
          RARCH_LOG("[Metal] HDR capability: display EDR %s, advertising HDR support %s.\n",
                edr_supported ? "detected" : "not detected",
                edr_supported ? "YES (HDR10 + scRGB)" : "NO");
@@ -4288,10 +4301,10 @@ static void metal_pull_cached_frame_cb(void *userdata,
 #if METAL_HDR_AVAILABLE
    /* Withdraw the HDR-capability flags so a subsequent driver init (e.g.
     * after the user switches to Vulkan and back) doesn't see stale bits. */
-   video_driver_set_disp_flags(video_driver_get_disp_flags()
-         & ~(VIDEO_FLAG_HDR_SUPPORT
-            | VIDEO_FLAG_HDR10_SUPPORT
-            | VIDEO_FLAG_SCRGB_SUPPORT));
+   video_driver_modify_disp_flags(0,
+           VIDEO_FLAG_HDR_SUPPORT
+         | VIDEO_FLAG_HDR10_SUPPORT
+         | VIDEO_FLAG_SCRGB_SUPPORT);
 #endif
 }
 
@@ -4401,6 +4414,10 @@ static void metal_pull_cached_frame_cb(void *userdata,
                 msg:(const char *)msg
                info:(video_frame_info_t *)video_info
 {
+   /* Travels with the frame, for set_texture_frame() to read rather
+    * than the setting the menu writes */
+   self.frameMenuLinearFilter = video_info->menu_linear_filter;
+
    @autoreleasepool
    {
       bool statistics_show = video_info->statistics_show;
@@ -4418,7 +4435,15 @@ static void metal_pull_cached_frame_cb(void *userdata,
          [_context begin];
       }
 
-      _frameView.frameCount = frameCount;
+      _frameView.frameCount      = frameCount;
+      /* The sub-frame index is 0 on the core frame and j on the j-th
+       * re-render below; the shader sees it 1-based, and each
+       * sub-frame is one more present on the display */
+      _frameView.swapCount       = video_info->swap_count
+                                 + video_info->current_subframe;
+      _frameView.totalSubframes  = video_info->shader_subframes > 1
+                                 ? video_info->shader_subframes : 1;
+      _frameView.currentSubframe = video_info->current_subframe + 1;
       if (frame && width && height)
       {
          _frameView.size      = CGSizeMake(width, height);
@@ -4683,6 +4708,9 @@ typedef struct MTLALIGN(16)
       uint32_t rotation;
       float_t core_aspect;
       float_t core_aspect_rot;
+      uint32_t total_subframes;
+      uint32_t current_subframe;
+      uint32_t swap_count;
       pass_semantics_t semantics;
       MTLViewport viewport;
       __unsafe_unretained id<MTLRenderPipelineState> _state;
@@ -5169,6 +5197,10 @@ typedef struct MTLALIGN(16)
       _engine.pass[i].frame_count = (uint32_t)_frameCount;
       if (_shader->pass[i].frame_count_mod)
          _engine.pass[i].frame_count %= _shader->pass[i].frame_count_mod;
+      /* Not modulo'd: SwapCount counts what the display was shown */
+      _engine.pass[i].swap_count       = (uint32_t)_swapCount;
+      _engine.pass[i].total_subframes  = _totalSubframes;
+      _engine.pass[i].current_subframe = _currentSubframe;
 
 #ifdef HAVE_REWIND
       if (state_manager_frame_is_reversed())
@@ -5537,6 +5569,23 @@ typedef struct MTLALIGN(16)
                &_engine.pass[i].rotation,        /* Rotation */
                &_engine.pass[i].core_aspect,     /* OriginalAspect */
                &_engine.pass[i].core_aspect_rot, /* OriginalAspectRotated */
+               &_engine.pass[i].total_subframes, /* TotalSubFrames */
+               &_engine.pass[i].current_subframe,/* CurrentSubFrame */
+               /* The HDR and sensor semantics have no Metal source yet;
+                * slang_process leaves an unwired slot at its zero
+                * default. The table is positional, so they are named
+                * here to keep SwapCount at its index. */
+               NULL,                             /* HDRMode */
+               NULL,                             /* BrightnessNits */
+               NULL,                             /* Scanlines */
+               NULL,                             /* SubpixelLayout */
+               NULL,                             /* ExpandGamut */
+               NULL,                             /* InverseTonemap */
+               NULL,                             /* HDR10 */
+               NULL,                             /* Gyroscope */
+               NULL,                             /* Accelerometer */
+               NULL,                             /* AccelerometerRest */
+               &_engine.pass[i].swap_count,      /* SwapCount */
             }
          };
          /* clang-format on */
@@ -6084,13 +6133,17 @@ static bool metal_frame(void *data, const void *frame,
       metal_subframe_lock = true;
       for (j = 1; j < (int)video_info->shader_subframes; j++)
       {
-         /* Re-render and present with NULL frame data (reuse previous frame) */
+         /* Re-render and present with NULL frame data (reuse previous
+          * frame); the index tells the shader which sub-frame this is */
+         video_info->current_subframe = (unsigned)j;
          if (!metal_frame(data, NULL, 0, 0, frame_count, 0, msg, video_info))
          {
+            video_info->current_subframe = 0;
             metal_subframe_lock = false;
             return false;
          }
       }
+      video_info->current_subframe = 0;
       metal_subframe_lock = false;
    }
 
@@ -6344,12 +6397,12 @@ static void metal_set_texture_frame(void *data, const void *frame,
       float alpha)
 {
    MetalDriver *md         = (__bridge MetalDriver *)data;
-   settings_t *settings;
    bool menu_linear_filter;
    if (!md)
       return;
-   settings                = config_get_ptr();
-   menu_linear_filter      = settings->bools.menu_linear_filter;
+   /* What the last frame carried, not what the setting says now: the
+    * video thread applies this from thread_update_driver_state(). */
+   menu_linear_filter      = md.frameMenuLinearFilter;
 
    [md.menu updateWidth:width
                  height:height
@@ -6678,6 +6731,15 @@ gfx_display_ctx_driver_t gfx_display_ctx_metal = {
    GFX_VIDEO_DRIVER_METAL,
    "metal",
    false,
+   /* handles_vertex_strip: this driver's draw walks
+    * draw->coords->vertices rather than reading a fixed four, so a
+    * strip may be handed to it whole.
+    *
+    * It was missing entirely, which is what the pointer-to-bool
+    * warning was reporting: scissor_begin was landing in this bool,
+    * scissor_end in scissor_begin, and scissor_end was left null. The
+    * compiler had been saying so for a while. */
+   true,
    gfx_display_metal_scissor_begin,
    gfx_display_metal_scissor_end
 };

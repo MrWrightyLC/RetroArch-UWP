@@ -452,6 +452,11 @@
  * of slower convergence after content load. */
 #define DEFAULT_FRAME_TIME_SAMPLE_GATED false
 
+/* Measure the refresh-rate estimate from the display's reported present
+ * times rather than the frame loop. Off: the estimate keeps measuring
+ * exactly what it always has. */
+#define DEFAULT_FRAME_TIME_SAMPLE_FROM_DISPLAY false
+
 /* When true, drains the 'Estimated Screen Refresh Rate' sample
  * buffer after fast-forward, save state, or load state -- events
  * whose timing doesn't reflect normal frame cadence and would
@@ -495,14 +500,34 @@
  */
 #define DEFAULT_SWAP_INTERVAL 1
 
-/* Threaded video. Will possibly increase performance significantly
- * at the cost of worse synchronization and latency.
- */
+/* Threaded video: the core runs on one thread and the video driver
+ * presents on another. Off by default, as it has always been; the
+ * Switch keeps its own default. When it is on, hardware-rendered cores
+ * follow it on every API that has a ring, with no setting of their
+ * own. */
 #if defined(HAVE_LIBNX)
 #define DEFAULT_VIDEO_THREADED true
 #else
 #define DEFAULT_VIDEO_THREADED false
 #endif
+
+/* Pace repeated frames from the display's own report of when a present
+ * reached it, where the driver or context can say. Off falls back to the
+ * frontend clock, which is also what happens with no reporter. */
+#define DEFAULT_VIDEO_PRESENT_TIMING_FROM_DISPLAY true
+
+/* With threaded video, keep presenting the last frame at the display's
+ * cadence while the core is late, instead of leaving the last present
+ * on screen for longer. Needs a driver that can repeat a frame cheaply
+ * (poke->present_last); ignored under BFI and shader sub-frames. */
+#define DEFAULT_VIDEO_THREADED_PRESENT_REPEAT false
+
+/* With threaded video, pace the core from the display: start each frame
+ * as late as the next refresh allows given measured core and render
+ * times. Off: the fixed-timer pacing threaded video always had. */
+#define DEFAULT_VIDEO_THREADED_DISPLAY_PACING false
+
+
 
 #if defined(HAVE_THREADS)
 #if defined(GEKKO) || defined(PSP) || defined(PS2)
@@ -1290,6 +1315,15 @@
 #endif
 
 /* Audio device (e.g. hw:0,0 or /dev/audio). If NULL, will use defaults. */
+/* The floor applied to the audio latency setting before any driver
+ * sees it, in milliseconds. Eight is what it was fixed at, and the
+ * reason it existed: zero used to reach the drivers and each handled
+ * it differently. Lower it and an exclusive-mode driver - WASAPI,
+ * ASIO, WDM-KS - will negotiate a shorter period with the device
+ * where the device allows one; a driver that cannot goes no lower
+ * than its own hardware floor either way. */
+#define DEFAULT_AUDIO_LATENCY_FLOOR 8
+
 #define DEFAULT_AUDIO_DEVICE NULL
 
 /* Desired audio latency in milliseconds. Might not be honored
@@ -1382,6 +1416,15 @@
  * AUDIO_FORMAT_NEGOTIATION_INT16 (0) or AUDIO_FORMAT_NEGOTIATION_FLOAT (1).
  * Float by default, matching RetroArch's historical driver behaviour. */
 #define DEFAULT_AUDIO_FORMAT_NEGOTIATION AUDIO_FORMAT_NEGOTIATION_FLOAT
+
+/* Speaker layout to open the output device with: 0 stereo, the
+ * pipeline as it always was; 1 quad, 2 5.1, 3 5.1 with the rear pair
+ * at the sides, 4 7.1 - upmixed from the stereo mix. */
+#define DEFAULT_AUDIO_OUTPUT_LAYOUT 0
+
+/* Headphone virtual surround on a stereo device: off; it is for
+ * headphones and narrows the stereo on speakers. */
+#define DEFAULT_AUDIO_HEADPHONE_VIRTUAL_SURROUND false
 /* Automatically mute audio when rewind is enabled. */
 #define DEFAULT_AUDIO_REWIND_MUTE false
 
@@ -1587,6 +1630,14 @@
 #define DEFAULT_SAVESTATE_FILE_COMPRESSION true
 #endif
 
+/* The codec compressed saves are written with: 0 deflate, 1
+ * Zstandard. Zstandard where the built-in codec is compiled in. */
+#ifdef HAVE_RZSTD
+#define DEFAULT_SAVE_COMPRESSION_CODEC 1
+#else
+#define DEFAULT_SAVE_COMPRESSION_CODEC 0
+#endif
+
 /* Slowmotion ratio. */
 #define DEFAULT_SLOWMOTION_RATIO 3.0f
 
@@ -1782,6 +1833,18 @@
  * all times. */
 #define DEFAULT_INPUT_ANDROID_SYSTEM_KEYBOARD false
 
+/* Use the system screen keyboard for menu text entry on SDL3
+ * platforms that provide one. Off by default so gamepad-only
+ * devices such as TVs keep the navigable on-screen keyboard.
+ *
+ * webOS is the exception: its own panel is the one the remote is
+ * built to drive, and the built-in OSK is the awkward option there. */
+#ifdef WEBOS
+#define DEFAULT_INPUT_SDL3_SYSTEM_KEYBOARD true
+#else
+#define DEFAULT_INPUT_SDL3_SYSTEM_KEYBOARD false
+#endif
+
 /* Automatically enable game focus when running or
  * resuming content */
 #define DEFAULT_INPUT_AUTO_GAME_FOCUS AUTO_GAME_FOCUS_OFF
@@ -1851,6 +1914,25 @@
 
 /* Only init the WIMP UI for this session if this is enabled */
 #define DEFAULT_DESKTOP_MENU_ENABLE true
+
+/* Desktop companion presentation settings, shared by the Qt, Win32 and
+ * Cocoa companions. */
+#define DEFAULT_DESKTOP_MENU_VIEW_TYPE 0            /* 0 list, 1 icons */
+#define DEFAULT_DESKTOP_MENU_THUMBNAIL_TYPE 0       /* 0 boxart, 1 screenshot, 2 title, 3 logo */
+#define DEFAULT_DESKTOP_MENU_SUGGEST_LOADED_CORE_FIRST false
+#define DEFAULT_DESKTOP_MENU_SAVE_LAST_TAB false
+#define DEFAULT_DESKTOP_MENU_LAST_TAB 0
+#define DEFAULT_DESKTOP_MENU_SAVE_GEOMETRY false
+#define DEFAULT_DESKTOP_MENU_SAVE_DOCK_POSITIONS false
+#define DEFAULT_DESKTOP_MENU_SHOW_WELCOME_SCREEN true
+#define DEFAULT_DESKTOP_MENU_SCAN_FINISH_CONFIRM true
+#define DEFAULT_DESKTOP_MENU_THUMBNAIL_CACHE_LIMIT 500
+#define DEFAULT_DESKTOP_MENU_THUMBNAIL_MAX_SIZE 0   /* 0 = unlimited */
+#define DEFAULT_DESKTOP_MENU_THUMBNAIL_QUALITY 0     /* 0 = default */
+#define DEFAULT_DESKTOP_MENU_ICON_VIEW_ZOOM 50
+#define DEFAULT_DESKTOP_MENU_ALL_PLAYLISTS_LIST_MAX_COUNT 0
+#define DEFAULT_DESKTOP_MENU_ALL_PLAYLISTS_GRID_MAX_COUNT 0
+#define DEFAULT_DESKTOP_MENU_THEME 0                 /* 0 system, 1 dark, 2 custom */
 
 /* Keep track of how long each core+content has been running for over time */
 
