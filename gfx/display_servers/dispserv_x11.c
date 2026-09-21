@@ -24,6 +24,7 @@
 
 #include <sys/types.h>
 #include <unistd.h>
+#include <poll.h>
 #include <X11/Xlib.h>
 
 #ifdef HAVE_CONFIG_H
@@ -1067,10 +1068,16 @@ static int x11_display_server_modeline_enum(void *data,
          mode->doublescan = (pxmode->modeFlags & RR_DoubleScan) ? 1 : 0;
          mode->hsync      = (pxmode->modeFlags & RR_HSyncPositive) ? 1 : 0;
          mode->vsync      = (pxmode->modeFlags & RR_VSyncPositive) ? 1 : 0;
-         /* Whole hertz for the line rate, the label the list uses */
-         mode->hfreq      = (double)(mode->pclock / (uint64_t)mode->htotal);
-         mode->vfreq      = mode->hfreq / mode->vtotal * (mode->interlace ? 2 : 1);
-         mode->refresh    = (int)mode->vfreq;
+         /* Whole hertz for the line rate, the label the list uses. A
+          * virtual or headless server lists its mode with the timing
+          * left at zero; the mode is real, its rate is unknown, and
+          * dividing by the totals is what crashed. Left at zero. */
+         if (mode->htotal && mode->vtotal)
+         {
+            mode->hfreq   = (double)(mode->pclock / (uint64_t)mode->htotal);
+            mode->vfreq   = mode->hfreq / mode->vtotal * (mode->interlace ? 2 : 1);
+            mode->refresh = (int)mode->vfreq;
+         }
          mode->width      = pxmode->width;
          mode->height     = pxmode->height;
          mode->type      |= ml->crtc_flags;
@@ -1812,6 +1819,24 @@ static int x11_display_server_get_edid(void *data, uint8_t *out, size_t max)
    return n;
 }
 
+/* Readiness of the X connection socket: a plain poll() on the fd, no
+ * Xlib call, so it is safe against a threaded video context using
+ * the same Display. Events a dispatcher already drained were its to
+ * act on. */
+static bool x11_display_server_idle_wait(void *data, unsigned ms)
+{
+   struct pollfd pfd;
+   Display *dpy = g_x11_dpy;
+   (void)data;
+   if (!dpy)
+      return false;
+   pfd.fd      = ConnectionNumber(dpy);
+   pfd.events  = POLLIN;
+   pfd.revents = 0;
+   poll(&pfd, 1, (int)ms);
+   return true;
+}
+
 const video_display_server_t dispserv_x11 = {
    x11_display_server_init,
    x11_display_server_destroy,
@@ -1870,5 +1895,6 @@ const video_display_server_t dispserv_x11 = {
    NULL, /* modeline_flush */
 #endif
    x11_display_server_get_edid,
+   x11_display_server_idle_wait,
    "x11"
 };

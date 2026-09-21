@@ -2601,11 +2601,6 @@ static struct config_bool_setting *populate_settings_bool(
    SETTING_BOOL("menu_scroll_fast",              &settings->bools.menu_scroll_fast, true, DEFAULT_MENU_SCROLL_FAST, false);
    SETTING_BOOL("menu_ignore_missing_assets",    &settings->bools.menu_ignore_missing_assets, true, DEFAULT_MENU_IGNORE_MISSING_ASSETS, false);
 
-
-
-#ifdef HAVE_CDROM
-#endif /* HAVE_CDROM */
-
    /* Actually Quick Menu items, but too late to change without breaking old confs */
    SETTING_BOOL("menu_show_latency",             &settings->bools.menu_show_latency, true, DEFAULT_QUICK_MENU_SHOW_LATENCY, false);
    SETTING_BOOL("menu_show_rewind",              &settings->bools.menu_show_rewind, true, DEFAULT_QUICK_MENU_SHOW_REWIND, false);
@@ -5345,14 +5340,14 @@ static void video_driver_default_settings(global_t *global)
  *
  * Set 'default' configuration values.
  **/
-void config_set_defaults(void *data)
+void config_set_defaults(void *data, settings_t *target)
 {
    size_t i;
 #ifdef HAVE_MENU
    static bool first_initialized   = true;
 #endif
    global_t *global                 = (global_t*)data;
-   settings_t *settings             = config_st;
+   settings_t *settings             = target;
    recording_state_t *recording_st  = recording_state_get_ptr();
    int bool_settings_size           = SETTINGS_BOOL_COUNT_MAX;
    int float_settings_size          = SETTINGS_FLOAT_COUNT_MAX;
@@ -6037,7 +6032,7 @@ void config_set_defaults(void *data)
 void config_load(void *data)
 {
    global_t *global = (global_t*)data;
-   config_set_defaults(global);
+   config_set_defaults(global, config_st);
 #ifdef HAVE_CONFIGFILE
    config_parse_file(global);
 #endif
@@ -7621,7 +7616,7 @@ bool config_unload_override(void)
    {
       input_autoconf_backup_t bkp;
       bool have_bkp = input_autoconf_state_save(&bkp);
-      config_set_defaults(global_get_ptr());
+      config_set_defaults(global_get_ptr(), config_st);
       if (have_bkp)
          input_autoconf_state_restore(&bkp);
    }
@@ -8682,7 +8677,6 @@ bool config_save_file(const char *path)
    if (minimal)
    {
       int tmp_int;
-      settings_t *saved_config_st = config_st;
 
       /* Allocate fresh settings struct for defaults */
       defaults = (settings_t*)calloc(1, sizeof(settings_t));
@@ -8731,15 +8725,13 @@ bool config_save_file(const char *path)
 
             have_autoconf_bkp = input_autoconf_state_save(&autoconf_bkp);
 
-            /* Temporarily set config_st to defaults struct so config_set_defaults populates it */
-            config_st = defaults;
-            config_set_defaults(global);  /* This calls input_config_reset() which sets default keybinds */
+            /* Populate the local defaults struct directly: config_st
+             * stays what every other thread's config_get_ptr() returns.
+             * input_config_reset() inside sets the default keybinds. */
+            config_set_defaults(global, defaults);
 
             /* Capture default keybinds (set by input_config_reset() in config_set_defaults) */
             memcpy(defaults_binds, input_config_binds, MAX_USERS * sizeof(retro_keybind_set));
-
-            /* Restore original config_st */
-            config_st = saved_config_st;
 
             /* Restore input_config_binds */
             if (saved_binds)

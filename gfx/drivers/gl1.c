@@ -205,8 +205,8 @@ typedef struct gl1
    unsigned char *menu_video_buf;
    size_t menu_frame_cap;
    /* Staging for the CPU BGRA->RGBA swizzle in gl1_draw_tex when the
-    * GL lacks GL_EXT_bgra, kept across frames and grown on demand; it
-    * used to be malloc'd and freed on every upload. */
+    * GL lacks GL_EXT_bgra, kept across frames and grown on demand
+    * rather than malloc'd and freed per upload. */
    uint8_t *swizzle_buf;
    size_t   swizzle_cap;
 #ifdef VITA
@@ -1254,10 +1254,10 @@ static void gl1_overlay_vertex_geom(void *data,
    GLfloat *vertex = NULL;
    gl1_t *gl        = (gl1_t*)data;
 
-   if (!gl)
+   if (!gl || !gl->overlay_vertex_coord)
       return;
 
-   if (image > gl->overlays)
+   if (image >= gl->overlays)
    {
       RARCH_ERR("[GL1] Invalid overlay id: %u.\n", image);
       return;
@@ -1287,7 +1287,10 @@ static void gl1_overlay_tex_geom(void *data,
    GLfloat *tex = NULL;
    gl1_t *gl     = (gl1_t*)data;
 
-   if (!gl)
+   if (!gl || !gl->overlay_tex_coord)
+      return;
+
+   if (image >= gl->overlays)
       return;
 
    tex          = (GLfloat*)&gl->overlay_tex_coord[image * 8];
@@ -2724,8 +2727,8 @@ static bool gl1_alive(void *data)
    bool ret             = false;
    gl1_t *gl1           = (gl1_t*)data;
 
-   /* Read from local bookkeeping rather than video_st (which would
-    * acquire context_lock + display_lock).  gl1->vp.full_* is
+   /* Read from local bookkeeping rather than video_st: this runs on
+    * the video thread, and gl1->vp.full_* is this driver's own state,
     * written at every set_size call site in this driver. */
    temp_width  = gl1->vp.full_width;
    temp_height = gl1->vp.full_height;
@@ -3344,7 +3347,9 @@ static void gl1_overlay_set_alpha(void *data, unsigned image, float mod)
 {
    GLfloat *color = NULL;
    gl1_t *gl      = (gl1_t*)data;
-   if (!gl)
+   /* As the geometry setters: no page loaded is a NULL array, and an
+    * index off the end of the page is the neighbouring block. */
+   if (!gl || !gl->overlay_color_coord || image >= gl->overlays)
       return;
 
    color          = (GLfloat*)&gl->overlay_color_coord[image * 16];
@@ -3358,6 +3363,7 @@ static void gl1_overlay_set_alpha(void *data, unsigned image, float mod)
 static const video_overlay_interface_t gl1_overlay_interface = {
    gl1_overlay_enable,
    gl1_overlay_load,
+   NULL, /* load_textures */
    gl1_overlay_tex_geom,
    gl1_overlay_vertex_geom,
    gl1_overlay_full_screen,

@@ -48,6 +48,7 @@
 
 #include "../tasks/task_content.h"
 #include "../tasks/tasks_internal.h"
+#include "gfx_surface.h"
 
 #define BASE_FONT_SIZE      32.0f
 #define MSG_QUEUE_FONT_SIZE 20.0f
@@ -61,11 +62,6 @@ static uint64_t widget_icon_load_gen  = 0;
 static void gfx_widgets_update_icon_layout(dispgfx_widget_t *p_dispwidget)
 {
    bool has_icons = !!(p_dispwidget->flags & DISPGFX_WIDGET_FLAG_MSG_QUEUE_HAS_ICONS);
-
-   if (has_icons)
-      p_dispwidget->msg_queue_regular_padding_x   = p_dispwidget->simple_widget_padding / 2;
-   else
-      p_dispwidget->msg_queue_regular_padding_x   = p_dispwidget->simple_widget_padding;
 
    if (has_icons)
    {
@@ -332,8 +328,8 @@ static void gfx_widgets_msg_queue_push_state(
    disp_widget_msg_t    *msg_widget = NULL;
    dispgfx_widget_t *p_dispwidget   = &dispwidget_st;
 
-   /* The outer FIFO_WRITE_AVAIL fast-path check that used to wrap
-    * this function body has been removed: reading the FIFO cursors
+   /* No FIFO_WRITE_AVAIL fast-path check wraps this function body,
+    * deliberately: reading the FIFO cursors
     * outside msg_queue_lock is a data race against the producer
     * lock-protected fifo_write below (TSan-detectable; benign on
     * x86 TSO but real on weak-memory hardware).  The locked
@@ -428,7 +424,6 @@ static void gfx_widgets_msg_queue_push_state(
          msg_widget->expiration_timer           = 0;
 
          msg_widget->task_ptr                   = task;
-         msg_widget->task_count                 = 0;
 
          msg_widget->task_progress              = 0;
          msg_widget->task_ident                 = 0;
@@ -471,7 +466,6 @@ static void gfx_widgets_msg_queue_push_state(
                msg_widget->flags               |= DISPWIDG_FLAG_TASK_FINISHED;
             msg_widget->task_progress           = task->progress;
             msg_widget->task_ident              = task->ident;
-            msg_widget->task_count              = 1;
 
             if (task->style == TASK_STYLE_POSITIVE)
                msg_widget->flags               |= DISPWIDG_FLAG_POSITIVE;
@@ -610,8 +604,6 @@ static void gfx_widgets_msg_queue_push_state(
             else
                msg_widget_msg_transition_animation_done(msg_widget);
 
-            msg_widget->task_count++;
-
             msg_widget->width = new_width;
          }
 
@@ -734,8 +726,8 @@ static void gfx_widgets_msg_queue_free(
     * once per frame) until it notices. The widget, meanwhile, gets an
     * expiration timer the moment the flag is observed and is gone
     * TASK_FINISHED_DURATION later. Skipping the unlink for those two
-    * left task->frontend_userdata pointing into freed memory for the
-    * entire remaining lifetime of the task. */
+    * leaves task->frontend_userdata pointing into freed memory for
+    * the entire remaining lifetime of the task. */
    if (msg->task_ptr && !(msg->flags & DISPWIDG_FLAG_TASK_FINISHED))
       msg->task_ptr->frontend_userdata = NULL;
 
@@ -1428,8 +1420,7 @@ static int gfx_widgets_draw_indicator(
 
       gfx_display_set_alpha(p_dispwidget->pure_white, 1.0f);
 
-      if (dispctx && dispctx->blend_begin)
-         dispctx->blend_begin(userdata);
+      gfx_display_blend_begin(dispctx, userdata);
       gfx_widgets_draw_icon(
             userdata,
             p_disp,
@@ -1444,8 +1435,7 @@ static int gfx_widgets_draw_indicator(
             0.0f, /* sine(rad)  = sine(0) = 0.0f */
             p_dispwidget->pure_white
             );
-      if (dispctx && dispctx->blend_end)
-         dispctx->blend_end(userdata);
+      gfx_display_blend_end(dispctx, userdata);
    }
    else
    {
@@ -1612,8 +1602,7 @@ static void gfx_widgets_draw_task_msg(
    }
 
    /* Icon */
-   if (dispctx && dispctx->blend_begin)
-      dispctx->blend_begin(userdata);
+   gfx_display_blend_begin(dispctx, userdata);
    {
       float radians = 0.0f; /* rad                        */
       float cosine  = 1.0f; /* cos(rad)  = cos(0)  = 1.0f */
@@ -1666,8 +1655,7 @@ static void gfx_widgets_draw_task_msg(
             sine,
             color);
    }
-   if (dispctx && dispctx->blend_end)
-      dispctx->blend_end(userdata);
+   gfx_display_blend_end(dispctx, userdata);
 
    /* Text */
    text_y_base = rect_y
@@ -1840,8 +1828,7 @@ static void gfx_widgets_draw_regular_msg(
       float cosine  = cosf(radians);
       float sine    = sinf(radians);
 
-      if (dispctx && dispctx->blend_begin)
-         dispctx->blend_begin(userdata);
+      gfx_display_blend_begin(dispctx, userdata);
 
       gfx_widgets_draw_icon(
             userdata,
@@ -1859,8 +1846,7 @@ static void gfx_widgets_draw_regular_msg(
             sine,
             msg_queue_info);
 
-      if (dispctx && dispctx->blend_end)
-         dispctx->blend_end(userdata);
+      gfx_display_blend_end(dispctx, userdata);
    }
 }
 
@@ -2027,8 +2013,7 @@ static void gfx_widgets_frame_state(void *data)
 
       if (p_dispwidget->ai_service_overlay_texture)
       {
-         if (dispctx->blend_begin)
-            dispctx->blend_begin(userdata);
+         gfx_display_blend_begin(dispctx, userdata);
          gfx_widgets_draw_icon(
                userdata,
                p_disp,
@@ -2044,8 +2029,7 @@ static void gfx_widgets_frame_state(void *data)
                0.0f, /* sine(rad)  = sine(0) = 0.0f */
                p_dispwidget->pure_white
                );
-         if (dispctx->blend_end)
-            dispctx->blend_end(userdata);
+         gfx_display_blend_end(dispctx, userdata);
       }
 
       /* top line */
@@ -2293,9 +2277,28 @@ static void gfx_widgets_frame_state(void *data)
 
 void gfx_widgets_frame(void *data)
 {
+   dispgfx_widget_t *p_dispwidget = &dispwidget_st;
+
    gfx_widgets_state_lock();
+#ifdef HAVE_THREADS
+   /* A frame the wrapper already had queued still says the widgets
+    * are active. Once gfx_widgets_deinit() has taken the worker away
+    * from them - under this lock, before it frees the fonts - the
+    * fonts are not there to draw with; the frame's own flag is the
+    * main thread's word from before that. */
+   if (     !p_dispwidget->worker
+         && p_dispwidget->video_st
+         && ((video_driver_state_t*)p_dispwidget->video_st)->thread_wrapper_active)
+   {
+      gfx_widgets_state_unlock();
+      return;
+   }
+#endif
    gfx_widgets_frame_state(data);
    gfx_widgets_state_unlock();
+
+   /* Nothing gathered may still be waiting when the frame is over */
+   gfx_display_flush_batch(disp_get_ptr());
 }
 
 static void gfx_widgets_free(dispgfx_widget_t *p_dispwidget)
@@ -2403,7 +2406,7 @@ static void gfx_widgets_context_reset(
          "menu_achievements.png"
       };
    size_t i;
-   bool supports_rgba = (video_driver_get_disp_flags() & VIDEO_FLAG_USE_RGBA);
+   bool supports_rgba = gfx_surface_wants_rgba();
 
    /* Invalidate any in-flight async icon loads */
    widget_icon_load_gen++;
@@ -2569,7 +2572,9 @@ bool gfx_widgets_init(
 #ifdef HAVE_THREADS
    /* Under the threaded video wrapper the worker that draws the
     * widgets also animates and lays them out */
-   p_dispwidget->worker = video_state_get_ptr()->thread_wrapper_active;
+   p_dispwidget->video_st = video_state_get_ptr();
+   p_dispwidget->worker   = ((video_driver_state_t*)
+         p_dispwidget->video_st)->thread_wrapper_active;
    gfx_animation_widgets_own(p_dispwidget->worker);
 #endif
 
@@ -2687,9 +2692,16 @@ void gfx_widgets_deinit(bool widgets_persisting)
 #ifdef HAVE_THREADS
    /* Back to the main list: the tweens of widgets that persist carry
     * on under whichever video comes up next, and freeing kills the
-    * rest where the widget code looks for them */
+    * rest where the widget code looks for them. Under the state lock:
+    * a frame the worker is drawing finishes first, and every frame
+    * after it sees the worker gone (gfx_widgets_frame()) and draws no
+    * widgets, so the fonts freed below are read by nobody. The frames
+    * the wrapper still holds were queued while the widgets were
+    * active, and would otherwise draw with a font being freed. */
+   gfx_widgets_state_lock();
    p_dispwidget->worker = false;
    gfx_animation_widgets_own(false);
+   gfx_widgets_state_unlock();
 #endif
 
    gfx_widgets_detach_tasks(p_dispwidget);
@@ -2805,7 +2817,9 @@ void gfx_widgets_state_lock(void)
    uintptr_t self;
 
    if (     !p_dispwidget->state_lock
-         || !video_state_get_ptr()->thread_wrapper_active)
+         || !p_dispwidget->video_st
+         || !((video_driver_state_t*)
+               p_dispwidget->video_st)->thread_wrapper_active)
       return;
 
    self = sthread_get_current_thread_id();

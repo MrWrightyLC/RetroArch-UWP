@@ -28,6 +28,7 @@
 #include "../msg_hash.h"
 #include "../verbosity.h"
 #include "font_driver.h"
+#include "gfx_display.h"
 #include "video_thread_wrapper.h"
 #include <retro_atomic.h>
 
@@ -485,10 +486,16 @@ static bool font_driver_rebuild(font_data_t *font,
       return false;
 
    /* font->renderer is the backend font_init_first() was handed, so
-    * this is the call that made the font, against a different file. */
+    * this is the call that made the font, against a different file.
+    * A rebuild goes through the video thread whenever the wrapper is
+    * up, whatever thread made the font: the OSD font is made on the
+    * thread that owns the context and carries no threading hint, but
+    * a font-size change rebuilds it from the settings path on the
+    * main thread, and a GL backend making its context current there
+    * while the video thread holds it is an X BadAccess. On the video
+    * thread itself the call runs directly. */
 #ifdef HAVE_THREADS
-   if (     font->threading_hint
-         && video_driver_thread_wrapper_active())
+   if (video_driver_thread_wrapper_active())
       ok = video_thread_font_init(&drv, &handle, font->video_data,
             path, size, font->renderer, font_init_first,
             font->is_threaded);
@@ -563,6 +570,19 @@ unsigned font_driver_reload_fonts(void)
 uint32_t font_driver_get_generation(void)
 {
    return (uint32_t)retro_atomic_load_acquire_int(&font_driver_generation);
+}
+
+/* The video singleton's stable address, bound on the main thread at
+ * video init before the threaded wrapper spawns. Under the wrapper
+ * the OSD fonts are created, measured and freed on the video thread,
+ * so every reach into ra-video state in this file goes through the
+ * capture rather than the getter; no thread entry calls into a
+ * singleton getter through here. */
+static video_driver_state_t *font_driver_video_st;
+
+void font_driver_bind_video_state(void *video_st)
+{
+   font_driver_video_st = (video_driver_state_t*)video_st;
 }
 
 int font_renderer_create_default(
@@ -1144,9 +1164,15 @@ void font_driver_render_msg(void *data, const char *msg, size_t msg_len,
       const struct font_params *params, void *font_data)
 {
    font_data_t                *font = (font_data_t*)(font_data
-         ? font_data : (void*)video_state_get_ptr()->osd_font);
+         ? font_data : (font_driver_video_st
+            ? (void*)font_driver_video_st->osd_font : NULL));
    const font_renderer_t *renderer  = (font && msg && msg_len)
    ? font->renderer : NULL;
+
+   gfx_display_t *p_disp            = disp_get_ptr();
+
+   /* Quads asked for before this text have to land under it */
+   gfx_display_flush_batch(p_disp);
 
    if (renderer && renderer->render_msg)
    {
@@ -1161,6 +1187,10 @@ void font_driver_render_msg(void *data, const char *msg, size_t msg_len,
       char         *new_msg         = (char*)msg;
       size_t        new_msg_len     = msg_len;
 #endif
+      /* Without a block the backend draws this string on its own;
+       * with one, the draw is counted when the block is flushed */
+      if (p_disp && !(font->block_bound && renderer->bind_block))
+         p_disp->stats.v[GFX_DISPLAY_STAT_FONT_DRAWS]++;
       renderer->render_msg(data,
             font->renderer_data, new_msg, new_msg_len, params);
    }
@@ -1171,7 +1201,10 @@ void font_driver_bind_block(void *font_data, void *block)
    font_data_t *font               = (font_data_t*)font_data;
    const font_renderer_t *renderer = font ? font->renderer : NULL;
    if (renderer && renderer->bind_block)
+   {
       renderer->bind_block(font->renderer_data, block);
+      font->block_bound = (block != NULL);
+   }
 }
 
 /* Flushing is slow - only do it if font has actually been used */
@@ -1224,6 +1257,13 @@ void font_flush(
 
    if (font_data->raster_block.carr.coords.vertices == 0)
       return;
+   {
+      gfx_display_t *p_disp = disp_get_ptr();
+      /* Quads asked for before this text have to land under it */
+      gfx_display_flush_batch(p_disp);
+      if (p_disp && renderer && renderer->flush)
+         p_disp->stats.v[GFX_DISPLAY_STAT_FONT_DRAWS]++;
+   }
    if (renderer && renderer->flush)
       renderer->flush(video_width, video_height, font_data->font->renderer_data);
    font_data->raster_block.carr.coords.vertices = 0;
@@ -1233,7 +1273,8 @@ int font_driver_get_message_width(void *font_data,
       const char *msg, size_t len, float scale)
 {
    font_data_t *font               = (font_data_t*)(font_data
-         ? font_data : (void*)video_state_get_ptr()->osd_font);
+         ? font_data : (font_driver_video_st
+            ? (void*)font_driver_video_st->osd_font : NULL));
    const font_renderer_t *renderer = font ? font->renderer : NULL;
    if (renderer && renderer->get_message_width)
       return renderer->get_message_width(font->renderer_data, msg, len, scale);
@@ -1516,7 +1557,11 @@ font_data_t *font_driver_init_first(
  * another driver instance. */
 static void font_driver_free_osd(void)
 {
-   video_driver_state_t *video_st = video_state_get_ptr();
+   video_driver_state_t *video_st = font_driver_video_st;
+
+   /* Unbound == video never initialised == no shared OSD font. */
+   if (!video_st)
+      return;
 
    if (video_st->osd_font)
       font_driver_free((font_data_t*)video_st->osd_font);
@@ -1535,7 +1580,11 @@ void font_driver_init_osd(
     * its images belong to a device that is gone, whose handles the
     * new one will recycle. Drop it rather than keep it. Guarding on
     * presence alone is what let a stale font survive a reinit. */
-   video_driver_state_t *video_st = video_state_get_ptr();
+   video_driver_state_t *video_st = font_driver_video_st;
+
+   /* Unbound == video never initialised == no shared OSD font. */
+   if (!video_st)
+      return;
 
    if (video_st->osd_font && video_st->osd_font_owner != video_data)
    {
@@ -1562,8 +1611,9 @@ void font_driver_init_osd(
 
 bool font_driver_reinit_osd(const char *font_path, float font_size)
 {
-   video_driver_state_t *video_st = video_state_get_ptr();
-   font_data_t          *font     = (font_data_t*)video_st->osd_font;
+   video_driver_state_t *video_st = font_driver_video_st;
+   font_data_t          *font     = video_st
+         ? (font_data_t*)video_st->osd_font : NULL;
 
    /* No shared OSD font: video is not up, or the driver keeps its own
     * and never registered one here. Let the caller fall back. */
@@ -1603,7 +1653,11 @@ void font_driver_free_osd_for(void *video_data)
    /* Only the owner may free it. Teardown of an instance that no
     * longer owns the font - a stale or deferred free - must leave the
     * live one alone. */
-   video_driver_state_t *video_st = video_state_get_ptr();
+   video_driver_state_t *video_st = font_driver_video_st;
+
+   /* Unbound == video never initialised == no shared OSD font. */
+   if (!video_st)
+      return;
 
    if (video_st->osd_font && video_st->osd_font_owner == video_data)
       font_driver_free_osd();

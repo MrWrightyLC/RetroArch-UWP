@@ -167,6 +167,10 @@
 /* Play the audio track of animated WebM thumbnails (menu preview). */
 #define DEFAULT_MENU_THUMBNAIL_PREVIEW_AUDIO false
 
+/* Threads converting each frame of an animated WebM/MP4 thumbnail to
+ * pixels; 1 keeps the conversion on the decode thread. */
+#define DEFAULT_MENU_THUMBNAIL_PREVIEW_THREADS 1
+
 #define DEFAULT_SCREEN_BRIGHTNESS 100
 
 #define DEFAULT_CRT_SWITCH_RESOLUTION CRT_SWITCH_NONE
@@ -1153,8 +1157,10 @@
 #define DEFAULT_VIDEO_SHADER_WATCH_FILES false
 
 /* Initialise file browser with last used directory
- * when selecting shader presets/passes via the menu */
-#define DEFAULT_VIDEO_SHADER_REMEMBER_LAST_DIR false
+ * when selecting shader presets/passes via the menu,
+ * and step the next/prev shader hotkeys from the
+ * loaded preset instead of the shader directory root */
+#define DEFAULT_VIDEO_SHADER_REMEMBER_LAST_DIR true
 
 /* OSD-messages. */
 #define DEFAULT_FONT_ENABLE true
@@ -1406,6 +1412,10 @@
 #define DEFAULT_AUDIO_FASTFORWARD_MUTE false
 /* Speed up audio to match fast forward speed up. */
 #define DEFAULT_AUDIO_FASTFORWARD_SPEEDUP false
+/* Apply fast-forward audio handling to cores that render audio
+ * through their own callback. Off keeps their audio at real time,
+ * as stable RetroArch always did. */
+#define DEFAULT_AUDIO_FASTFORWARD_CALLBACK false
 /* When a core outputs 16-bit integer audio, the deterministic
  * fixed-point (int16) resampler variant of the selected backend
  * (sinc, nearest, or CC) can be preferred over the float one for any
@@ -1460,6 +1470,7 @@
 
 /* Enables displaying various timing statistics. */
 #define DEFAULT_STATISTICS_SHOW false
+#define DEFAULT_STATISTICS_HIDE_IN_MENU true
 
 /* Enables displaying the current netplay room ping. */
 #define DEFAULT_NETPLAY_PING_SHOW false
@@ -1812,6 +1823,10 @@
 #else
 #define DEFAULT_INPUT_AUTO_MOUSE_GRAB false
 #endif
+
+/* Take controller input while RetroArch is not the active window.
+ * On by default: one controller can drive several instances. */
+#define DEFAULT_INPUT_JOYPAD_BACKGROUND true
 
 #if TARGET_OS_IPHONE
 #define DEFAULT_INPUT_KEYBOARD_GAMEPAD_ENABLE false

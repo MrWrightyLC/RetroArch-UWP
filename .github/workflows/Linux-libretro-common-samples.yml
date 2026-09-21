@@ -146,6 +146,10 @@ jobs:
             screenshot_io_bench
             word_wrap_overflow_test
             task_queue_title_error_test
+            task_queue_init_failure_test
+            # Stops the worker with a bound when a detachable
+            # handler is stuck; waits ~1.5 s by design.
+            task_queue_detach_test
             tpool_wait_test
             data_transfer_pool_scrub_test
             retro_atomic_test
@@ -155,8 +159,25 @@ jobs:
             # <kernel.h>: the PS2 CI lane compiles it, this runs it.
             retro_atomic_ps2_backend_test
             retro_spsc_test
+            mpsc_stack_test
             retro_waitable_spsc_test
             retro_eventcount_test
+            # retro_sleep_until_us must never return early against the
+            # microsecond clock; the late bound is loose for a loaded
+            # runner.
+            retro_sleep_until_test
+            # Runs its natural tier only here; Makefile.test's
+            # threads-samples forces each tier in turn.  On the
+            # runner's cores the fence check is load-bearing, which
+            # this box cannot make it.
+            retro_procbarrier_test
+            retro_asym_eventcount_test
+            sthread_ex_test
+            memshm_test
+            fastjmp_test
+            rdds_block_test
+            faulthandler_test
+            memshm_area_test
             msg_fifo_queue_test
             audio_mixer_loop_test
             audio_mixer_rate_guard_test
@@ -195,6 +216,14 @@ jobs:
           # leak is fixed, so LeakSanitizer runs at full strictness and
           # any surviving allocation is a real config_file regression.
           declare -A RUN_ENV=(
+            # fastjmp_jmp is a longjmp that is not libc's, so ASan's
+            # fake-stack check cannot follow it; the same holds for
+            # libco. The jump is what the test is for.
+            [fastjmp_test]="ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=0"
+            # The filter must be the one that sees SIGSEGV: ASan installs
+            # its own, and with it the faults never reach the code under
+            # test. handle_segv=0 is how a fastmem core runs.
+            [faulthandler_test]="ASAN_OPTIONS=detect_leaks=1:handle_segv=0 UBSAN_OPTIONS=handle_segv=0"
           )
 
           # Samples that are build-only (either they require command-line
@@ -452,6 +481,27 @@ jobs:
           CC=clang make all SANITIZER=thread
 
           TSAN_OPTIONS=halt_on_error=1 ./retro_atomic_test
+
+      - name: Run mpsc_stack_test under Clang + ThreadSanitizer
+        shell: bash
+        working-directory: libretro-common/samples/queues/mpsc_stack_test
+        run: |
+          # mpsc_stack.h is the lock-free many-producer single-consumer
+          # stack the runloop's deferred messages ride.  Its contract is
+          # the push's compare-exchange publishing the node against the
+          # drain's exchange; a weakened push loses nodes under
+          # contention, observable as a drained-count mismatch AND as a
+          # TSan-reported race.  The default ASan/UBSan pass above
+          # catches neither reliably - the race needs TSan's scheduling
+          # to manifest - so this lane is the one that holds the
+          # contract.
+          set -u
+          set -o pipefail
+
+          make clean
+          CC=clang make all SANITIZER=thread
+
+          TSAN_OPTIONS=halt_on_error=1 ./mpsc_stack_test
 
       - name: Run retro_spsc_test under Clang + ThreadSanitizer
         shell: bash

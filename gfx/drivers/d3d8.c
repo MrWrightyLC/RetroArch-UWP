@@ -150,9 +150,6 @@ typedef struct d3d8_video
    bool quitting;
    bool needs_restore;
    bool overlays_enabled;
-   /* TODO - refactor this away properly. */
-   bool resolution_hd_enable;
-
    /* Only used for Xbox */
    bool widescreen_mode;
 
@@ -1997,21 +1994,18 @@ static void d3d8_get_video_size(d3d8_video_t *d3d,
          *width                    = 640;
          *height                   = 480;
          d3d->widescreen_mode      = false;
-         d3d->resolution_hd_enable = true;
       }
       else if (video_mode & XC_VIDEO_FLAGS_HDTV_720p)
       {
          *width                    = 1280;
          *height                   = 720;
          d3d->widescreen_mode      = true;
-         d3d->resolution_hd_enable = true;
       }
       else if (video_mode & XC_VIDEO_FLAGS_HDTV_1080i)
       {
          *width                    = 1920;
          *height                   = 1080;
          d3d->widescreen_mode      = true;
-         d3d->resolution_hd_enable = true;
       }
    }
 }
@@ -2799,6 +2793,7 @@ static void d3d8_overlay_set_alpha(void *data, unsigned index, float mod)
 static const video_overlay_interface_t d3d8_overlay_interface = {
    d3d8_overlay_enable,
    d3d8_overlay_load,
+   NULL, /* load_textures */
    d3d8_overlay_tex_geom,
    d3d8_overlay_vertex_geom,
    d3d8_overlay_full_screen,

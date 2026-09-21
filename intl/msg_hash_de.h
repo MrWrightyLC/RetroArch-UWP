@@ -268,6 +268,7 @@ static const struct
    char s_daead8a5[13];
    char s_48c208ee[11];
    char s_a38cafbb[21];
+   char s_cf4d4f28[47];
    char s_f4740f16[35];
    char s_d95f1db1[44];
    char s_3c9950ad[39];
@@ -286,6 +287,7 @@ static const struct
    char s_fb84857a[8];
    char s_3943c7ae[31];
    char s_5b2d8d2f[25];
+   char s_6fd9b032[31];
    char s_affd948c[26];
    char s_d2d4c381[27];
    char s_a95aa0fc[27];
@@ -298,6 +300,8 @@ static const struct
    char s_ad7c73f6[16];
    char s_30acd6fb[16];
    char s_ce7da552[38];
+   char s_6b5e88c4[55];
+   char s_79fff0ec[43];
    char s_04b30c51[26];
    char s_e5aeacf9[24];
    char s_24976a5b[25];
@@ -837,6 +841,7 @@ static const struct
    char s_d458f013[30];
    char s_56e1b31e[17];
    char s_56e1b31f[16];
+   char s_267cbe7d[34];
    char s_597c4715[18];
    char s_56e1b329[24];
    char s_3318187b[19];
@@ -1220,6 +1225,7 @@ static const struct
    char s_ac60056b[11];
    char s_1ad09b45[26];
    char s_774e2332[39];
+   char s_1c9e1ceb[38];
    char s_87064238[36];
    char s_2a273dd7[25];
    char s_5e5fc0ee[25];
@@ -1988,6 +1994,7 @@ static const struct
    char s_d7fc4c9c[24];
    char s_d21c686b[23];
    char s_f465878a[24];
+   char s_3aa6b936[32];
    char s_a35a9e13[21];
    char s_64a91b83[14];
 #ifdef HAVE_MIST
@@ -2298,7 +2305,7 @@ static const struct
    char s_a9711945[33];
    char s_bdaa2cfe[51];
    char s_ec9ccdc3[26];
-   char s_8bf6ccd4[49];
+   char s_8bf6ccd4[46];
    char s_2cb6ab5c[19];
    char s_552163d9[40];
    char s_ef3d53d8[20];
@@ -2449,6 +2456,7 @@ static const struct
    char s_a95c1929[45];
    char s_23b8ca2e[25];
    char s_daf6d7e2[57];
+   char s_708c69d6[335];
    char s_042502c4[55];
    char s_90ae9a9f[102];
    char s_81b79d5b_0[500];
@@ -2471,6 +2479,8 @@ static const struct
    char s_bdeebb68[36];
    char s_f9005edc[142];
    char s_6ade80dd[42];
+   char s_ec7aa7a0_0[500];
+   char s_ec7aa7a0_1[6];
    char s_b5ccfdfa[173];
    char s_8a24406f[45];
    char s_8c6b0fea[52];
@@ -2481,6 +2491,9 @@ static const struct
    char s_3c3598a9[44];
    char s_3bac47bd[447];
    char s_90e7db40[465];
+   char s_b07cd572_0[500];
+   char s_b07cd572_1[89];
+   char s_1b3f0b9a[400];
    char s_4b78ee7f[62];
    char s_aed11d67[151];
    char s_dbe6e749[94];
@@ -2656,7 +2669,6 @@ static const struct
    char s_79b8ce4a[87];
    char s_a1a8257e[103];
    char s_282f7955[108];
-   char s_d5231783[99];
    char s_a68d6d11[61];
    char s_74022c02[76];
    char s_8abad013[90];
@@ -2773,6 +2785,7 @@ static const struct
    char s_6da9b571[277];
    char s_c2827177[133];
    char s_09f2837b[244];
+   char s_2c4c27eb[238];
    char s_85147d5c[86];
    char s_0b56ad4c[65];
    char s_c312b1ca[39];
@@ -2821,8 +2834,8 @@ static const struct
    char s_d9153542[57];
    char s_8e48ec69[43];
    char s_cd43c108[81];
-   char s_cd46e260[84];
-   char s_cd482ffe[85];
+   char s_cd46e260[412];
+   char s_cd482ffe[412];
    char s_49336383[51];
    char s_e92351d4[113];
    char s_8e22cdce[54];
@@ -3045,6 +3058,7 @@ static const struct
    char s_5aa622cc[254];
    char s_2b908073[300];
    char s_64bea160[226];
+   char s_2826de99[404];
    char s_97c62766[167];
    char s_6f458a85[128];
    char s_41702fdc[62];
@@ -3453,6 +3467,7 @@ static const struct
 #endif
    char s_9b51352c[26];
    char s_12510638[46];
+   char s_407622a4[66];
    char s_ac067981[52];
    char s_82d064b1[28];
 #ifdef HAVE_MIST
@@ -3632,7 +3647,7 @@ static const struct
    char s_261210b3[78];
    char s_3a4b246c[102];
    char s_2ceab671[153];
-   char s_977f8e82[96];
+   char s_977f8e82[301];
    char s_3c679f0a[336];
    char s_5b059407[144];
    char s_36033606[199];
@@ -4723,6 +4738,7 @@ static const struct
    "Audiotreiber",
    "DSP-Plugin",
    "DSP-Plugin entfernen",
+   "Schnellvorspulen ver\303\244ndert das Callback-Audio",
    "Auto-stumm bei schnellem Vorspulen",
    "Audiobeschleunigung bei schnellem Vorspulen",
    "Auf feste Ganzzahl resamplen (Hinweis)",
@@ -4741,6 +4757,7 @@ static const struct
    "Ausgabe",
    "Dynamische Audioratensteuerung",
    "Audio-Resampling-Treiber",
+   "Hochwertiges Sinc-Oversampling",
    "Audio-Resampler-Qualit\303\244t",
    "Lautlos-Modus respektieren",
    "Auto-stumm bei R\303\274ckspulen",
@@ -4753,6 +4770,8 @@ static const struct
    "Synchronisation",
    "Synchronisation",
    "Priorit\303\244t des Audio-Threads erh\303\266hen",
+   "Geschwindigkeits\303\244nderungen ohne Tonh\303\266henver\303\244nderung",
+   "Geschwindigkeitsabh\303\244ngiger Tiefpassfilter",
    "Lautst\303\244rkeanpassung (dB)",
    "Exklusiver WASAPI-Modus",
    "WASAPI-Gleitkomma-Format",
@@ -5293,6 +5312,7 @@ static const struct
    "Tastatur-Controller-Zuordnung",
    "A-Knopf (rechts)",
    "B-Knopf (unten)",
+   "Controller-Eingabe im Hintergrund",
    "Steuerkreuz unten",
    "L-Knopf (Schultertaste)",
    "L2-Knopf (Trigger)",
@@ -5676,6 +5696,7 @@ static const struct
    "Startseite",
    "Vorschaubildhintergr\303\274nde",
    "Audio von animierten Miniaturansichten",
+   "Threads f\303\274r animierte Miniaturbilder",
    "Vorschaubildskalierungs-Schwellwert",
    "Gleichm\303\244\303\237iger Lauftext",
    "Lauftext-Geschwindigkeit",
@@ -6452,6 +6473,7 @@ static const struct
    "Remote-RetroPad starten",
    "Videoprozessor starten",
    "Savestate-Speicherplatz",
+   "Statistiken im Men\303\274 ausblenden",
    "Statistiken anzeigen",
    "stdin-Befehle",
 #ifdef HAVE_MIST
@@ -6764,7 +6786,7 @@ static const struct
    "Globale Voreinstellung speichern",
    "Voreinstellung des Inhaltsverzeichnisses speichern",
    "Einfache Voreinstellungen",
-   "Das zuletzt verwendete Shader-Verzeichnis merken",
+   "Zuletzt verwendetes Shader-Verzeichnis merken",
    "Shader-Unterbilder",
    "Gemeinsamen Hardware-Kontext aktivieren",
    "Bilineare Filterung",
@@ -6937,6 +6959,10 @@ static const struct
    "Alle aktiven Audio-DSP-Plugins deaktivieren.",
    "Audioausgabe aktivieren.",
    "Gleichzeitige Wiedergabe von Audiostreams auch im Men\303\274.",
+   "Schnellvorlauf-Audioverarbeitung auf Cores anwenden, die Audio \303\274ber einen eigenen Callbac"
+   "k wiedergeben. Diese Cores erzeugen Audio in Echtzeit, daher wird die Geschwindigkeit anhand der"
+   " erreichten Bildrate des Videos ermittelt. Bei \342\200\236Aus\342\200\234 bleibt das Audio in E"
+   "chtzeit, wie es bei der stabilen RetroArch-Version stets der Fall war.",
    "Audio automatisch stummschalten, wenn vorgespult wird.",
    "Audio beim schnellen Vorlauf beschleunigen. Verhindert Knackger\303\244usche, ver\303\244ndert a"
    "ber die Tonh\303\266he.",
@@ -6995,6 +7021,13 @@ static const struct
    "Hilft, Fehler bei der Audio- und Videosynchronisierung auszub\303\274geln. Wenn deaktiviert, ist"
    " eine brauchbare Synchronisation nahezu unm\303\266glich.",
    "Zu verwendender Audio-Resampling-Treiber.",
+   "Einen l\303\244ngeren Sinc-Filter verwenden, wenn die konfigurierte Ausgaberate mindestens doppe"
+   "lt so hoch ist wie die Inhaltsrate. \303\234berschreibt die Resampler-Qualit\303\244t ausschlie"
+   "\303\237lich f\303\274r Sinc. Erh\303\266ht die CPU-Auslastung, den Speicherbedarf und die Filte"
+   "rverz\303\266gerung, insbesondere bei mehreren Kan\303\244len. Verwendet w\303\244hrend der Akti"
+   "vierung Software-Resampling anstelle von Treiber-Resampling. Erfordert eine hohe Ausgaberate; be"
+   "im Schnellvorlauf kann sich das tats\303\244chliche Resampling-Verh\303\244ltnis verrin",
+   "gern.",
    "Diesen Wert verkleinern, f\303\274r bessere Leistung/kleinere Latenz zu Lasten der Audioqualit"
    "\303\244t; erh\303\266hen, f\303\274r bessere Audioqualit\303\244t auf Kosten der Leistung/klein"
    "erer Latenz.",
@@ -7022,6 +7055,18 @@ static const struct
    " beh\303\244lt die Standardpriorit\303\244t bei, und es \303\244ndert sich nichts weiter. Dies g"
    "ilt f\303\274r den Audiothread, auf dem die Threaded Pipeline und die Core-Audio-Callbacks ausge"
    "f\303\274hrt werden.",
+   "Die Tonh\303\266he bei Zeitlupe und Zeitraffer beibehalten. Unterst\303\274tzt Thread-basierte u"
+   "nd framesynchrone Wiedergabe, einschlie\303\237lich ausgehandeltem Mehrkanal-Audio. Erh\303\266h"
+   "t bei Aktivierung den Rechenaufwand sowie den Speicher- und Pufferbedarf. Erfordert eine Inhalts"
+   "rate von 8000\342\200\223192000\302\240Hz. Nicht unterst\303\274tzte Geschwindigkeiten oder Quel"
+   "lformate verwenden die normale Wiedergabe. Inline-Layout\303\244nderungen setzen den gepufferten"
+   " Ton zur\303\274ck. Bei der Thread-basierten Wiedergabe wird die Tonh\303\266henbei",
+   "behaltung fortgesetzt, sobald der in der Warteschlange befindliche Ton abgearbeitet ist.",
+   "Mildert hohe Frequenzen bei beschleunigter Wiedergabe, mit oder ohne tonh\303\266henkonservieren"
+   "de Geschwindigkeits\303\244nderungen. Unterst\303\274tzt dieselben Inhaltsraten und Quellformate"
+   ". F\303\274gt bei Aktivierung eine Signalverarbeitung und vorbereiteten Speicher hinzu; die Wied"
+   "ergabe mit normaler Geschwindigkeit erfolgt ungefiltert. Dieser optionale Effekt ersetzt nicht d"
+   "en Anti-Aliasing-Filter des Resamplers.",
    "Lautst\303\244rkeanpassung in dB. 0 dB ist die normale Lautst\303\244rke.",
    "Dem WASAPI-Treiber erlauben, die vollst\303\244ndige Kontrolle \303\274ber das Audio-Ger\303\244"
    "t zu \303\274bernehmen. Wenn deaktiviert, wird der gemeinsame Modus verwendet.",
@@ -7266,8 +7311,6 @@ static const struct
    "kein Inhalt geladen ist.",
    "Durch diese Optionen bl\303\244ttern, um die horizontalen Einstellungen zur \303\204nderung der "
    "Bildgr\303\266\303\237e anzupassen.",
-   "Nur f\303\274r CRT-Bildschirme. Versucht die exakte Core-/Spielaufl\303\266sung und Bildfrequenz"
-   " zu verwenden.",
    "Zwischen nativer und ultraweiter Superaufl\303\266sung umschalten.",
    "Eine in der Konfigurationsdatei definierte Bildwiederholfrequenz verwenden.",
    "Diese Optionen durchwechseln, falls das Bild nicht richtig auf dem Display zentriert ist.",
@@ -7439,6 +7482,9 @@ static const struct
    "Hotkeys sind an Core-Port 1 gebunden, auch wenn Core-Port 1 einem anderen Benutzer zugewiesen wu"
    "rde. Hinweis: Tastatur-Hotkeys funktionieren nicht, wenn Core-Port 1 einem Benutzer > 1 zugewies"
    "en wurde (Tastatureingaben stammen von Benutzer 1).",
+   "Controller-Eingaben akzeptieren, auch wenn RetroArch nicht das aktive Fenster ist. Wenn deaktivi"
+   "ert, werden Controller ignoriert, solange sie nicht im Fokus sind: Men\303\274, Tastenkombinatio"
+   "nen und der laufende Inhalt reagieren nicht darauf.",
    "Maximale Benutzeranzahl, die von RetroArch unterst\303\274tzt wird. (Neustart erforderlich)",
    "Controller-Tastenkombination, mit der das Men\303\274 aufgerufen wird.",
    "Men\303\274-Steuerungseinstellungen \303\244ndern.",
@@ -7504,8 +7550,16 @@ static const struct
    "Fertigt ein Foto des aktuellen Inhalts an.",
    "H\303\244lt den aktuell ausgew\303\244hlten Shader an/aus, solange die Taste gedr\303\274ckt wir"
    "d.",
-   "L\303\244dt und wendet die n\303\244chste Shader-Preset-Datei im 'Video-Shader'-Verzeichnis an.",
-   "L\303\244dt und wendet die vorherige Shader-Preset-Datei im 'Video-Shader'-Verzeichnis an.",
+   "L\303\244dt und wendet die n\303\244chste Shader-Voreinstellung aus dem Ordner der aktuellen Vor"
+   "einstellung an. Wechselt nach der letzten Voreinstellung zum n\303\244chsten Ordner auf derselbe"
+   "n Ebene. Wenn die Option \342\200\236Zuletzt verwendetes Shader-Verzeichnis merken\342\200\234 d"
+   "eaktiviert ist, werden stattdessen die Voreinstellungen im Stammverzeichnis des Ordners \342\200"
+   "\236Video Shaders\342\200\234 durchgewechselt, sofern dort welche vorhanden sind.",
+   "L\303\244dt und wendet die vorherige Shader-Voreinstellung aus dem Ordner der aktuellen Voreinst"
+   "ellung an. Wechselt vor der ersten Voreinstellung zum vorherigen Ordner auf derselben Ebene. Wen"
+   "n die Option \342\200\236Zuletzt verwendetes Shader-Verzeichnis merken\342\200\234 deaktiviert i"
+   "st, werden stattdessen die Voreinstellungen im Stammverzeichnis des Ordners \342\200\236Video Sh"
+   "aders\342\200\234 durchgewechselt, sofern dort welche vorhanden sind.",
    "Schaltet den aktuell ausgew\303\244hlten Shader ein/aus.",
    "Aktiviert Zeitlupe, solange gedr\303\274ckt. Inhalte laufen mit normaler Geschwindigkeit, wenn T"
    "aste losgelassen wird.",
@@ -7850,6 +7904,11 @@ static const struct
    "Spielt die Audiospur von animierten WebM-Thumbnails ab, w\303\244hrend sie angezeigt werden. Vor"
    "bis- und Opus-Audio werden unterst\303\274tzt. Das Audio l\303\244uft mit der Animation in Schle"
    "ife und stoppt beim Schlie\303\237en der Miniaturansicht.",
+   "Die Anzahl der Threads, die jedes Einzelbild eines animierten WebM- oder MP4-Miniaturbilds in Pi"
+   "xel umwandeln. Bei nur einem Thread erfolgt die gesamte Umwandlung im Dekodierungs-Thread. Bei e"
+   "iner h\303\266heren Anzahl wird sie auf die Kerne verteilt, was bei Rechnern mit freien Kernen d"
+   "ie Darstellung gro\303\237er Vorschaubilder erleichtert, bei Rechnern ohne freie Kerne jedoch zu"
+   " Lasten der aktiven Kerne geht.",
    "Skaliert automatisch Vorschaubilder mit einer Breite/H\303\266he, die kleiner als der angegebene"
    " Wert ist. Verbessert die Bildqualit\303\244t. Bringt moderate Leistungseinbu\303\237en.",
    "Eine fl\303\274ssige Bildlaufanimation verwenden, wenn langer Men\303\274text angezeigt wird. Ha"
@@ -8473,6 +8532,7 @@ static const struct
 #endif
    "Core ohne Inhalt starten.",
    "Den aktuell gew\303\244hlten Speicherplatz \303\244ndern.",
+   "Die Statistiken nicht anzeigen, w\303\244hrend das Men\303\274 ge\303\266ffnet ist.",
    "Technische Statistiken auf dem Bildschirm anzeigen.",
    "stdin Befehlsschnittstelle.",
 #ifdef HAVE_MIST
@@ -8776,8 +8836,10 @@ static const struct
    " speichern.",
    "Eine Shader-Voreinstellung speichern, die nur die von Dir vorgenommenen Parameter\303\244nderung"
    "en und einen Link zur urspr\303\274nglichen Voreinstellung enth\303\244lt.",
-   "Dateibrowser beim Laden von Shader-Voreinstellungen im zuletzt verwendeten Verzeichnis \303\266f"
-   "fnen.",
+   "Den Dateibrowser beim Laden von Shader-Voreinstellungen und -Durchl\303\244ufe im zuletzt verwen"
+   "deten Verzeichnis \303\266ffnen. Die Tastenkombinationen N\303\244chster/Vorheriger Shader start"
+   "en von der aktuellen Voreinstellung aus weiter, anstatt innerhalb des Stammverzeichnisses \342"
+   "\200\236Video-Shaders\342\200\234 durchzuwechseln.",
    "WARNUNG: Schnelles Flackern kann auf manchen Bildschirmen zu einem Nachleuchten des Bildes f\303"
    "\274hren. Verwendung auf eigene Gefahr // Simuliert eine einfache rollende Scanline \303\274ber "
    "mehrere Unterbilder, indem der Bildschirm vertikal aufgeteilt wird und jeder Teil des Bildschirm"
@@ -9476,7 +9538,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_de_blob_check[
-      (sizeof(msg_hash_de_blob) == (206391u
+      (sizeof(msg_hash_de_blob) == (209967u
 #ifdef ANDROID
        + 358u
 #endif
@@ -10156,6 +10218,7 @@ static const uint32_t msg_hash_de_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_DRIVER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_DSP_PLUGIN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_DSP_PLUGIN_REMOVE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_FASTFORWARD_CALLBACK,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_FASTFORWARD_MUTE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_FASTFORWARD_SPEEDUP,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_FASTPATH_S16,
@@ -10174,6 +10237,7 @@ static const uint32_t msg_hash_de_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_OUTPUT_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_RATE_CONTROL_DELTA,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_RESAMPLER_DRIVER,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_RESAMPLER_HQ_OVERSAMPLING,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_RESAMPLER_QUALITY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_RESPECT_SILENT_MODE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_REWIND_MUTE,
@@ -10186,6 +10250,8 @@ static const uint32_t msg_hash_de_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_SYNC,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_SYNCHRONIZATION_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_THREAD_PRIORITY,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_TIME_STRETCH,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_TIME_STRETCH_LOWPASS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_VOLUME,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_WASAPI_EXCLUSIVE_MODE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_WASAPI_FLOAT_FORMAT,
@@ -10725,6 +10791,7 @@ static const uint32_t msg_hash_de_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_ICADE_ENABLE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_JOYPAD_A,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_JOYPAD_B,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_JOYPAD_BACKGROUND,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_JOYPAD_DOWN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_JOYPAD_L,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_JOYPAD_L2,
@@ -11108,6 +11175,7 @@ static const uint32_t msg_hash_de_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_STARTUP_PAGE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_THUMBNAIL_BACKGROUND_ENABLE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_THUMBNAIL_PREVIEW_AUDIO,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_THUMBNAIL_PREVIEW_THREADS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_THUMBNAIL_UPSCALE_THRESHOLD,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_TICKER_SMOOTH,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_TICKER_SPEED,
@@ -11875,6 +11943,7 @@ static const uint32_t msg_hash_de_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_START_NET_RETROPAD,
    (uint32_t)MENU_ENUM_LABEL_VALUE_START_VIDEO_PROCESSOR,
    (uint32_t)MENU_ENUM_LABEL_VALUE_STATE_SLOT,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_STATISTICS_HIDE_IN_MENU,
    (uint32_t)MENU_ENUM_LABEL_VALUE_STATISTICS_SHOW,
    (uint32_t)MENU_ENUM_LABEL_VALUE_STDIN_CMD_ENABLE,
 #ifdef HAVE_MIST
@@ -12336,6 +12405,7 @@ static const uint32_t msg_hash_de_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_DSP_PLUGIN_REMOVE,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_ENABLE,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_ENABLE_MENU,
+   (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_FASTFORWARD_CALLBACK,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_FASTFORWARD_MUTE,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_FASTFORWARD_SPEEDUP,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_FASTPATH_S16,
@@ -12354,6 +12424,7 @@ static const uint32_t msg_hash_de_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_OUTPUT_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_RATE_CONTROL_DELTA,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_RESAMPLER_DRIVER,
+   (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_RESAMPLER_HQ_OVERSAMPLING,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_RESAMPLER_QUALITY,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_RESPECT_SILENT_MODE,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_REWIND_MUTE,
@@ -12363,6 +12434,8 @@ static const uint32_t msg_hash_de_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_SYNCHRONIZATION_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_THREADED_PIPELINE,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_THREAD_PRIORITY,
+   (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_TIME_STRETCH,
+   (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_TIME_STRETCH_LOWPASS,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_VOLUME,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_WASAPI_EXCLUSIVE_MODE,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_WASAPI_FLOAT_FORMAT,
@@ -12537,7 +12610,6 @@ static const uint32_t msg_hash_de_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCHRES_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_HIRES_MENU,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_PORCH_ADJUST,
-   (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_SUPER,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_USE_CUSTOM_REFRESH_RATE,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_VERTICAL_ADJUST,
@@ -12654,6 +12726,7 @@ static const uint32_t msg_hash_de_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_HOTKEY_BLOCK_DELAY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_HOTKEY_DEVICE_MERGE,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_HOTKEY_FOLLOWS_PLAYER1,
+   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_JOYPAD_BACKGROUND,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_MAX_USERS,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_MENU_ENUM_TOGGLE_GAMEPAD_COMBO,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_MENU_SETTINGS,
@@ -12926,6 +12999,7 @@ static const uint32_t msg_hash_de_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_TEXTURE_MIPMAPPING,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_THUMBNAIL_BACKGROUND_ENABLE,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_THUMBNAIL_PREVIEW_AUDIO,
+   (uint32_t)MENU_ENUM_SUBLABEL_MENU_THUMBNAIL_PREVIEW_THREADS,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_THUMBNAIL_UPSCALE_THRESHOLD,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_TICKER_SMOOTH,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_TICKER_SPEED,
@@ -13334,6 +13408,7 @@ static const uint32_t msg_hash_de_ids[] =
 #endif
    (uint32_t)MENU_ENUM_SUBLABEL_START_CORE,
    (uint32_t)MENU_ENUM_SUBLABEL_STATE_SLOT,
+   (uint32_t)MENU_ENUM_SUBLABEL_STATISTICS_HIDE_IN_MENU,
    (uint32_t)MENU_ENUM_SUBLABEL_STATISTICS_SHOW,
    (uint32_t)MENU_ENUM_SUBLABEL_STDIN_CMD_ENABLE,
 #ifdef HAVE_MIST

@@ -2559,7 +2559,6 @@ static const struct
    char s_79b8ce4a[92];
    char s_a1a8257e[104];
    char s_282f7955[80];
-   char s_d5231783[130];
    char s_a68d6d11[66];
    char s_74022c02[100];
    char s_8abad013[83];
@@ -2703,8 +2702,6 @@ static const struct
    char s_d9153542[60];
    char s_8e48ec69[47];
    char s_cd43c108[78];
-   char s_cd46e260[107];
-   char s_cd482ffe[104];
    char s_49336383[38];
    char s_e92351d4[97];
    char s_8e22cdce[53];
@@ -3479,7 +3476,6 @@ static const struct
    char s_261210b3[91];
    char s_3a4b246c[135];
    char s_2ceab671[129];
-   char s_977f8e82[114];
    char s_3c679f0a[304];
    char s_5b059407[152];
    char s_36033606[160];
@@ -7200,9 +7196,6 @@ static const struct
    "\241lat\303\241hoz, amikor nincs tartalom bet\303\266ltve.",
    "A k\303\274l\303\266nf\303\251le be\303\241ll\303\255t\303\241sok k\303\266zt v\303\241ltva v"
    "\303\241ltozik a v\303\255zszintes k\303\251pm\303\251ret.",
-   "Csak kat\303\263dsug\303\241rcs\303\266ves kijelz\305\221kh\303\266z. A mag/j\303\241t\303\251k "
-   "pontos felbont\303\241s\303\241t \303\251s friss\303\255t\303\251si gyakoris\303\241g\303\241t p"
-   "r\303\263b\303\241lja alkalmazni.",
    "V\303\241lt\303\241s az eredeti \303\251s az ultrasz\303\251les szuperfelbont\303\241sok k\303"
    "\266zt.",
    "Ha sz\303\274ks\303\251ges, haszn\303\241ljon a konfigur\303\241ci\303\263s f\303\241jlban megad"
@@ -7456,10 +7449,6 @@ static const struct
    "K\303\251sz\303\255t egy k\303\251pet az aktu\303\241lis tartalomr\303\263l.",
    "Az \303\251ppen kiv\303\241lasztott shader ki/be kapcsol\303\241sa, am\303\255g a gomb le van ny"
    "omva.",
-   "A \"Videoshaderek\" k\303\266nyvt\303\241r gy\303\266ker\303\251b\305\221l a k\303\266vetkez\305"
-   "\221 shader preset f\303\241jl bet\303\266lt\303\251se \303\251s alkalmaz\303\241sa.",
-   "A \"Videoshaderek\" k\303\266nyvt\303\241r gy\303\266ker\303\251b\305\221l az el\305\221z\305"
-   "\221 shader preset f\303\241jl bet\303\266lt\303\251se \303\251s alkalmaz\303\241sa.",
    "Az aktu\303\241lis shadert be/ki kapcsolja.",
    "Am\303\255g a gomb le van nyomva, a lass\303\255t\303\241s akt\303\255v. Felengedve a tartalom n"
    "orm\303\241l sebess\303\251ggel fut.",
@@ -8958,8 +8947,6 @@ static const struct
    "\241ll\303\255t\303\241s.",
    "Olyan shader preset ment\303\251se, amely hivatkozik az eredeti bet\303\266lt\303\266tt shaderre"
    " \303\251s csak a param\303\251ter v\303\241ltoz\303\241sokat tartalmazza.",
-   "Shader presetek \303\251s feldolgoz\303\263k bet\303\266lt\303\251sekor a F\303\241jlb\303\266ng"
-   "\303\251sz\305\221 a legut\303\263bb haszn\303\241lt k\303\266nyvt\303\241rat nyitja meg.",
    "FIGYELEM: a gyors vill\303\263dz\303\241s bizonyos kijelz\305\221k\303\266n k\303\251pvisszatart"
    "\303\241st okozhat. Csak saj\303\241t felel\305\221ss\303\251gre. // Egyszer\305\261 g\303\266rd"
    "\303\274l\305\221 elektronsug\303\241r szimul\303\241ci\303\263 t\303\266bb alk\303\251pkock\303"
@@ -9724,7 +9711,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_hu_blob_check[
-      (sizeof(msg_hash_hu_blob) == (188883u
+      (sizeof(msg_hash_hu_blob) == (188428u
 #ifdef ANDROID
        + 316u
 #endif
@@ -12670,7 +12657,6 @@ static const uint32_t msg_hash_hu_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCHRES_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_HIRES_MENU,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_PORCH_ADJUST,
-   (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_SUPER,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_USE_CUSTOM_REFRESH_RATE,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_VERTICAL_ADJUST,
@@ -12814,8 +12800,6 @@ static const uint32_t msg_hash_hu_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SAVE_STATE_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SCREENSHOT,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_HOLD,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_NEXT,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_PREV,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_TOGGLE,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_HOLD_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_KEY,
@@ -13590,7 +13574,6 @@ static const uint32_t msg_hash_hu_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_GLOBAL,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_PARENT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_REFERENCE,
-   (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_REMEMBER_LAST_DIR,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_SUBFRAMES,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHARED_CONTEXT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SMOOTH,

@@ -207,6 +207,7 @@ typedef struct gl3
    unsigned out_vp_width;
    unsigned out_vp_height;
    unsigned rotation;
+   unsigned rotation_raw;
    unsigned textures_index;
    unsigned scratch_vbo_index;
    unsigned fence_count;
@@ -247,7 +248,7 @@ typedef struct gl3
    math_matrix_4x4 mvp_no_rot;
    math_matrix_4x4 mvp_no_rot_yflip;
 
-   uint16_t flags;
+   uint32_t flags;
 
    bool pbo_readback_valid[GL_CORE_NUM_PBOS];
    bool menu_texture_rgb32;
@@ -538,13 +539,30 @@ static bool gl3_parse_version(const char *version,
  *
  * Returns: true if glShaderBinary/glSpecializeShader can consume SPIR-V.
  */
+#if !defined(HAVE_OPENGLES3) && !defined(HAVE_OPENGLES)
+/* The user toggle, latched at init and at every set_shader - both
+ * blocking wrapper commands, so the read cannot race - which is
+ * exactly the "takes effect on the next preset load" promise the
+ * old per-call settings read made, minus the per-call settings read
+ * from the video thread's lazy pass builds. */
+static bool gl3_direct_spirv_enabled;
+
+void gl3_spirv_refresh_direct_toggle(void)
+{
+   settings_t *settings    = config_get_ptr();
+   gl3_direct_spirv_enabled =
+         settings && settings->bools.video_gl_direct_spirv;
+}
+#else
+void gl3_spirv_refresh_direct_toggle(void) { }
+#endif
+
 bool gl3_spirv_binary_supported(void)
 {
 #if defined(HAVE_OPENGLES3) || defined(HAVE_OPENGLES)
    return false;
 #else
    static int supported = -1;
-   settings_t *settings = config_get_ptr();
    GLint num_formats    = 0;
    GLint num_extensions = 0;
    GLint i;
@@ -552,9 +570,7 @@ bool gl3_spirv_binary_supported(void)
    unsigned minor       = 0;
    bool have_extension  = false;
 
-   /* Checked on every call rather than latched with the capability, so
-    * toggling the menu entry takes effect on the next preset load. */
-   if (!settings || !settings->bools.video_gl_direct_spirv)
+   if (!gl3_direct_spirv_enabled)
       return false;
 
    if (supported >= 0)
@@ -1780,8 +1796,9 @@ static void gl3_fence_iterate(gl3_t *gl, unsigned hard_sync_frames)
 #ifdef HAVE_OVERLAY
 static void gl3_free_overlay(gl3_t *gl)
 {
-   if (gl->overlay_tex)
+   if (gl->overlay_tex && !(gl->flags & GL3_FLAG_OVERLAY_BORROWED))
       glDeleteTextures(gl->overlays, gl->overlay_tex);
+   gl->flags &= ~GL3_FLAG_OVERLAY_BORROWED;
 
    /* The three coordinate arrays are views into the overlay_tex block. */
    free(gl->overlay_tex);
@@ -1813,10 +1830,10 @@ static void gl3_overlay_vertex_geom(void *data,
    GLfloat *vertex = NULL;
    gl3_t       *gl = (gl3_t*)data;
 
-   if (!gl)
+   if (!gl || !gl->overlay_vertex_coord)
       return;
 
-   if (image > gl->overlays)
+   if (image >= gl->overlays)
       return;
 
    vertex          = (GLfloat*)&gl->overlay_vertex_coord[image * 8];
@@ -1843,7 +1860,10 @@ static void gl3_overlay_tex_geom(void *data,
    GLfloat *tex = NULL;
    gl3_t *gl    = (gl3_t*)data;
 
-   if (!gl)
+   if (!gl || !gl->overlay_tex_coord)
+      return;
+
+   if (image >= gl->overlays)
       return;
 
    tex          = (GLfloat*)&gl->overlay_tex_coord[image * 8];
@@ -1862,6 +1882,9 @@ static void gl3_render_overlay(gl3_t *gl,
       unsigned width, unsigned height)
 {
    size_t i;
+
+   if (!gl->overlay_tex || !gl->overlays)
+      return;
 
    glEnable(GL_BLEND);
    glDisable(GL_CULL_FACE);
@@ -1898,6 +1921,10 @@ static void gl3_render_overlay(gl3_t *gl,
 
    for (i = 0; i < gl->overlays; i++)
    {
+      /* Name 0 is black only on a core context; a GLES driver may
+       * sample whatever the unit last held. */
+      if (!gl->overlay_tex[i])
+         continue;
       glActiveTexture(GL_TEXTURE1);
       glBindTexture(GL_TEXTURE_2D, gl->overlay_tex[i]);
       glDrawArrays(GL_TRIANGLE_STRIP, (GLint)(4 * i), 4);
@@ -3258,6 +3285,20 @@ static void *gl3_init(const video_info_t *video,
    if (!gl || !ctx_driver)
       goto error;
 
+   /* Latched here, inside the wrapper's blocking CMD_INIT (the main
+    * thread is parked in send-and-wait, so the settings read is
+    * race-free), for every later gl3_core_context_is_mains() -
+    * including the frame path, where main runs free. */
+#ifdef HAVE_THREADS
+   if (video_driver_thread_wrapper_active() && video_thread_hw_allowed())
+      gl->flags |= GL3_FLAG_HW_RING_EXPECTED;
+#endif
+
+   /* Seed the raw rotation latch inside the same blocking window;
+    * set_rotation keeps it current from here on. */
+   gl->rotation_raw = retroarch_get_rotation();
+   gl3_spirv_refresh_direct_toggle();
+
    video_context_driver_set(ctx_driver);
 
    gl->ctx_driver = ctx_driver;
@@ -3543,24 +3584,19 @@ static void video_texture_load_gl3(
 }
 
 #ifdef HAVE_OVERLAY
-static bool gl3_overlay_load(void *data,
-      const void *image_data, unsigned num_images)
+/* The texture names and the vertex, texture and colour coordinate
+ * arrays of a page's images come out of one zeroed block, each region
+ * starting on a 64-byte boundary; overlay_tex owns it. Geometry starts
+ * as the whole screen, colour as opaque white. Names come from
+ * @textures when the page shows the pack's textures, else are made
+ * by the upload that follows. */
+static bool gl3_overlay_alloc(gl3_t *gl, unsigned num_images,
+      const uintptr_t *textures)
 {
    size_t o_vertex, o_tex, o_color;
-   size_t i;
-   int j;
-   GLuint id;
-   gl3_t *gl = (gl3_t*)data;
-   const struct texture_image *images =
-      (const struct texture_image*)image_data;
-
-   if (!gl)
-      return false;
+   unsigned i, j;
 
    gl3_free_overlay(gl);
-   /* The texture names and the vertex, texture and colour coordinate
-    * arrays of all overlay images come out of one zeroed block, each
-    * region starting on a 64-byte boundary; overlay_tex owns it. */
    o_vertex = ((num_images * sizeof(GLuint)) + 63) & ~(size_t)63;
    o_tex    = o_vertex + ((2 * 4 * num_images * sizeof(GLfloat) + 63) & ~(size_t)63);
    o_color  = o_tex    + ((2 * 4 * num_images * sizeof(GLfloat) + 63) & ~(size_t)63);
@@ -3575,22 +3611,53 @@ static bool gl3_overlay_load(void *data,
    gl->overlay_color_coord  = (GLfloat*)((uint8_t*)gl->overlay_tex + o_color);
 
    gl->overlays = num_images;
-   glGenTextures(num_images, gl->overlay_tex);
+   if (textures)
+   {
+      for (i = 0; i < num_images; i++)
+         gl->overlay_tex[i] = (GLuint)textures[i];
+      gl->flags |= GL3_FLAG_OVERLAY_BORROWED;
+   }
+
+   for (i = 0; i < num_images; i++)
+   {
+      gl3_overlay_tex_geom   (gl, i, 0, 0, 1, 1);
+      gl3_overlay_vertex_geom(gl, i, 0, 0, 1, 1);
+      for (j = 0; j < 16; j++)
+         gl->overlay_color_coord[16 * i + j] = 1.0f;
+   }
+   return true;
+}
+
+static bool gl3_overlay_load(void *data,
+      const void *image_data, unsigned num_images)
+{
+   unsigned i;
+   GLuint id;
+   gl3_t *gl = (gl3_t*)data;
+   const struct texture_image *images =
+      (const struct texture_image*)image_data;
+
+   if (!gl || !gl3_overlay_alloc(gl, num_images, NULL))
+      return false;
 
    for (i = 0; i < num_images; i++)
    {
       video_texture_load_gl3(&images[i], TEXTURE_FILTER_LINEAR, &id);
       gl->overlay_tex[i] = id;
-
-      /* Default. Stretch to whole screen. */
-      gl3_overlay_tex_geom   (gl, (unsigned)i, 0, 0, 1, 1);
-      gl3_overlay_vertex_geom(gl, (unsigned)i, 0, 0, 1, 1);
-
-      for (j = 0; j < 16; j++)
-         gl->overlay_color_coord[16 * i + j] = 1.0f;
    }
-
    return true;
+}
+
+/* A page of the pack's textures: no upload, no GL call but the
+ * geometry setup. The names are gl3_load_texture's, valid on this
+ * context. */
+static bool gl3_overlay_load_textures(void *data,
+      const uintptr_t *textures, unsigned num_textures)
+{
+   gl3_t *gl = (gl3_t*)data;
+   if (!gl)
+      return false;
+   return gl3_overlay_alloc(gl, num_textures, textures);
 }
 
 static void gl3_overlay_enable(void *data, bool state)
@@ -3625,7 +3692,9 @@ static void gl3_overlay_set_alpha(void *data, unsigned image, float mod)
 {
    GLfloat *color = NULL;
    gl3_t *gl = (gl3_t*)data;
-   if (!gl)
+   /* As the geometry setters: no page loaded is a NULL array, and an
+    * index off the end of the page is the neighbouring block. */
+   if (!gl || !gl->overlay_color_coord || image >= gl->overlays)
       return;
 
    color          = (GLfloat*)&gl->overlay_color_coord[image * 16];
@@ -3639,6 +3708,7 @@ static void gl3_overlay_set_alpha(void *data, unsigned image, float mod)
 static const video_overlay_interface_t gl3_overlay_interface = {
    gl3_overlay_enable,
    gl3_overlay_load,
+   gl3_overlay_load_textures,
    gl3_overlay_tex_geom,
    gl3_overlay_vertex_geom,
    gl3_overlay_full_screen,
@@ -3893,6 +3963,10 @@ static bool gl3_set_shader(void *data,
    if (!gl)
       return false;
 
+   /* Blocking window: refresh the direct-SPIR-V toggle latch, the
+    * "next preset load" moment its semantics promise. */
+   gl3_spirv_refresh_direct_toggle();
+
    if (gl->flags & GL3_FLAG_USE_SHARED_CONTEXT)
       gl->ctx_driver->bind_hw_render(gl->ctx_data, false);
 
@@ -3939,6 +4013,11 @@ static void gl3_set_rotation(void *data, unsigned rotation)
    if (!gl)
       return;
 
+   /* Raw 0-3 value alongside the transformed degrees: the frame
+    * path feeds it to the filter chain, and reading it here -
+    * written only inside blocking wrapper commands - replaces a
+    * per-frame retroarch_get_rotation() from the video thread. */
+   gl->rotation_raw = rotation;
    if (video_driver_is_hw_context() && (gl->flags & GL3_FLAG_HW_RENDER_BOTTOM_LEFT))
       gl->rotation = 90 * rotation;
    else
@@ -4648,7 +4727,6 @@ static void gl3_renderchain_render(
  * linear-light compositing applies. */
 static void gl3_encode_pq_to_sdr(gl3_t *gl, unsigned width, unsigned height)
 {
-   settings_t *settings = config_get_ptr();
    float ubo_data[20];
    static const float quad_pos[8] = {
       0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f
@@ -4668,8 +4746,11 @@ static void gl3_encode_pq_to_sdr(gl3_t *gl, unsigned width, unsigned height)
    }
 
    memcpy(ubo_data, gl->mvp_no_rot.data, 16 * sizeof(float));
-   ubo_data[16] = settings
-         ? gl->scrgb.paper_white_nits : 200.0f;
+   /* Driver-owned, latched by the HDR poke path: the frame path
+    * (video thread, main running free) reads no live settings. The
+    * settings null-check this replaces was a vestige of the fetch
+    * that once supplied the value. */
+   ubo_data[16] = gl->scrgb.paper_white_nits;
    ubo_data[17] = 0.0f;
    ubo_data[18] = 2.0f;   /* PQ -> SDR */
    ubo_data[19] = 0.0f;   /* no separate UI layer on this path */
@@ -5065,14 +5146,16 @@ static bool gl3_frame(void *data, const void *frame,
 
       gl3_filter_chain_set_original_fps(filter_chain, video_driver_get_original_fps());
 
-      gl3_filter_chain_set_rotation(filter_chain, retroarch_get_rotation());
-
-      gl3_filter_chain_set_core_aspect(filter_chain, video_driver_get_core_aspect());
-
-      /* OriginalAspectRotated: return 1/aspect for 90 and 270 rotated content */
       {
-         uint32_t rot          = retroarch_get_rotation();
-         float core_aspect_rot = video_driver_get_core_aspect();
+         uint32_t rot          = gl->rotation_raw;
+         float core_aspect     = video_driver_get_core_aspect();
+         float core_aspect_rot = core_aspect;
+
+         gl3_filter_chain_set_rotation(filter_chain, rot);
+
+         gl3_filter_chain_set_core_aspect(filter_chain, core_aspect);
+
+         /* OriginalAspectRotated: return 1/aspect for 90 and 270 rotated content */
          if (rot == 1 || rot == 3)
             core_aspect_rot    = 1 / core_aspect_rot;
          gl3_filter_chain_set_core_aspect_rot(filter_chain, core_aspect_rot);
@@ -5519,6 +5602,7 @@ typedef struct
 {
    gl3_t     *gl;
    void      *payload;
+   uintptr_t  handle;
 } gl3_texture_cmd_t;
 
 static uintptr_t video_texture_load_wrap_gl3_mipmap(void *data)
@@ -5598,6 +5682,58 @@ static uintptr_t gl3_load_texture(void *video_data, void *data,
 
    video_texture_load_gl3((struct texture_image*)data, filter_type, &id);
    return id;
+}
+
+/* Same-size contents into a texture gl3_load_texture made: the
+ * immutable storage stays, glTexSubImage2D rewrites level 0. Mip
+ * levels are not regenerated; streaming textures are loaded with
+ * TEXTURE_FILTER_LINEAR. */
+static void gl3_update_texture_internal(uintptr_t id,
+      const struct texture_image *ti)
+{
+   glBindTexture(GL_TEXTURE_2D, (GLuint)id);
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+   glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ti->width, ti->height,
+         GL_RGBA, GL_UNSIGNED_BYTE, ti->pixels);
+   glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+#ifdef HAVE_THREADS
+static uintptr_t video_texture_update_wrap_gl3(void *data)
+{
+   gl3_texture_cmd_t *cmd = (gl3_texture_cmd_t*)data;
+   gl3_t             *gl  = cmd->gl;
+
+   if (gl && gl->ctx_driver->make_current)
+      gl->ctx_driver->make_current(false);
+
+   gl3_update_texture_internal(cmd->handle,
+         (const struct texture_image*)cmd->payload);
+   return 1;
+}
+#endif
+
+static bool gl3_update_texture(void *video_data, uintptr_t id,
+      const struct texture_image *ti, bool threaded)
+{
+   if (!id || !ti || !ti->pixels)
+      return false;
+
+#ifdef HAVE_THREADS
+   if (threaded)
+   {
+      gl3_texture_cmd_t cmd;
+      cmd.gl      = (gl3_t*)video_data;
+      cmd.payload = (void*)ti;
+      cmd.handle  = id;
+      video_thread_texture_handle(&cmd, video_texture_update_wrap_gl3);
+      return true;
+   }
+#endif
+
+   gl3_update_texture_internal(id, ti);
+   return true;
 }
 
 static void gl3_unload_texture(void *data, bool threaded,
@@ -5754,7 +5890,13 @@ static bool gl3_hw_ring_expected(void)
  * a core with no current context, and no GL function resolved. */
 static bool gl3_core_context_is_mains(gl3_t *gl)
 {
-   return (gl->flags & GL3_FLAG_HW_RING) || gl3_hw_ring_expected();
+   /* Both bits are set on the video thread inside blocking command
+    * handlers (init, ring bring-up) while the main thread is parked
+    * in the wrapper's send-and-wait, and read here from the frame
+    * path. The live-settings consultation this replaces read
+    * settings->arrays.video_driver every frame from the video
+    * thread with the main thread running free. */
+   return (gl->flags & (GL3_FLAG_HW_RING | GL3_FLAG_HW_RING_EXPECTED)) != 0;
 }
 
 
@@ -6091,7 +6233,8 @@ static const video_poke_interface_t gl3_poke_interface = {
    gl3_hw_ring_present_slot,
    gl3_hw_ring_context_new,
    gl3_hw_ring_context_free,
-   gl3_hw_ring_framebuffer
+   gl3_hw_ring_framebuffer,
+   gl3_update_texture
 };
 
 static void gl3_get_poke_interface(void *data,

@@ -2578,7 +2578,6 @@ static const struct
    char s_79b8ce4a[72];
    char s_a1a8257e[108];
    char s_282f7955[99];
-   char s_d5231783[100];
    char s_a68d6d11[56];
    char s_74022c02[81];
    char s_8abad013[90];
@@ -2722,8 +2721,6 @@ static const struct
    char s_d9153542[52];
    char s_8e48ec69[38];
    char s_cd43c108[91];
-   char s_cd46e260[112];
-   char s_cd482ffe[110];
    char s_49336383[56];
    char s_e92351d4[109];
    char s_8e22cdce[52];
@@ -3493,7 +3490,6 @@ static const struct
    char s_261210b3[89];
    char s_3a4b246c[121];
    char s_2ceab671[141];
-   char s_977f8e82[104];
    char s_3c679f0a[321];
    char s_5b059407[143];
    char s_36033606[177];
@@ -7003,8 +6999,6 @@ static const struct
    "on se cargou ning\303\272n contido.",
    "Alterna entre estas opci\303\263ns para axustar os par\303\241metros horizontais e cambiar o tam"
    "a\303\261o da imaxe.",
-   "S\303\263 para pantallas CRT. Tenta usar a resoluci\303\263n e tasa de refresco exactas para cad"
-   "a n\303\272cleo/xogo.",
    "Cambia entre super resoluci\303\263ns nativas ou ultraanchas.",
    "Usa unha tasa de refresco especificada no arquivo de configuracion se o precisa.",
    "Vai xirando sobre estas opci\303\263ns se a imaxe non est\303\241 correctamente centrada na pant"
@@ -7216,10 +7210,6 @@ static const struct
    "Captura unha imaxe do contido actual.",
    "Mant\303\251n o sombreado seleccionado activado/desactivado mentres se mante\303\261a a tecla pu"
    "lsada.",
-   "Carga e aplica o seguinte ficheiro predefinido de sombreadores na ra\303\255z do directorio \"So"
-   "mbreadores de v\303\255deo\".",
-   "Carga e aplica o ficheiro predefinido do sombreador anterior na ra\303\255z do directorio \"Somb"
-   "readores de v\303\255deo\".",
    "Activa/desactiva o sombreador seleccionado actualmente.",
    "Permite a c\303\241mara lenta cando se mante\303\261a. O contido exec\303\272tase \303\241 veloc"
    "idade normal cando se solta a tecla.",
@@ -8412,8 +8402,6 @@ static const struct
    " directorio de contido actual.",
    "Garda un predefinido de sombreado que ten unha ligaz\303\263n ao predefinido orixinal cargado e "
    "incl\303\272e s\303\263 os cambios de par\303\241metro que fixeches.",
-   "Abrir o explorador de arquivos no \303\272ltimo directorio usado ao cargar predefinidos e pasos "
-   "de sombreado.",
    "ADVERTENCIA: O destello r\303\241pido pode causar retenci\303\263n de imaxe en algunhas pantalla"
    "s. Usa esta opci\303\263n baixo a t\303\272a responsabilidade // Simula unha li\303\261a de expl"
    "oraci\303\263n b\303\241sica \303\263 longo de varios subfotogramas dividindo a pantalla vertica"
@@ -9097,7 +9085,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_gl_blob_check[
-      (sizeof(msg_hash_gl_blob) == (193783u
+      (sizeof(msg_hash_gl_blob) == (193357u
 #ifdef ANDROID
        + 365u
 #endif
@@ -12052,7 +12040,6 @@ static const uint32_t msg_hash_gl_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCHRES_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_HIRES_MENU,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_PORCH_ADJUST,
-   (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_SUPER,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_USE_CUSTOM_REFRESH_RATE,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_VERTICAL_ADJUST,
@@ -12196,8 +12183,6 @@ static const uint32_t msg_hash_gl_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SAVE_STATE_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SCREENSHOT,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_HOLD,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_NEXT,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_PREV,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_TOGGLE,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_HOLD_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_KEY,
@@ -12967,7 +12952,6 @@ static const uint32_t msg_hash_gl_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_GLOBAL,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_PARENT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_REFERENCE,
-   (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_REMEMBER_LAST_DIR,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_SUBFRAMES,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHARED_CONTEXT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SMOOTH,

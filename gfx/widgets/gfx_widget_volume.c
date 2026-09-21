@@ -22,6 +22,7 @@
 #include "../gfx_animation.h"
 #include "../gfx_display.h"
 #include "../../tasks/tasks_internal.h"
+#include "../gfx_surface.h"
 
 /* Constants */
 #define VOLUME_DURATION 3000
@@ -194,8 +195,7 @@ static void gfx_widget_volume_frame(void* data, void *user_data)
       {
          gfx_display_set_alpha(pure_white, state->text_alpha);
 
-         if (dispctx && dispctx->blend_begin)
-            dispctx->blend_begin(userdata);
+         gfx_display_blend_begin(dispctx, userdata);
          gfx_widgets_draw_icon(
                userdata,
                p_disp,
@@ -210,8 +210,7 @@ static void gfx_widget_volume_frame(void* data, void *user_data)
                0.0f, /* sine(rad)  = sine(0) = 0.0f */
                pure_white
                );
-         if (dispctx && dispctx->blend_end)
-            dispctx->blend_end(userdata);
+         gfx_display_blend_end(dispctx, userdata);
       }
 
       if (state->mute)
@@ -362,7 +361,7 @@ static void gfx_widget_volume_context_reset(bool is_threaded,
       char* widgets_png_path)
 {
    size_t i;
-   bool supports_rgba                    = (video_driver_get_disp_flags() & VIDEO_FLAG_USE_RGBA);
+   bool supports_rgba                    = gfx_surface_wants_rgba();
    gfx_widget_volume_state_t *state      = &p_w_volume_st;
 
    volume_icon_load_gen++;

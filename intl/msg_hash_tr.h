@@ -2482,7 +2482,6 @@ static const struct
    char s_79b8ce4a[86];
    char s_a1a8257e[130];
    char s_282f7955[116];
-   char s_d5231783[114];
    char s_a68d6d11[74];
    char s_74022c02[86];
    char s_8abad013[86];
@@ -2613,8 +2612,6 @@ static const struct
    char s_d9153542[38];
    char s_8e48ec69[48];
    char s_cd43c108[87];
-   char s_cd46e260[114];
-   char s_cd482ffe[111];
    char s_49336383[47];
    char s_e92351d4[109];
    char s_8e22cdce[54];
@@ -3317,7 +3314,6 @@ static const struct
    char s_261210b3[74];
    char s_3a4b246c[112];
    char s_2ceab671[161];
-   char s_977f8e82[118];
    char s_3c679f0a[305];
    char s_5b059407[155];
    char s_36033606[231];
@@ -6898,9 +6894,6 @@ static const struct
    "G\303\266r\303\274nt\303\274 boyutunu de\304\237i\305\237tirmek i\303\247in yatay ayarlar\304"
    "\261 d\303\274zenlemek \303\274zere bu se\303\247enekler aras\304\261nda ge\303\247i\305\237 yap"
    "\304\261n.",
-   "Sadece CRT ekranlar i\303\247in. Tam \303\247ekirdek/oyun \303\247\303\266z\303\274n\303\274rl"
-   "\303\274\304\237\303\274n\303\274 ve yenileme h\304\261z\304\261n\304\261 kullanmaya \303\247al"
-   "\304\261\305\237\304\261r.",
    "Do\304\237al ve ultrageni\305\237 s\303\274per \303\247\303\266z\303\274n\303\274rl\303\274kler "
    "aras\304\261nda ge\303\247i\305\237 yap\304\261n.",
    "Gerekirse, yap\304\261land\304\261rma dosyas\304\261nda belirtilen \303\266zel bir yenileme h"
@@ -7126,10 +7119,6 @@ static const struct
    "Mevcut i\303\247eri\304\237in bir g\303\266r\303\274nt\303\274s\303\274n\303\274 yakalar.",
    "Tu\305\237a bas\304\261l\304\261 tutuldu\304\237u s\303\274rece se\303\247ili olan g\303\266lgel"
    "endiriciyi a\303\247\304\261k/kapal\304\261 tutar.",
-   "'Video G\303\266lgelendirici' dizininin k\303\266k\303\274ndeki sonraki g\303\266lgelendirici ha"
-   "z\304\261r ayar dosyas\304\261n\304\261 y\303\274kler ve uygular.",
-   "\303\226nceki g\303\266lgelendirici \303\266n ayar dosyas\304\261n\304\261 'Video G\303\266lgele"
-   "ndiriciler' dizininin k\303\266k\303\274ne y\303\274kler ve uygular.",
    "Se\303\247ili olan g\303\266lgelendiriciyi a\303\247ar/kapat\304\261r.",
    "Bas\304\261l\304\261 tutuldu\304\237unda a\304\237\304\261r \303\247ekim sa\304\237lar. Anahtar "
    "b\304\261rak\304\261ld\304\261\304\237\304\261nda i\303\247erik normal h\304\261zda \303\247al"
@@ -8451,9 +8440,6 @@ static const struct
    "Y\303\274klenen orijinal \303\266n ayara bir ba\304\237lant\304\261 i\303\247eren ve yaln\304"
    "\261zca yapt\304\261\304\237\304\261n\304\261z parametre de\304\237i\305\237ikliklerini i\303"
    "\247eren bir g\303\266lgelendirici \303\266n ayar\304\261n\304\261 kaydeder.",
-   "G\303\266lgelendirici \303\266n ayarlar\304\261n\304\261 ve ge\303\247i\305\237lerini y\303\274k"
-   "lerken son kullan\304\261lan dizindeki dosya taray\304\261c\304\261s\304\261n\304\261 a\303\247"
-   "\304\261n.",
    "UYARI: H\304\261zl\304\261 titreme baz\304\261 ekranlarda g\303\266r\303\274nt\303\274n\303\274n"
    " kal\304\261c\304\261 olmas\304\261na neden olabilir. Kullan\304\261m riski size aittir // Ekran"
    "\304\261 dikey olarak b\303\266lerek ve ekran\304\261n her bir b\303\266l\303\274m\303\274n\303"
@@ -9186,7 +9172,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_tr_blob_check[
-      (sizeof(msg_hash_tr_blob) == (170816u
+      (sizeof(msg_hash_tr_blob) == (170359u
 #ifdef ANDROID
        + 340u
 #endif
@@ -12026,7 +12012,6 @@ static const uint32_t msg_hash_tr_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCHRES_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_HIRES_MENU,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_PORCH_ADJUST,
-   (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_SUPER,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_USE_CUSTOM_REFRESH_RATE,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_VERTICAL_ADJUST,
@@ -12157,8 +12142,6 @@ static const uint32_t msg_hash_tr_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SAVE_STATE_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SCREENSHOT,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_HOLD,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_NEXT,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_PREV,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_TOGGLE,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_HOLD_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_KEY,
@@ -12861,7 +12844,6 @@ static const uint32_t msg_hash_tr_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_GLOBAL,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_PARENT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_REFERENCE,
-   (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_REMEMBER_LAST_DIR,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_SUBFRAMES,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHARED_CONTEXT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SMOOTH,

@@ -165,11 +165,12 @@ enum db_state_flags_enum
    DB_STATE_FLAG_HAS_SIZE                 = (1 << 2),
    DB_STATE_FLAG_MATCHED                  = (1 << 3),
    /* Set once the size range for a database has been queried,
-    * whatever the answer was.  The probe used to key off
-    * "min_sizes[i] == 0", which is also what an unqueried slot holds
-    * and what a database whose smallest record is zero-sized
-    * legitimately produces - so such a database was re-queried for
-    * every content file, at two full walks a time. */
+    * whatever the answer was.  A separate flag, because
+    * "min_sizes[i] == 0" cannot carry it: zero is what an unqueried
+    * slot holds AND what a database whose smallest record is
+    * zero-sized legitimately produces, and keying the probe off it
+    * re-queries such a database for every content file, at two full
+    * walks a time. */
    DB_STATE_FLAG_SIZE_CHECKED             = (1 << 4)
 };
 
@@ -233,10 +234,10 @@ typedef struct database_state_handle
    uint64_t archive_size;
    char archive_name[512]; /* TODO/FIXME - check size */
    char serial[4096];      /* TODO/FIXME - check size */
-   /* One entry per database in 'list'.  These used to be
-    * [MAX_DATABASE_COUNT] arrays indexed by list_index, which is
-    * bounded only by list->size - the number of .rdb files in the
-    * database directory.  Nothing clamped it, so a database
+   /* One entry per database in 'list', allocated to list->size:
+    * list_index is bounded only by list->size - the number of .rdb
+    * files in the database directory - so a fixed
+    * [MAX_DATABASE_COUNT] array would need a clamp, and a database
     * directory with more than MAX_DATABASE_COUNT entries wrote past
     * all three arrays, and the shuffle in
     * database_info_list_iterate_found_match() memmove()d past them
@@ -343,10 +344,9 @@ typedef struct manual_scan_handle
    database_state_handle_t state;
    uint8_t flags;
 #endif
-   /* The caller's completion callback, run after the task's own.
-    * task_push_dbscan takes one and used to drop it, so a caller that
-    * wanted to know when a scan finished never found out - see
-    * cb_task_manual_content_scan. */
+   /* The caller's completion callback, run after the task's own -
+    * this is how a task_push_dbscan caller learns the scan finished;
+    * see cb_task_manual_content_scan. */
    retro_task_callback_t user_cb;
 } manual_scan_handle_t;
 
@@ -481,7 +481,7 @@ static enum scan_verdict task_database_iterate_start(retro_task_t *task,
                roundf((float)manual_scan->content_list_index /
                   ((float)manual_scan->content_list->size / 100.0f)));
       RARCH_LOG("[Scanner] %s", msg);
-      if (retroarch_override_setting_is_set(RARCH_OVERRIDE_SETTING_DATABASE_SCAN, NULL))
+      if (manual_scan->task_config->cli_scan_output)
          printf("%s", msg);
    }
 
@@ -505,6 +505,9 @@ static void task_database_cue_prune(struct string_list *list,
 
    while (cue_next_file(fd, name, path, sizeof(path)))
    {
+      /* A sheet naming itself would free the path being scanned. */
+      if (string_is_equal(path, name))
+         continue;
       /* change in filtering: start from 0 */
       for (i = 0; i < list->size; ++i)
       {
@@ -609,10 +612,10 @@ static void remove_disc_indicators(char *title, size_t len)
    size_t prefix_len = 0;
    /* Tape and floppy releases usually do not follow the naming
     * convention, so their prefixes skip the leading space - which
-    * makes them six characters rather than seven.  The old code
-    * skipped a hard-coded seven for all of them, so for "(Tape 1)"
-    * the indicator was taken to start at the ')' and came out empty:
-    * is_valid_disc_indicator() rejected it and no tape or side
+    * makes them six characters rather than seven.  The skip must
+    * match the prefix: a hard-coded seven lands "(Tape 1)" on the
+    * ')' so the indicator comes out empty,
+    * is_valid_disc_indicator() rejects it, and no tape or side
     * indicator was ever stripped.  Carry each prefix's own length. */
    static const struct
    {
@@ -720,12 +723,30 @@ static void task_database_iterate_m3u(
                      sizeof(first_matched_db));
                strlcpy(first_matched_crc, result->db_crc,
                      sizeof(first_matched_crc));
-               strlcpy(collapsed_title, result->entry_label,
-                     sizeof(collapsed_title));
+               {
+                  char disc_name[NAME_MAX_LENGTH];
+                  fill_pathname(disc_name,
+                        path_basename_nocompression(result->entry_path),
+                        "", sizeof(disc_name));
 
-               /* Remove disc indicator from title */
-               remove_disc_indicators(collapsed_title,
-                     sizeof(collapsed_title));
+                  /* A label that is only the disc's own file name
+                   * (no database or DAT title) says nothing the M3U's
+                   * name doesn't - and the user chose the M3U's name,
+                   * which thumbnails and saves already follow. Keep
+                   * it, as before the M3U collapse existed. A real
+                   * title has its disc indicator stripped instead. */
+                  if (string_is_equal(result->entry_label, disc_name))
+                     fill_pathname(collapsed_title,
+                           path_basename_nocompression(m3u_path),
+                           "", sizeof(collapsed_title));
+                  else
+                  {
+                     strlcpy(collapsed_title, result->entry_label,
+                           sizeof(collapsed_title));
+                     remove_disc_indicators(collapsed_title,
+                           sizeof(collapsed_title));
+                  }
+               }
             }
 
 #ifdef DEBUG
@@ -805,6 +826,9 @@ static void gdi_prune(struct string_list *list, const char *name)
 
    while (gdi_next_file(fd, name, path, sizeof(path)))
    {
+      /* A sheet naming itself would free the path being scanned. */
+      if (string_is_equal(path, name))
+         continue;
       /* change in filtering */
       for (i = 0; i < list->size; ++i)
       {
@@ -1012,8 +1036,7 @@ static enum scan_verdict database_info_list_iterate_end_no_match(
    bool archive_added = false;
    /* Reached end of database list,
     * CRC match probably didn't succeed. */
-   if (retroarch_override_setting_is_set(
-       RARCH_OVERRIDE_SETTING_DATABASE_SCAN, NULL))
+   if (_db->task_config->cli_scan_output)
       task_database_scan_console_output(path, NULL, false);
 
    /* If this was a compressed file and no match in the database
@@ -1117,9 +1140,9 @@ static enum scan_verdict database_info_list_iterate_found_match(
     * no database name there is no meaningful playlist filename to
     * build, so treat it like the OOM case and skip this entry.
     *
-    * db_info_entry likewise: the matched entry used to be taken as
-    * &info->list[entry_index] unconditionally, which reads info and
-    * indexes list on nothing but the caller's word.  Every caller
+    * db_info_entry likewise: taking the matched entry as
+    * &info->list[entry_index] unconditionally reads info and indexes
+    * list on nothing but the caller's word.  Every caller
     * does test both - each of the four reaches this function from
     * inside an "info && entry_index < info->count" - so this is the
     * invariant being stated where it is relied on rather than a
@@ -1543,8 +1566,9 @@ static enum scan_verdict task_database_iterate_crc_lookup(
       query[0] = '\0';
 
       /* Answer from this database's crc index when we can.  Building
-       * it costs one walk - about what a single probe used to cost -
-       * and every later content file is then a binary search instead
+       * it costs one walk - about the price of a single unindexed
+       * probe - and every later content file is then a binary search
+       * instead
        * of another walk.  The index is only a faster route to the
        * same records: it reports them in file order with the same
        * fields extracted, so the matching below is unchanged.
@@ -1604,10 +1628,10 @@ static enum scan_verdict task_database_iterate_crc_lookup(
          return database_info_list_iterate_next(db_state);
    }
 
-   /* Same shape as the serial lookup below: entry_index was used to
-    * index the list without checking it against count, so a query
-    * that matched nothing (count == 0, list either empty or NULL)
-    * still had list[0] dereferenced. */
+   /* Same shape as the serial lookup below: entry_index must be
+    * checked against count before indexing the list, or a query that
+    * matched nothing (count == 0, list either empty or NULL) has
+    * list[0] dereferenced anyway. */
    if (db_state->info && db_state->entry_index < db_state->info->count)
    {
       database_info_t *db_info_entry =
@@ -1680,10 +1704,12 @@ static int task_database_iterate_playlist_lutro(
 }
 
 static bool task_database_check_serial_and_crc(
-      database_state_handle_t *db_state)
+      database_state_handle_t *db_state, bool scan_serial_and_crc)
 {
    const char *db_name;
-   if (!config_get_ptr()->bools.scan_serial_and_crc)
+   /* The toggle comes captured from the task's config: this runs on
+    * the threaded task queue's worker. */
+   if (!scan_serial_and_crc)
        return false;
    /* database_info_get_current_name() can return NULL (missing
     * handle/list, or a NULL element). Guard it before it reaches
@@ -1891,7 +1917,8 @@ serial_query_done:
          {
             if (string_is_equal(db_state->serial, db_info_entry->serial))
             {
-               if (task_database_check_serial_and_crc(db_state))
+               if (task_database_check_serial_and_crc(db_state,
+                     _db->task_config->scan_serial_and_crc))
                {
                   if (db_state->crc == 0)
                   {
@@ -2108,8 +2135,8 @@ static bool manual_scan_end_flush_tick(
          /* Check before use: the playlist_set_scan_* calls below are
           * not all NULL-guarded (playlist_set_scan_search_recursively,
           * playlist_set_sort_mode, playlist_qsort, playlist_write_file
-          * and several others dereference unconditionally).  The test
-          * used to sit after all of them. */
+          * and several others dereference unconditionally), so this
+          * test must come before all of them. */
          if (!manual_scan->flush_playlist)
          {
             RARCH_ERR("[Scanner] Failed to open playlist: \"%s\".\n", result->db_name);
@@ -2229,12 +2256,12 @@ static bool manual_scan_end_flush_tick(
 
          RARCH_LOG("[Scanner] Add \"%s / %s\".\n", db_name_noext, result->entry_label);
 
-         if (retroarch_override_setting_is_set(RARCH_OVERRIDE_SETTING_DATABASE_SCAN, NULL))
+         if (manual_scan->task_config->cli_scan_output)
             task_database_scan_console_output(result->entry_label,
                   db_name_noext, true);
       }
       /* Entry already exists - output duplicate indicator for CLI scans */
-      else if (manual_scan->flush_playlist && retroarch_override_setting_is_set(RARCH_OVERRIDE_SETTING_DATABASE_SCAN, NULL))
+      else if (manual_scan->flush_playlist && manual_scan->task_config->cli_scan_output)
          task_database_scan_console_output(result->entry_label,
                db_name_noext, false);
 
@@ -2468,6 +2495,12 @@ static void cb_task_manual_content_scan(
       return;
 #endif
 
+   /* At retrieval, on the main thread, where the companion
+    * belongs: ui_companion_driver_notify_refresh reads companion
+    * state that main-thread code owns, so the handler must not
+    * call it from the worker. */
+   ui_companion_driver_notify_refresh();
+
    if (!(manual_scan = (manual_scan_handle_t*)task->state))
    {
 #if defined(HAVE_MENU)
@@ -2510,9 +2543,9 @@ end:
    /* The caller's callback, if it gave one.  Read before the handle is
     * released below.
     *
-    * This used to sit inside the HAVE_MENU block along with the menu
-    * refresh, so a build without menu support ran the scan and then
-    * dropped the callback: a caller waiting on it waited forever.
+    * Outside the HAVE_MENU block deliberately: inside it, a build
+    * without menu support runs the scan and then drops the callback,
+    * and a caller waiting on it waits forever.
     * The in-tree callers only supply one under HAVE_MENU themselves,
     * which is why nothing noticed, but the parameter is not
     * documented as menu-only and the sample in samples/tasks/database
@@ -2705,7 +2738,7 @@ static bool manual_scan_begin_setup(retro_task_t *task,
          }
 
          RARCH_LOG("[Scanner] %s\"%s\"...\n", msg_hash_to_str(MSG_MANUAL_CONTENT_SCAN_START), manual_scan->content_database_path);
-         if (retroarch_override_setting_is_set(RARCH_OVERRIDE_SETTING_DATABASE_SCAN, NULL))
+         if (manual_scan->task_config->cli_scan_output)
             printf("%s\"%s\"...\n", msg_hash_to_str(MSG_MANUAL_CONTENT_SCAN_START), manual_scan->content_database_path);
       }
    }
@@ -2783,6 +2816,15 @@ static bool manual_scan_begin_dir_list(retro_task_t *task,
       if (  (manual_scan->flags & DB_HANDLE_FLAG_IS_DIRECTORY)
           && !manual_scan->handle)
       {
+         if (  !manual_scan->content_list
+             || manual_scan->content_list->size < 1)
+         {
+            const char *_msg = msg_hash_to_str(MSG_MANUAL_CONTENT_SCAN_INVALID_CONTENT);
+            runloop_msg_queue_push(_msg, strlen(_msg), 1, 100, true, NULL,
+                  MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+            return true;
+         }
+
          /* cue, gdi prioritization in sorting */
          if (!(manual_scan->handle = database_info_dir_init_from_list(
                DATABASE_TYPE_ITERATE, manual_scan->content_list)))
@@ -3290,10 +3332,10 @@ static void task_manual_content_scan_handler(retro_task_t *task)
             manual_scan->status = DATABASE_SCAN_ITERATE_START;
             dbinfo->type   = DATABASE_TYPE_ITERATE;
          }
+         else if (manual_scan->m3u_list->size > 0)
+            manual_scan->status = MANUAL_SCAN_ITERATE_M3U;
          else
-         {
-            manual_scan->status = MANUAL_SCAN_ITERATE_CONTENT;
-         }
+            manual_scan->status = MANUAL_SCAN_END;
          break;
 #endif
       case MANUAL_SCAN_ITERATE_CONTENT:
@@ -3492,9 +3534,8 @@ static void task_manual_content_scan_handler(retro_task_t *task)
             task_free_title(task);
             task_set_title(task, strdup(msg));
             task_set_progress(task, 100);
-            ui_companion_driver_notify_refresh();
             RARCH_LOG("[Scanner] %s\n", msg);
-            if (retroarch_override_setting_is_set(RARCH_OVERRIDE_SETTING_DATABASE_SCAN, NULL))
+            if (manual_scan->task_config->cli_scan_output)
                printf("%s\n", msg);
 
             RARCH_DBG("[Scanner] Scan settings were:\n");

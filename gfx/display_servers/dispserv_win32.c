@@ -45,6 +45,13 @@
 #include <windows.h>
 #include <ntverp.h>
 
+/* objbase.h declares this as an enumerator where it has it at all;
+ * the oldest SDKs this builds against do not, so it is defined only
+ * after that header has been seen. */
+#ifndef COINIT_DISABLE_OLE1DDE
+#define COINIT_DISABLE_OLE1DDE 0x4
+#endif
+
 #ifndef COBJMACROS
 #define COBJMACROS
 #define COBJMACROS_DEFINED
@@ -116,6 +123,10 @@ typedef struct
 {
 #ifdef HAS_TASKBAR_EXT
    ITaskbarList3 *taskbar_list;
+   /* This server's own reference on the apartment the taskbar
+    * interface lives in, so the interface outlives whatever else
+    * initialised COM (see the init below). */
+   bool com_inited;
 #endif
 #ifdef HAVE_MODELINE
    win32_modeline_t ml;
@@ -253,6 +264,18 @@ static void *win32_display_server_init(void)
       return NULL;
 
 #ifdef HAS_TASKBAR_EXT
+   /* A COM interface may only be released while the apartment it was
+    * created in is still initialised, and the frontend's own
+    * CoInitialize is undone before the drivers are torn down: the
+    * taskbar interface was then released through a vtable in a module
+    * that had already unloaded, which is a segfault on the way out
+    * (call *0x10(%rax) - Release - with rax in a gone module). This
+    * reference of our own keeps the apartment alive for exactly as
+    * long as the interface, and is given back after the release
+    * below. CoInitializeEx returns S_FALSE when the apartment is
+    * already initialised, which still takes a reference. */
+   dispserv->com_inited = SUCCEEDED(CoInitializeEx(NULL,
+            COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
 #ifdef __cplusplus
    /* When compiling in C++ mode, GUIDs
       are references instead of pointers */
@@ -305,6 +328,11 @@ static void win32_display_server_destroy(void *data)
    {
       ITaskbarList3_Release(dispserv->taskbar_list);
       dispserv->taskbar_list = NULL;
+   }
+   if (dispserv->com_inited)
+   {
+      CoUninitialize();
+      dispserv->com_inited = false;
    }
 #endif
 
@@ -1487,6 +1515,18 @@ static int win32_display_server_get_edid(void *data, uint8_t *out, size_t max)
 #endif
 }
 
+/* The calling thread's own message queue is where every Win32 input
+ * path begins. With no handles the wait is on the queue alone; with
+ * QS_ALLINPUT and MWMO_INPUTAVAILABLE it returns for any message,
+ * including one already queued, and removes nothing. */
+static bool win32_display_server_idle_wait(void *data, unsigned ms)
+{
+   (void)data;
+   MsgWaitForMultipleObjectsEx(0, NULL, ms, QS_ALLINPUT,
+         MWMO_INPUTAVAILABLE);
+   return true;
+}
+
 const video_display_server_t dispserv_win32 = {
    win32_display_server_init,
    win32_display_server_destroy,
@@ -1540,5 +1580,6 @@ const video_display_server_t dispserv_win32 = {
    NULL, /* modeline_flush */
 #endif
    win32_display_server_get_edid,
+   win32_display_server_idle_wait,
    "win32"
 };

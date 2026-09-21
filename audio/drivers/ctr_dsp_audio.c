@@ -17,12 +17,19 @@
 #include <string.h>
 
 #include <retro_atomic.h>
+#include <features/features_cpu.h>
 #include <malloc.h>
 
 #include "../audio_driver.h"
 #include "../../ctr/ctr_debug.h"
 #include "../../retroarch.h"
 #include "../../verbosity.h"
+
+/* The rate the channel is set to and the rate the frontend is told,
+ * which have to be the one number: the channel interpolates with
+ * NDSP_INTERP_NONE, so anything the frontend resamples to that the
+ * channel is not playing at is error with nothing to correct it. */
+#define CTR_DSP_AUDIO_RATE 32728
 
 typedef struct
 {
@@ -42,6 +49,28 @@ typedef struct
     * that once every four seconds and would miss ninety wraps. */
    uint32_t last_pos;
    retro_atomic_size_t consumed;
+   /* The DSP's clock against the rate the channel is set to, fitted
+    * from the sample position this callback already reads and
+    * svcGetSystemTick(), which counts in the ARM11's domain rather
+    * than the DSP's. Accumulated in the callback, which owns all of
+    * it, and published as one int in ppm.
+    *
+    * cpu_features_get_perf_counter() and not
+    * cpu_features_get_time_usec(): the counter is svcGetSystemTick()
+    * here, the ARM11's own tick; the clock is osGetTime(), which
+    * resolves in milliseconds - a hundred parts per million of
+    * quantisation on a ten second window, against a figure measured
+    * in single parts. SYSCLOCK_ARM11 is the counter's scale, since
+    * features_cpu.h offers no frequency beside it.
+    *
+    * A measurement. Nothing acts on it. */
+   uint64_t clk_pos;
+   uint64_t clk_anchor_pos;
+   uint64_t clk_anchor_tick;
+   int      clk_have_anchor;
+   double   clk_sx, clk_sy, clk_sxx, clk_sxy, clk_n;
+   retro_atomic_int_t clk_ppm;
+   retro_atomic_int_t clk_valid;
    bool nonblock;
    bool playing;
 } ctr_dsp_audio_t;
@@ -50,17 +79,75 @@ typedef struct
 #define CTR_DSP_AUDIO_COUNT_MASK  (CTR_DSP_AUDIO_COUNT - 1u)
 #define CTR_DSP_AUDIO_SIZE        (CTR_DSP_AUDIO_COUNT * sizeof(int16_t) * 2)
 
+/* One (position, tick) pair into the fit. Runs on the DSP callback's
+ * own thread, which owns every field it touches here. */
+static void ctr_dsp_audio_clock_sample(ctr_dsp_audio_t *ctr, uint32_t frames)
+{
+   uint64_t tick = (uint64_t)cpu_features_get_perf_counter();
+   double   x, y, denom;
+
+   ctr->clk_pos += frames;
+
+   /* Taken on the first frame, on a position that went backwards, and
+    * again once the window has run long enough to be worth
+    * restarting. */
+   if (     !ctr->clk_have_anchor
+         || tick <= ctr->clk_anchor_tick
+         || (tick - ctr->clk_anchor_tick) > (uint64_t)SYSCLOCK_ARM11 * 30)
+   {
+      ctr->clk_anchor_pos  = ctr->clk_pos;
+      ctr->clk_anchor_tick = tick;
+      ctr->clk_have_anchor = 1;
+      ctr->clk_sx = ctr->clk_sy = ctr->clk_sxx = ctr->clk_sxy
+                  = ctr->clk_n = 0.0;
+      retro_atomic_store_release_int(&ctr->clk_valid, 0);
+      return;
+   }
+
+   /* Seconds and frames from the anchor: a fit on the raw values
+    * loses its answer to cancellation. */
+   x = (double)(tick - ctr->clk_anchor_tick) / (double)SYSCLOCK_ARM11;
+   y = (double)(ctr->clk_pos - ctr->clk_anchor_pos);
+
+   ctr->clk_sx  += x;
+   ctr->clk_sy  += y;
+   ctr->clk_sxx += x * x;
+   ctr->clk_sxy += x * y;
+   ctr->clk_n   += 1.0;
+
+   /* A second of window at least, as the interface asks. */
+   if (ctr->clk_n < 4.0 || x < 1.0)
+      return;
+
+   denom = ctr->clk_n * ctr->clk_sxx - ctr->clk_sx * ctr->clk_sx;
+   if (denom <= 0.0)
+      return;
+
+   {
+      double slope = (ctr->clk_n * ctr->clk_sxy - ctr->clk_sx * ctr->clk_sy)
+            / denom;
+      double ppm   = (slope / (double)CTR_DSP_AUDIO_RATE - 1.0) * 1000000.0;
+      if (ppm > -100000.0 && ppm < 100000.0)
+      {
+         retro_atomic_store_release_int(&ctr->clk_ppm, (int)ppm);
+         retro_atomic_store_release_int(&ctr->clk_valid, 1);
+      }
+   }
+}
+
 static void ctr_dsp_audio_frame_cb(void *data)
 {
    ctr_dsp_audio_t *ctr = (ctr_dsp_audio_t*)data;
    uint32_t pos         = ndspChnGetSamplePos(ctr->channel);
-
    /* Unsigned subtraction and the mask do the unwrap: the difference is
     * right across the wrap without a comparison. Only this callback
     * writes either field. */
-   retro_atomic_fetch_add_size(&ctr->consumed,
-         (size_t)((pos - ctr->last_pos) & CTR_DSP_AUDIO_COUNT_MASK));
+   uint32_t frames      = (pos - ctr->last_pos) & CTR_DSP_AUDIO_COUNT_MASK;
+
+   retro_atomic_fetch_add_size(&ctr->consumed, (size_t)frames);
    ctr->last_pos = pos;
+
+   ctr_dsp_audio_clock_sample(ctr, frames);
 
    LightEvent_Signal(&ctr->frame_event);
 }
@@ -97,10 +184,7 @@ static void *ctr_dsp_audio_init(const char *device, unsigned rate, unsigned late
    LightEvent_Init(&ctr->frame_event, RESET_ONESHOT);
    ndspSetCallback(ctr_dsp_audio_frame_cb, ctr);
 
-   if (!ctr)
-      return NULL;
-
-   *new_rate    = 32730;
+   *new_rate    = CTR_DSP_AUDIO_RATE;
 
    ctr->channel = 0;
 
@@ -110,7 +194,7 @@ static void *ctr_dsp_audio_init(const char *device, unsigned rate, unsigned late
    ndspChnReset(ctr->channel);
    ndspChnSetFormat(ctr->channel, NDSP_FORMAT_STEREO_PCM16);
    ndspChnSetInterp(ctr->channel, NDSP_INTERP_NONE);
-   ndspChnSetRate(ctr->channel, 32728.0f);
+   ndspChnSetRate(ctr->channel, (float)CTR_DSP_AUDIO_RATE);
    ndspChnWaveBufClear(ctr->channel);
 
    ctr->dsp_buf.data_pcm16 = linearAlloc(CTR_DSP_AUDIO_SIZE);
@@ -143,6 +227,14 @@ static void ctr_dsp_audio_free(void *data)
 /* How many 100 ms polls a blocking write waits for the channel to
  * advance before giving up on it. */
 #define CTR_DSP_AUDIO_WAIT_LAPS 20
+
+/* LightEvent_Wait() has no timeout, so a DSP that has stopped
+ * signalling its frame event - reset, or the channel dropped coming
+ * back from sleep - never returns from it. Never reached while the DSP
+ * runs: it signals every frame, so this only decides how long a
+ * stopped one takes to be noticed. */
+#define CTR_DSP_AUDIO_STALL_TIMEOUT_NS 256000000LL
+#define CTR_DSP_AUDIO_WAIT_WRITABLE_LAPS 8
 
 static ssize_t ctr_dsp_audio_write(void *data, const void *buf, size_t len)
 {
@@ -265,6 +357,9 @@ static size_t ctr_dsp_audio_wait_writable(void *data, size_t len)
 {
    ctr_dsp_audio_t *ctr = (ctr_dsp_audio_t*)data;
    uint32_t want        = (uint32_t)(len >> 2);
+   /* Each wait ends on a timeout; this ends the loop when the DSP
+    * keeps calling back but never frees enough. */
+   int laps             = CTR_DSP_AUDIO_WAIT_WRITABLE_LAPS;
 
    if (want > (CTR_DSP_AUDIO_COUNT >> 1))
       want = CTR_DSP_AUDIO_COUNT >> 1;
@@ -273,13 +368,19 @@ static size_t ctr_dsp_audio_wait_writable(void *data, size_t len)
    {
       uint32_t avail;
       if (!ctr->playing)
-         return 0;
+         break;
       avail = (ndspChnGetSamplePos(ctr->channel) - ctr->pos)
             & CTR_DSP_AUDIO_COUNT_MASK;
       if (avail >= want)
          return avail * 2 * sizeof(int16_t);
-      LightEvent_Wait(&ctr->frame_event);
+      if (--laps < 0)
+         break;
+      /* Non-zero is the timeout. */
+      if (LightEvent_WaitTimeout(&ctr->frame_event,
+               CTR_DSP_AUDIO_STALL_TIMEOUT_NS))
+         break;
    }
+   return 0;
 }
 
 /* Both in bytes of int16 stereo, as the interface asks: the ring is
@@ -289,6 +390,15 @@ static size_t ctr_dsp_audio_wait_writable(void *data, size_t len)
 static size_t ctr_dsp_audio_buffer_size(void *data)
 {
    return CTR_DSP_AUDIO_COUNT * 2 * sizeof(int16_t);
+}
+
+static bool ctr_dsp_audio_device_clock_ppm(void *data, double *ppm)
+{
+   ctr_dsp_audio_t *ctr = (ctr_dsp_audio_t*)data;
+   if (!ctr || !retro_atomic_load_acquire_int(&ctr->clk_valid))
+      return false;
+   *ppm = (double)retro_atomic_load_acquire_int(&ctr->clk_ppm);
+   return true;
 }
 
 audio_driver_t audio_ctr_dsp = {
@@ -307,5 +417,9 @@ audio_driver_t audio_ctr_dsp = {
    ctr_dsp_audio_buffer_size,
    NULL, /* write_raw */
    ctr_dsp_audio_wait_writable,
-   ctr_dsp_audio_frames_consumed
+   ctr_dsp_audio_frames_consumed,
+   NULL, /* underruns */
+   NULL, /* layout */
+   NULL, /* frames_consumed_fallback */
+   ctr_dsp_audio_device_clock_ppm
 };

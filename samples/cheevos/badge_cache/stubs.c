@@ -15,11 +15,12 @@
 #include "../../../file_path_special.h"
 #include "../../../tasks/tasks_internal.h"
 #include "../../../cheevos/cheevos.h"
+#include "../../../gfx/gfx_surface.h"
 
 /* ---- test-visible state ---- */
 int      st_on_main_thread = 1;
 char     st_badge_dir[256] = "/tmp";
-char     st_existing[8][64];          /* badge files that "exist" */
+char     st_existing[32][64];          /* badge files that "exist" */
 unsigned st_existing_count;
 unsigned st_downloads;                /* rcheevos_badge_request_download calls */
 char     st_last_download[64];
@@ -34,7 +35,7 @@ typedef struct
    retro_task_callback_t cb;
    void *user;
 } parked_t;
-parked_t st_parked[16];
+parked_t st_parked[32];
 unsigned st_parked_count;
 
 /* parked async uploads */
@@ -88,14 +89,33 @@ void rcheevos_badge_request_download(const char* badge, bool locked)
 }
 
 enum texture_filter_type gfx_display_texture_filter(void) { return TEXTURE_FILTER_LINEAR; }
+enum texture_filter_type gfx_display_texture_filter_latched(void) { return TEXTURE_FILTER_LINEAR; }
 uint32_t video_driver_get_disp_flags(void) { return 0; }
+
+/* The badge loader asks the surface layer what the driver wants
+ * before it queues a decode; there is no driver here, so the answer
+ * is what a software path takes: ARGB words, 8 bits a channel, no
+ * in-place texture update. */
+bool gfx_surface_query_requirements(unsigned width,
+      gfx_surface_requirements_t *req)
+{
+   if (!req)
+      return false;
+   req->rgba       = false;
+   req->formats    = GFX_SURFACE_PIXFMT_8888;
+   req->preferred  = GFX_SURFACE_PIXFMT_8888;
+   req->can_update = false;
+   req->pitch      = (size_t)width * sizeof(uint32_t);
+   req->align      = 4;
+   return true;
+}
 
 bool task_push_image_load(const char *fullpath, bool supports_rgba,
       unsigned upscale_threshold, unsigned downscale_cap,
       retro_task_callback_t cb, void *userdata)
 {
    (void)supports_rgba; (void)upscale_threshold; (void)downscale_cap;
-   if (st_parked_count >= 16)
+   if (st_parked_count >= 32)
       return false;
    strlcpy(st_parked[st_parked_count].path, fullpath, sizeof(st_parked[0].path));
    st_parked[st_parked_count].cb   = cb;

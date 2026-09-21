@@ -1,5 +1,21 @@
 # Bounded native transport stretcher
 
+## Borrowed source spans for inline owners
+
+`audio_stretch_stream_push_view_limit` reuses the bound stream adapter while
+exposing inactive, quiescent source spans without copying. The owner must keep
+the accepted source prefix alive and unchanged until `consume` or reset; the
+returned view is read-only. Active processing and exit transitions still use
+the bound output buffer. No source ring, allocation or format conversion is
+added. This API alone does not activate inline frontend time stretching.
+
+`stretch_test` compares copied and borrowed output bit for bit across native
+int16/float stereo, 5.1, 7.1 and 11-channel spans. It checks alternating active
+and inactive requests, fragmented budgets, partial acknowledgement, stable
+pending views, EOF/reset, untouched dry output storage and guarded heap calls.
+
+## Engine
+
 This is an engine foundation, not an enabled frontend transport mode. The existing
 WSOLA pitch DSP is unchanged. Normal playback does not call or feed this engine.
 
@@ -12,9 +28,11 @@ offset. This avoids cancellation on anti-phase material. Ties prefer the nominal
 position, then the closest candidate (lower index for equal distance).
 
 At 48 kHz, synthesis hop is 128 frames, the overlap window spans 256 source
-frames, and search radius is 64. Hop scales as round(rate / 375), with rates
-restricted to 8..192 kHz and 1..8 channels. Radius is floor(hop / 2). The ring
-holds only 2*hop + 2*radius frames, irrespective of tempo (0.25..32). High tempos
+frames, and search radius is 512. Hop scales as round(rate / 375), with rates
+restricted to 8..192 kHz and 1..8 channels. Radius is 4 * hop: a splice can
+only land on matching phase if the search reaches a full period, and 10.7 ms
+covers fundamentals down to about 47 Hz. The ring holds only 2*hop + 2*radius
+frames, irrespective of tempo (0.25..32). High tempos
 consume skipped source directly. A shared linear search neighborhood is staged
 once per hop; sample storage stays native. Integer correlation uses int32
 references and int64 accumulation, with native int16 overlap synthesis using
@@ -62,9 +80,9 @@ from the reference, duration bounds and a coarse 440 Hz pitch check. They do not
 constitute listening or device-latency acceptance.
 
 The tests print allocated bytes (including state) for 2/6/8 channels at several
-rates. On x86-64, 48 kHz uses 4,488/9,608/12,168 bytes for int16 and
-7,304/17,544/22,664 bytes for float. The largest supported eight-channel float
-instance uses 90,248 bytes at 192 kHz. ABI padding can change these figures.
+rates. On x86-64, 48 kHz uses 11,656/23,944/30,088 bytes for int16 and
+18,056/42,632/54,920 bytes for float. The largest supported eight-channel float
+instance uses 219,272 bytes at 192 kHz. ABI padding can change these figures.
 
 ## Native transition spans
 

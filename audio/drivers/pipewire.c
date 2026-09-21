@@ -14,6 +14,11 @@
  */
 
 #include <spa/param/audio/format-utils.h>
+/* A note for the eventcount census: this driver stays off it, on
+ * purpose, for pulse.c's reason - pw_thread_loop is the library's
+ * mandated rendezvous, its lock covers every pw_* call, and the
+ * data path already runs on PipeWire's own lock-free
+ * spa_ringbuffer. Same column as ALSA's device waits. */
 #include <spa/utils/ringbuffer.h>
 #include <spa/utils/result.h>
 #include <spa/param/props.h>
@@ -56,6 +61,10 @@ typedef struct pipewire_audio
     * way. Written only by the callback, read by the frontend through
     * pwire_frames_consumed(). */
    retro_atomic_size_t consumed;
+   /* Quanta the graph asked for and this driver had nothing at all
+    * for, so the whole buffer went out as silence. A short read is
+    * not one: that hands the graph fewer frames, not silence. */
+   retro_atomic_size_t underruns;
 
    /* The device clock, fitted from the time report the graph already
     * hands over.
@@ -100,7 +109,6 @@ static size_t pwire_calc_frame_size(enum spa_audio_format fmt, uint32_t nchannel
       case SPA_AUDIO_FORMAT_F32_BE:
       case SPA_AUDIO_FORMAT_F32_LE:
          return 4 * nchannels;
-         break;
       default:
          RARCH_ERR("[PipeWire] Bad spa_audio_format %d.\n", fmt);
          break;
@@ -401,13 +409,6 @@ static bool pwire_microphone_mic_alive(const void *driver_context, const void *m
    return pw_stream_get_state(mic->stream, &error) == PW_STREAM_STATE_STREAMING;
 }
 
-static void pwire_microphone_set_nonblock_state(void *driver_context, bool nonblock)
-{
-   pipewire_core_t *pw = (pipewire_core_t*)driver_context;
-   if (pw)
-      pw->nonblock = nonblock;
-}
-
 static struct string_list *pwire_microphone_device_list_new(const void *driver_context)
 {
    pipewire_core_t *pw = (pipewire_core_t*)driver_context;
@@ -603,7 +604,6 @@ microphone_driver_t microphone_pipewire = {
       pwire_microphone_init,
       pwire_microphone_free,
       pwire_microphone_read,
-      pwire_microphone_set_nonblock_state,
       "pipewire",
       pwire_microphone_device_list_new,
       pwire_microphone_device_list_free,
@@ -657,8 +657,11 @@ static void pwire_playback_process_cb(void *data)
    avail = spa_ringbuffer_get_read_index(&audio->ring, &idx);
 
    if (avail <= 0)
+   {
       /* fill rest buffer with silence */
       memset(p, 0x00, n_bytes);
+      retro_atomic_fetch_add_size(&audio->underruns, 1);
+   }
    else
    {
       if (avail < (int32_t)n_bytes)
@@ -1259,6 +1262,12 @@ static size_t pwire_wait_writable(void *data, size_t len)
    return (size_t)avail;
 }
 
+static size_t pwire_underruns(void *data)
+{
+   pipewire_audio_t *audio = (pipewire_audio_t*)data;
+   return audio ? retro_atomic_load_acquire_size(&audio->underruns) : 0;
+}
+
 audio_driver_t audio_pipewire = {
       pwire_init,
       pwire_write,
@@ -1276,7 +1285,7 @@ audio_driver_t audio_pipewire = {
       NULL, /* write_raw */
       pwire_wait_writable,
       pwire_frames_consumed,
-      NULL, /* underruns */
+      pwire_underruns,
       pwire_layout,
       NULL, /* frames_consumed_fallback */
       pwire_device_clock_ppm

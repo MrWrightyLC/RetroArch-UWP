@@ -67,7 +67,9 @@ RETRO_BEGIN_DECLS
 #endif
 
 #define DATETIME_CHECK_INTERVAL    1000000
-#define MENU_DRAW_ENTRY_DELAY      30
+/* Single-click playlist button hold: entry drawing stays
+ * suppressed for this long (us) after the click */
+#define MENU_DRAW_ENTRY_DELAY      500000
 
 #define MENU_LIST_GET(list, idx) ((list) ? ((list)->menu_stack[(idx)]) : NULL)
 
@@ -106,6 +108,7 @@ enum menu_settings_type
    MENU_PLAYLISTS_TAB,
    MENU_SETTING_DROPDOWN_ITEM,
    MENU_SETTING_DROPDOWN_ITEM_RESOLUTION,
+   MENU_SETTING_DROPDOWN_ITEM_CRT_SUPER_RESOLUTION,
    MENU_SETTING_DROPDOWN_ITEM_VIDEO_SHADER_PARAM,
    MENU_SETTING_DROPDOWN_ITEM_VIDEO_SHADER_PRESET_PARAM,
    MENU_SETTING_DROPDOWN_ITEM_VIDEO_SHADER_NUM_PASS,
@@ -531,7 +534,6 @@ struct menu_state
    } scroll;
 
    /* unsigned alignment */
-   unsigned input_dialog_kb_type;
    unsigned input_dialog_kb_idx;
    unsigned input_driver_flushing_input;
    menu_dialog_t dialog_st;

@@ -151,6 +151,8 @@
 
 #include "audio/audio_driver.h"
 
+#include "gfx/gfx_display.h"
+
 #ifdef HAVE_GFX_WIDGETS
 #include "gfx/gfx_widgets.h"
 #endif
@@ -1778,7 +1780,7 @@ void drivers_init(
        && video_st->current_video->gfx_widgets_enabled
        && video_st->current_video->gfx_widgets_enabled(video_st->data))
    {
-      bool rarch_force_fullscreen = (video_st->flags &
+      bool rarch_force_fullscreen = ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags) &
          VIDEO_FLAG_FORCE_FULLSCREEN) ? true : false;
       bool video_is_fullscreen    = settings->bools.video_fullscreen
                                  || rarch_force_fullscreen;
@@ -1982,10 +1984,12 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
       video_driver_cached_frame_retire();
       video_driver_free_internal();
 #ifdef HAVE_THREADS
+#ifndef RETRO_ATOMIC_HAS_PTR
+      /* The volatile-backend title fallback's lock - the only
+       * backend on which a display lock exists at all. */
       slock_free(video_st->display_lock);
-      slock_free(video_st->context_lock);
       video_st->display_lock      = NULL;
-      video_st->context_lock      = NULL;
+#endif
 #endif
       video_st->data              = NULL;
    }
@@ -2145,12 +2149,12 @@ bool driver_ctl(enum driver_ctl_state state, void *data)
                   && runloop_st->current_core_type == CORE_TYPE_DUMMY)
                video_st->av_info.timing.fps = *hz;
 
-            /* Sets audio monitor rate to new value. */
+            driver_adjust_system_rates(runloop_st, video_st, settings);
+
+            /* Use the input rate adjusted for the new display timing. */
             audio_st->src_ratio_orig   =
             audio_st->src_ratio_curr   =
             (double)audio_output_sample_rate / audio_st->input;
-
-            driver_adjust_system_rates(runloop_st, video_st, settings);
 
             /* driver_adjust_system_rates may have updated audio_st->input
              * for the new refresh rate; recompute the DRC threshold so
@@ -2272,28 +2276,20 @@ struct string_list *dir_list_new_special(const char *input_dir,
             video_context_driver_get_flags(&flags);
 
             if (BIT32_GET(flags.flags, GFX_CTX_FLAGS_SHADERS_CG))
-            {
                _len    += strlcpy_lit(ext_shaders + _len, "cgp", sizeof(ext_shaders) - _len);
-               _len    += strlcpy_lit(ext_shaders + _len, "|",   sizeof(ext_shaders) - _len);
-               _len    += strlcpy_lit(ext_shaders + _len, "cg",  sizeof(ext_shaders) - _len);
-            }
 
             if (BIT32_GET(flags.flags, GFX_CTX_FLAGS_SHADERS_GLSL))
             {
                if (_len > 0)
                   _len += strlcpy_lit(ext_shaders + _len, "|",     sizeof(ext_shaders) - _len);
                _len    += strlcpy_lit(ext_shaders + _len, "glslp", sizeof(ext_shaders) - _len);
-               _len    += strlcpy_lit(ext_shaders + _len, "|",     sizeof(ext_shaders) - _len);
-               _len    += strlcpy_lit(ext_shaders + _len, "glsl",  sizeof(ext_shaders) - _len);
             }
 
             if (BIT32_GET(flags.flags, GFX_CTX_FLAGS_SHADERS_SLANG))
             {
                if (_len > 0)
                   _len += strlcpy_lit(ext_shaders + _len, "|",      sizeof(ext_shaders) - _len);
-               _len    += strlcpy_lit(ext_shaders + _len, "slangp", sizeof(ext_shaders) - _len);
-               _len    += strlcpy_lit(ext_shaders + _len, "|",      sizeof(ext_shaders) - _len);
-               strlcpy_lit(ext_shaders + _len, "slang",  sizeof(ext_shaders) - _len);
+               strlcpy_lit(ext_shaders + _len, "slangp", sizeof(ext_shaders) - _len);
             }
 
             exts = ext_shaders;
@@ -3277,8 +3273,8 @@ bool is_accessibility_enabled(bool accessibility_enable, bool accessibility_enab
 /* Everything closing content does once nothing is left running in
  * the core.
  *
- * Split out of CMD_EVENT_CORE_DEINIT unchanged, and still called
- * from exactly where it used to run.  It is separated because it has
+ * The tail half of CMD_EVENT_CORE_DEINIT, called from exactly
+ * where that body runs.  It is separated because it has
  * to become resumable: the wait above it is the freeze this work is
  * about, and removing that wait means this half runs later, from the
  * frame loop, once the tasks have finished.  Extracting it on its
@@ -3842,7 +3838,14 @@ bool command_event(enum event_command cmd, void *data)
             runloop_msg_queue_push(_msg, strlen(_msg), 1, 120, true, NULL,
                   MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
 
-            core_reset();
+            /* A reset throws the game's audio away mid-waveform, and
+             * re-initialising the machine is long enough to empty the device
+             * on the way. See audio_driver_jump_fade_begin(). */
+            {
+               bool ramped = audio_driver_jump_fade_begin();
+               core_reset();
+               audio_driver_jump_fade_end(ramped);
+            }
 #ifdef HAVE_CHEEVOS
 #ifdef HAVE_GFX_WIDGETS
             rcheevos_reset_game(dispwidget_get_ptr()->active);
@@ -4032,6 +4035,11 @@ bool command_event(enum event_command cmd, void *data)
 
             runloop_st->flags              &= ~RUNLOOP_FLAG_CORE_RUNNING;
 
+            /* Persist core options before anything below calls
+             * back into the core (auto save-state, unload, deinit),
+             * so a crash there cannot lose them. */
+            runloop_core_options_save();
+
             /* The platform that uses ram_state_save calls it when the content
              * ends and writes it to a file */
             ram_state_to_file();
@@ -4208,7 +4216,7 @@ bool command_event(enum event_command cmd, void *data)
 
             if (want_widgets && !widgets_active)
             {
-               bool force_fs            = (video_st->flags &
+               bool force_fs            = ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags) &
                      VIDEO_FLAG_FORCE_FULLSCREEN) ? true : false;
                bool video_is_fullscreen = settings->bools.video_fullscreen
                      || force_fs;
@@ -4378,10 +4386,10 @@ bool command_event(enum event_command cmd, void *data)
          }
 #endif
          break;
-      /* Plain stop and start. These used to be gated on the menu's
-       * pause and menu-sound settings because the menu toggle issued
-       * them; it no longer does, and the gate also disabled them for
-       * the callers that mean it, such as the 3DS sleep and wake hooks. */
+      /* Plain stop and start, deliberately ungated: a gate on the
+       * menu's pause and menu-sound settings would also disable
+       * them for the callers that mean it, such as the 3DS sleep
+       * and wake hooks (the menu toggle does not issue them). */
       case CMD_EVENT_AUDIO_STOP:
          if (!audio_driver_stop())
             return false;
@@ -4710,6 +4718,11 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_CORE_DEINIT:
          {
+            /* Persist core options before anything below calls
+             * back into the core (auto save-state, unload, deinit),
+             * so a crash there cannot lose them. */
+            runloop_core_options_save();
+
             /* Restore unpaused state. The recursive command_event call
              * here re-enters this dispatcher; the UNPAUSE branch is
              * deliberately small (clears flags, resumes audio) and
@@ -4916,6 +4929,21 @@ bool command_event(enum event_command cmd, void *data)
       case CMD_EVENT_AUDIO_REINIT:
          driver_uninit(DRIVER_AUDIO_MASK, DRIVER_LIFETIME_RESET);
          drivers_init(settings, DRIVER_AUDIO_MASK, DRIVER_LIFETIME_RESET, verbosity_is_enabled());
+         /* The teardown drops the record that the core is held. */
+         {
+            bool core_held = !!(runloop_st->flags & RUNLOOP_FLAG_PAUSED);
+#ifdef HAVE_MENU
+            if (     (menu_st->flags & MENU_ST_FLAG_ALIVE)
+                  && settings->bools.menu_pause_libretro
+#ifdef HAVE_NETWORKING
+                  && netplay_driver_ctl(RARCH_NETPLAY_CTL_ALLOW_PAUSE, NULL)
+#endif
+               )
+               core_held = true;
+#endif
+            if (core_held)
+               audio_driver_pause_fade(true);
+         }
 #ifdef HAVE_MENU
          menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
 #endif
@@ -4970,18 +4998,6 @@ bool command_event(enum event_command cmd, void *data)
 #ifdef HAVE_MENU
          retroarch_menu_running_finished(false);
 #endif
-         if (uico_st->flags & UICO_ST_FLAG_IS_ON_FOREGROUND)
-         {
-#ifdef HAVE_COMPANION_WIMP
-            bool desktop_menu_enable = settings->bools.desktop_menu_enable;
-            bool ui_companion_toggle = settings->bools.ui_companion_toggle;
-#else
-            bool desktop_menu_enable = false;
-            bool ui_companion_toggle = false;
-#endif
-            ui_companion_driver_toggle(desktop_menu_enable,
-                  ui_companion_toggle, false);
-         }
          break;
       case CMD_EVENT_ADD_TO_FAVORITES:
          {
@@ -5156,7 +5172,7 @@ bool command_event(enum event_command cmd, void *data)
          break;
 #endif
       case CMD_EVENT_MENU_RESET_TO_DEFAULT_CONFIG:
-         config_set_defaults(global_get_ptr());
+         config_set_defaults(global_get_ptr(), config_get_ptr());
          break;
       case CMD_EVENT_MENU_SAVE_CURRENT_CONFIG:
          /* Same as at quit: the companion's live layout first. */
@@ -5311,9 +5327,7 @@ bool command_event(enum event_command cmd, void *data)
          runloop_pause_checks();
          break;
       case CMD_EVENT_MENU_PAUSE_LIBRETRO:
-         /* Audio is not stopped or started around the menu any more;
-          * see the menu toggle. Only the microphone follows the pause. */
-#if defined(HAVE_MENU) && defined(HAVE_MICROPHONE)
+#ifdef HAVE_MENU
          {
 #ifdef HAVE_NETWORKING
             bool menu_pause_libretro = settings->bools.menu_pause_libretro
@@ -5321,10 +5335,18 @@ bool command_event(enum event_command cmd, void *data)
 #else
             bool menu_pause_libretro = settings->bools.menu_pause_libretro;
 #endif
+            /* Changed from inside the menu: the core stops or resumes
+             * behind it on the next iteration, so the audio ramp follows
+             * the new state here rather than at the menu toggle. Either
+             * direction is a no-op when nothing changes. */
+            if (menu_st->flags & MENU_ST_FLAG_ALIVE)
+               audio_driver_pause_fade(menu_pause_libretro);
+#ifdef HAVE_MICROPHONE
             if (menu_pause_libretro)
                command_event(CMD_EVENT_MICROPHONE_STOP, NULL);
             else
                command_event(CMD_EVENT_MICROPHONE_START, NULL);
+#endif
          }
 #endif
          break;
@@ -5590,7 +5612,7 @@ bool command_event(enum event_command cmd, void *data)
                *input_st              = input_state_get_ptr();
             bool *userdata            = (bool*)data;
             bool video_fullscreen     = settings->bools.video_fullscreen;
-            bool ra_is_forced_fs      = (video_st->flags &
+            bool ra_is_forced_fs      = ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags) &
                VIDEO_FLAG_FORCE_FULLSCREEN) ? true : false;
             bool new_fullscreen_state = !video_fullscreen && !ra_is_forced_fs;
 
@@ -5846,7 +5868,7 @@ bool command_event(enum event_command cmd, void *data)
          {
             bool video_fullscreen                         =
                   settings->bools.video_fullscreen
-               || (video_st->flags & VIDEO_FLAG_FORCE_FULLSCREEN);
+               || ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags) & VIDEO_FLAG_FORCE_FULLSCREEN);
             enum input_game_focus_cmd_type game_focus_cmd = GAME_FOCUS_CMD_TOGGLE;
             input_driver_state_t
                *input_st                                  = input_state_get_ptr();
@@ -6369,6 +6391,22 @@ static void sdl_exit(void)
  * Cleanly exit RetroArch.
  *
  **/
+/* Retire the task queue while every subsystem a finish callback can
+ * reach is still alive: the exit path tears drivers down before
+ * task_queue_deinit(), and deinit abandons whatever is still queued
+ * - handlers never run, finish callbacks never fire, cleanup
+ * callbacks never release their owners. Cancelling first lets
+ * cancellation-aware handlers wind down instead of completing their
+ * work, and the bound keeps a stuck transfer from hanging quit;
+ * whatever survives the bound meets the old abandonment, now the
+ * fallback instead of the rule. Scheduled-for-later tasks (a set
+ * 'when') do not hold the wait and are dropped as designed. */
+void retroarch_drain_tasks_for_exit(void)
+{
+   task_queue_reset();
+   task_queue_wait_timeout(NULL, NULL, 3 * 1000 * 1000);
+}
+
 void main_exit(void *args)
 {
    struct rarch_state *p_rarch  = &rarch_st;
@@ -6377,6 +6415,8 @@ void main_exit(void *args)
    struct menu_state  *menu_st  = menu_state_get_ptr();
 #endif
    settings_t     *settings     = config_get_ptr();
+
+   retroarch_drain_tasks_for_exit();
 
    video_driver_restore_cached(settings);
 
@@ -6447,11 +6487,17 @@ void main_exit(void *args)
 #endif
 
    ui_companion_driver_deinit();
-   retroarch_config_deinit();
 
    frontend_driver_shutdown(false);
 
    retroarch_deinit_drivers(&runloop_st->retro_ctx);
+   /* After the drivers: tearing them down reads settings - the Win32
+    * display server restores the original display mode through
+    * win32_monitor_info(), which asks for the monitor index - and a
+    * freed settings object is a crash on the way out, seen on Windows
+    * as a segfault in win32_display_server_destroy() once a run had
+    * changed the mode. */
+   retroarch_config_deinit();
    uico_state_get_ptr()->drv = NULL;
    frontend_driver_free();
 
@@ -8999,15 +9045,19 @@ void retroarch_init_task_queue(void)
 
    task_queue_deinit();
 #ifdef HAVE_NETWORKING
-   /* Before task_queue_init(), which is what spawns the task thread.
-    * net_http's DNS cache and connection pool locks used to be
-    * created lazily on first use, so the first two concurrent
-    * transfers of the process could each create one and then lock
-    * different objects. */
+   /* Before task_queue_init(), which is what spawns the task
+    * thread: net_http's DNS cache and connection pool locks must
+    * exist before any two transfers can race - created lazily on
+    * first use, the first two concurrent transfers of the process
+    * can each create one and then lock different objects. */
    net_http_init();
 #endif
    task_queue_init(threaded_enable, runloop_task_msg_queue_push);
 #ifdef HAVE_THREADS
+   /* The queue falls back to running tasks on the caller's thread when
+    * its worker or synchronisation primitives could not be created. */
+   if (threaded_enable && !task_queue_is_threaded())
+      RARCH_ERR("[Task] Threaded tasks were requested but could not be started; running tasks inline.\n");
    /* The main thread runs the emulation loop; on a mixed-core part
     * keep it off the slow cluster when asked. */
    if (settings->bools.thread_prefer_fast_cores)

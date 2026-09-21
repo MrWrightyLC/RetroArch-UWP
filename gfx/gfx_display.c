@@ -31,6 +31,7 @@
 #include "../verbosity.h"
 
 #include "../input/input_osk.h"
+#include "gfx_surface.h"
 
 /* Standard reference DPI value, used when determining
  * DPI-aware scaling factors */
@@ -335,6 +336,17 @@ float gfx_display_get_dpi_scale(
    return adjusted_scale;
 }
 
+static void gfx_display_flush_impl(gfx_display_t *p_disp);
+
+/* Sends what is gathered and records why it had to go */
+static void gfx_display_flush_as(gfx_display_t *p_disp,
+      enum gfx_display_flush_reason reason)
+{
+   if (p_disp && p_disp->batch_quads)
+      p_disp->stats.v[GFX_DISPLAY_STAT_FLUSH + reason]++;
+   gfx_display_flush_impl(p_disp);
+}
+
 /* Begin scissoring operation */
 void gfx_display_scissor_begin(
       gfx_display_t *p_disp,
@@ -344,6 +356,8 @@ void gfx_display_scissor_begin(
       int x, int y, unsigned width, unsigned height)
 {
    gfx_display_ctx_driver_t *dispctx = p_disp->dispctx;
+   /* What is gathered goes out before this draws */
+   gfx_display_flush_as(disp_get_ptr(), GFX_DISPLAY_FLUSH_SCISSOR);
    if (dispctx && dispctx->scissor_begin)
    {
       if (y < 0)
@@ -415,8 +429,12 @@ static void gfx_display_draw_text_internal(
       float scale, bool shadows_enable, float shadow_offset,
       bool draw_outside)
 {
+   size_t _len;
    struct font_params params;
+   gfx_display_t *p_disp          = disp_get_ptr();
    video_driver_state_t *video_st = video_state_get_ptr();
+   /* What is gathered goes out before this draws */
+   gfx_display_flush_as(p_disp, GFX_DISPLAY_FLUSH_TEXT);
 
    /* NULL text is a no-op: ozone_draw_footer and similar menu code can
     * legitimately reach here with text==NULL for unset/optional fields,
@@ -455,9 +473,13 @@ static void gfx_display_draw_text_internal(
       params.drop_alpha  = GFX_SHADOW_ALPHA;
    }
 
+   _len = strlen(text);
+   p_disp->stats.v[GFX_DISPLAY_STAT_TEXT_CALLS]++;
+   p_disp->stats.v[GFX_DISPLAY_STAT_TEXT_BYTES] += (unsigned)_len;
+
    if (video_st->poke && video_st->poke->set_osd_msg)
       video_st->poke->set_osd_msg(video_st->data,
-            text, strlen(text), &params, (void*)font);
+            text, _len, &params, (void*)font);
 }
 
 void gfx_display_draw_text(
@@ -537,6 +559,224 @@ void gfx_display_draw_bg(
             userdata);
 }
 
+/* How many quads may wait before the batch has to go out. One strip of
+ * them is six vertices a quad less the two the first does not need to
+ * be joined by, which is what the block below is sized for: 32 quads
+ * is 190 vertices, six kilobytes for the lot. A run of quads between
+ * two things that are not quads measured three or four, so this is
+ * room to spare; going over it costs a draw, not a correction. */
+#define GFX_DISPLAY_BATCH_QUADS 32
+#define GFX_DISPLAY_BATCH_VERTS (GFX_DISPLAY_BATCH_QUADS * 6 - 2)
+
+/* Adds one quad to the batch, in the strip order the drivers draw in -
+ * bottom left, bottom right, top left, top right - joined to the quad
+ * before it by a vertex repeated at each end of the seam, which the
+ * rasteriser drops as zero-area. Returns false when the quad cannot
+ * join, and the caller draws it itself. */
+static bool gfx_display_batch_add(gfx_display_t *p_disp,
+      uintptr_t texture, const float *color, void *userdata,
+      unsigned video_width, unsigned video_height,
+      float x0, float x1, float y0, float y1,
+      int px, int py, unsigned pw, unsigned ph)
+{
+   unsigned v, i;
+   float *vert, *tex, *col;
+
+   if (!p_disp)
+      return false;
+   /* A batch belongs to one texture and one frame's worth of state */
+   if (     p_disp->batch_quads
+         && (  p_disp->batch_texture     != texture
+            || p_disp->batch_userdata    != userdata
+            || p_disp->batch_video_width != video_width
+            || p_disp->batch_video_height != video_height))
+      gfx_display_flush_as(p_disp, GFX_DISPLAY_FLUSH_TEXTURE);
+   if (p_disp->batch_quads >= GFX_DISPLAY_BATCH_QUADS)
+      gfx_display_flush_as(p_disp, GFX_DISPLAY_FLUSH_CAPACITY);
+
+   if (!p_disp->batch_mem)
+   {
+      /* 2 + 2 + 4 floats a vertex, in one block: they are filled
+       * together and read together, so they are kept together. */
+      if (!(p_disp->batch_mem = (float*)malloc(
+                  sizeof(float) * 8 * GFX_DISPLAY_BATCH_VERTS)))
+         return false;
+      p_disp->batch_vertex = p_disp->batch_mem;
+      p_disp->batch_tex    = p_disp->batch_mem + 2 * GFX_DISPLAY_BATCH_VERTS;
+      p_disp->batch_color  = p_disp->batch_mem + 4 * GFX_DISPLAY_BATCH_VERTS;
+   }
+
+   vert = p_disp->batch_vertex;
+   tex  = p_disp->batch_tex;
+   col  = p_disp->batch_color;
+   v    = p_disp->batch_quads ? (p_disp->batch_quads * 6 - 2) : 0;
+
+   if (p_disp->batch_quads)
+   {
+      /* Seam: the quad before ends where this one starts */
+      vert[v * 2]     = vert[(v - 1) * 2];
+      vert[v * 2 + 1] = vert[(v - 1) * 2 + 1];
+      tex [v * 2]     = tex [(v - 1) * 2];
+      tex [v * 2 + 1] = tex [(v - 1) * 2 + 1];
+      for (i = 0; i < 4; i++)
+         col[v * 4 + i] = col[(v - 1) * 4 + i];
+      v++;
+      vert[v * 2]     = x0;
+      vert[v * 2 + 1] = y0;
+      tex [v * 2]     = 0.0f;
+      tex [v * 2 + 1] = 1.0f;
+      for (i = 0; i < 4; i++)
+         col[v * 4 + i] = color[i];
+      v++;
+   }
+
+   for (i = 0; i < 4; i++)
+   {
+      unsigned c;
+      /* bottom left, bottom right, top left, top right */
+      vert[v * 2]     = (i & 1) ? x1   : x0;
+      vert[v * 2 + 1] = (i & 2) ? y1   : y0;
+      tex [v * 2]     = (i & 1) ? 1.0f : 0.0f;
+      tex [v * 2 + 1] = (i & 2) ? 0.0f : 1.0f;
+      for (c = 0; c < 4; c++)
+         col[v * 4 + c] = color[i * 4 + c];
+      v++;
+   }
+
+   if (p_disp->batch_quads == 0)
+   {
+      p_disp->batch_first_x   = px;
+      p_disp->batch_first_y   = py;
+      p_disp->batch_first_w   = pw;
+      p_disp->batch_first_h   = ph;
+   }
+   p_disp->batch_quads++;
+   p_disp->stats.v[GFX_DISPLAY_STAT_QUADS]++;
+   p_disp->batch_texture      = texture;
+   p_disp->batch_userdata     = userdata;
+   p_disp->batch_video_width  = video_width;
+   p_disp->batch_video_height = video_height;
+   return true;
+}
+
+/* Sends the quads that are waiting, as one strip, and empties the
+ * batch. Called before anything else draws, so that what was gathered
+ * lands under what comes after it, and at the end of a frame so that
+ * nothing is still waiting when the frame is over. */
+static void gfx_display_flush_impl(gfx_display_t *p_disp)
+{
+   gfx_display_ctx_driver_t *dispctx;
+   gfx_display_ctx_draw_t draw;
+   struct video_coords coords;
+
+   if (!p_disp || !p_disp->batch_quads)
+      return;
+   dispctx                 = p_disp->dispctx;
+   p_disp->stats.v[GFX_DISPLAY_STAT_BATCHES]++;
+   if (p_disp->batch_quads > p_disp->stats.v[GFX_DISPLAY_STAT_BATCH_MAX])
+      p_disp->stats.v[GFX_DISPLAY_STAT_BATCH_MAX] = p_disp->batch_quads;
+   coords.lut_tex_coord    = NULL;
+   if (p_disp->batch_quads == 1)
+   {
+      /* One quad: hand it over as a quad */
+      coords.vertices      = 4;
+      coords.vertex        = NULL;
+      coords.tex_coord     = NULL;
+      coords.color         = p_disp->batch_color;
+      draw.x               = p_disp->batch_first_x;
+      draw.y               = p_disp->batch_first_y;
+      draw.width           = p_disp->batch_first_w;
+      draw.height          = p_disp->batch_first_h;
+   }
+   else
+   {
+      coords.vertices      = p_disp->batch_quads * 6 - 2;
+      coords.vertex        = p_disp->batch_vertex;
+      coords.tex_coord     = p_disp->batch_tex;
+      coords.color         = p_disp->batch_color;
+      draw.x               = 0;
+      draw.y               = 0;
+      draw.width           = p_disp->batch_video_width;
+      draw.height          = p_disp->batch_video_height;
+   }
+   draw.coords             = &coords;
+   draw.matrix_data        = NULL;
+   draw.texture            = p_disp->batch_texture;
+   draw.pipeline_id        = 0;
+   draw.scale_factor       = 1.0f;
+   draw.rotation           = 0.0f;
+   p_disp->batch_quads     = 0;
+   if (dispctx)
+   {
+      /* Inside a caller's group blending is already on and stays on:
+       * turning it off here would end the group early. */
+      bool own_blend = !p_disp->blend_on;
+      if (own_blend && dispctx->blend_begin)
+         dispctx->blend_begin(p_disp->batch_userdata);
+      if (dispctx->draw)
+         dispctx->draw(&draw, p_disp->batch_userdata,
+               p_disp->batch_video_width, p_disp->batch_video_height);
+      if (own_blend && dispctx->blend_end)
+         dispctx->blend_end(p_disp->batch_userdata);
+   }
+}
+
+void gfx_display_flush_batch(gfx_display_t *p_disp)
+{
+   if (p_disp && p_disp->batch_quads)
+      p_disp->stats.v[GFX_DISPLAY_STAT_FLUSH + GFX_DISPLAY_FLUSH_EXPLICIT]++;
+   gfx_display_flush_impl(p_disp);
+}
+
+void gfx_display_stats_latch(gfx_display_t *p_disp)
+{
+   unsigned i;
+   if (!p_disp)
+      return;
+   for (i = 0; i < GFX_DISPLAY_STAT_LAST; i++)
+   {
+      retro_atomic_store_relaxed_int(&p_disp->stats_pub[i],
+            (int)p_disp->stats.v[i]);
+      p_disp->stats.v[i] = 0;
+   }
+}
+
+void gfx_display_stats_get(gfx_display_stats_t *out)
+{
+   unsigned i;
+   gfx_display_t *p_disp = disp_get_ptr();
+   for (i = 0; i < GFX_DISPLAY_STAT_LAST; i++)
+      out->v[i] = (unsigned)retro_atomic_load_relaxed_int(
+            &p_disp->stats_pub[i]);
+}
+
+void gfx_display_blend_begin(gfx_display_ctx_driver_t *dispctx,
+      void *userdata)
+{
+   gfx_display_t *p_disp = disp_get_ptr();
+   /* What was gathered outside this group goes out under the state it
+    * was gathered under */
+   gfx_display_flush_as(p_disp, GFX_DISPLAY_FLUSH_BLEND);
+   if (dispctx && dispctx->blend_begin)
+   {
+      dispctx->blend_begin(userdata);
+      p_disp->blend_on = true;
+   }
+}
+
+void gfx_display_blend_end(gfx_display_ctx_driver_t *dispctx,
+      void *userdata)
+{
+   gfx_display_t *p_disp = disp_get_ptr();
+   /* And what was gathered inside it goes out while it is still on */
+   gfx_display_flush_as(p_disp, GFX_DISPLAY_FLUSH_BLEND);
+   if (dispctx && dispctx->blend_end)
+   {
+      dispctx->blend_end(userdata);
+      p_disp->blend_on = false;
+   }
+}
+
 /* The one way a caller outside this file reaches the display driver.
  * Everything drawn while the menu is up passes through here or through
  * the helpers above it, which is what lets this file know the order
@@ -546,6 +786,7 @@ void gfx_display_draw(gfx_display_ctx_driver_t *dispctx,
       gfx_display_ctx_draw_t *draw, void *userdata,
       unsigned video_width, unsigned video_height)
 {
+   gfx_display_flush_as(disp_get_ptr(), GFX_DISPLAY_FLUSH_DRAW);
    if (dispctx && dispctx->draw && draw)
       dispctx->draw(draw, userdata, video_width, video_height);
 }
@@ -589,6 +830,20 @@ void gfx_display_draw_quad(
    draw.scale_factor    = 1.0f;
    draw.rotation        = 0.0f;
 
+   /* Gathered rather than drawn, where the driver can be handed a
+    * strip of quads instead of one at a time. What is gathered goes
+    * out before anything else draws, so the order is unchanged. */
+   if (     dispctx->handles_vertex_strip
+         && gfx_display_batch_add(p_disp, draw.texture, color, data,
+            video_width, video_height,
+            (float)x / (float)width,
+            (float)(x + (int)w) / (float)width,
+            (float)draw.y / (float)height,
+            (float)(draw.y + (int)h) / (float)height,
+            draw.x, draw.y, draw.width, draw.height))
+      return;
+
+   gfx_display_flush_as(p_disp, GFX_DISPLAY_FLUSH_DRAW);
    if (dispctx->blend_begin)
       dispctx->blend_begin(data);
    if (dispctx->draw)
@@ -635,6 +890,9 @@ void gfx_display_draw_texture_slice(
       1.0f, 1.0f, 1.0f, 1.0f,
       1.0f, 1.0f, 1.0f, 1.0f
    };
+
+   /* What is gathered goes out before this draws */
+   gfx_display_flush_as(disp_get_ptr(), GFX_DISPLAY_FLUSH_DRAW);
 
    /* Early-out: guard against division by zero from
     * zero display dimensions or zero texture dimensions */
@@ -866,6 +1124,8 @@ void gfx_display_draw_cursor(
    gfx_display_ctx_draw_t draw;
    struct video_coords coords;
    gfx_display_ctx_driver_t *dispctx = p_disp->dispctx;
+   /* What is gathered goes out before this draws */
+   gfx_display_flush_as(disp_get_ptr(), GFX_DISPLAY_FLUSH_DRAW);
 
    if (!dispctx)
       return;
@@ -1030,7 +1290,7 @@ bool gfx_display_reset_textures_list_buffer(
    ti.width         = 0;
    ti.height        = 0;
    ti.pixels        = NULL;
-   ti.supports_rgba = (video_driver_get_disp_flags() & VIDEO_FLAG_USE_RGBA);
+   ti.supports_rgba = gfx_surface_wants_rgba();
    ti.pix10         = false;
 
    if (image_texture_load_buffer(&ti, image_type, buffer, buffer_len))
@@ -1067,7 +1327,7 @@ bool gfx_display_reset_textures_list(
    ti.width                      = 0;
    ti.height                     = 0;
    ti.pixels                     = NULL;
-   ti.supports_rgba              = (video_driver_get_disp_flags() & VIDEO_FLAG_USE_RGBA);
+   ti.supports_rgba              = gfx_surface_wants_rgba();
    ti.pix10                      = false;
 
    if (!texture_path || !*texture_path)
@@ -1107,7 +1367,7 @@ bool gfx_display_reset_icon_texture(
    ti.width                      = 0;
    ti.height                     = 0;
    ti.pixels                     = NULL;
-   ti.supports_rgba              = (video_driver_get_disp_flags() & VIDEO_FLAG_USE_RGBA);
+   ti.supports_rgba              = gfx_surface_wants_rgba();
    ti.pix10                      = false;
 
    if (!texture_path || !*texture_path)
@@ -1151,12 +1411,28 @@ bool gfx_display_reset_icon_texture(
 #define GFX_DISPLAY_ICON_LOAD_SYNCHRONOUS
 #endif
 
+/* The mipmap choice, published for the draw-thread texture loads:
+ * every main-thread caller of the live read below refreshes it, and
+ * main callers run at least per menu rebuild, so the latch tracks
+ * the setting to within one texture's filter mode. */
+static retro_atomic_int_t gfx_display_mipmap_latch;
+
 enum texture_filter_type gfx_display_texture_filter(void)
 {
    settings_t *settings = config_get_ptr();
-   if (settings && settings->bools.menu_texture_mipmapping)
-      return TEXTURE_FILTER_MIPMAP_LINEAR;
-   return TEXTURE_FILTER_LINEAR;
+   int mip              = settings
+         && settings->bools.menu_texture_mipmapping;
+   retro_atomic_store_relaxed_int(&gfx_display_mipmap_latch, mip);
+   return mip ? TEXTURE_FILTER_MIPMAP_LINEAR : TEXTURE_FILTER_LINEAR;
+}
+
+/* For texture loads issued off the main thread - badge fetches from
+ * the widget appliers, the screenshot widget's iterate - where the
+ * live settings must not be read. */
+enum texture_filter_type gfx_display_texture_filter_latched(void)
+{
+   return retro_atomic_load_relaxed_int(&gfx_display_mipmap_latch)
+         ? TEXTURE_FILTER_MIPMAP_LINEAR : TEXTURE_FILTER_LINEAR;
 }
 
 bool gfx_display_load_icon(
@@ -1196,11 +1472,15 @@ void gfx_display_init_white_texture(void)
    struct texture_image ti;
    static const uint8_t white_data[] = { 0xff, 0xff, 0xff, 0xff };
 
-   ti.width      = 1;
-   ti.height     = 1;
-   ti.pixels     = (uint32_t*)&white_data;
-   ti.compressed = NULL; /* raw pixels, not a loaded compressed texture */
-   ti.pix10      = false; /* 8-bit white; must not be read as 10-bit */
+   ti.width         = 1;
+   ti.height        = 1;
+   ti.pixels        = (uint32_t*)&white_data;
+   ti.compressed    = NULL; /* raw pixels, not a loaded compressed texture */
+   ti.pix10         = false; /* 8-bit white; must not be read as 10-bit */
+   /* Four 0xff bytes read either way, but the drivers read this field
+    * and it is the caller's to set: nothing here fills the struct
+    * beforehand, so an unset one is whatever the stack held. */
+   ti.supports_rgba = gfx_surface_wants_rgba();
 
    video_driver_texture_load(&ti,
          TEXTURE_FILTER_NEAREST, &gfx_white_texture);
@@ -1210,6 +1490,14 @@ void gfx_display_free(void)
 {
    gfx_display_t *p_disp       = &dispgfx_st;
    video_coord_array_free(&p_disp->dispca);
+
+   free(p_disp->batch_mem);
+   p_disp->batch_mem           = NULL;
+   p_disp->batch_vertex        = NULL;
+   p_disp->batch_tex           = NULL;
+   p_disp->batch_color         = NULL;
+   p_disp->batch_quads         = 0;
+   p_disp->blend_on            = false;
 
    p_disp->flags               = 0;
    p_disp->header_height       = 0;
@@ -1230,6 +1518,11 @@ void gfx_display_init(void)
    else
       p_disp->flags             &= ~GFX_DISP_FLAG_HAS_WINDOWED;
    p_dispca->allocated           =  0;
+   {
+      unsigned i;
+      for (i = 0; i < GFX_DISPLAY_STAT_LAST; i++)
+         retro_atomic_int_init(&p_disp->stats_pub[i], 0);
+   }
 }
 
 bool gfx_display_init_first_driver(gfx_display_t *p_disp,

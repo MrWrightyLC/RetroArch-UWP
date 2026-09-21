@@ -20,6 +20,7 @@
 #include <stddef.h>
 
 #include <boolean.h>
+#include <retro_atomic.h>
 #include <retro_common_api.h>
 #include <lists/file_list.h>
 #include <lists/string_list.h>
@@ -70,8 +71,7 @@ enum ui_msg_window_type
 
 enum uico_driver_state_flags
 {
-   UICO_ST_FLAG_WIMP_IS_INITED   = (1 << 0),
-   UICO_ST_FLAG_IS_ON_FOREGROUND = (1 << 1)
+   UICO_ST_FLAG_WIMP_IS_INITED   = (1 << 0)
 };
 
 typedef struct ui_msg_window_state
@@ -172,6 +172,15 @@ typedef struct
    const ui_companion_driver_t *wimp;
    void *wimp_data;
 #endif
+   /* desktop_menu_enable, latched on the main thread wherever the
+    * live value arrives (init and toggle both receive it from their
+    * callers' settings read). Read with relaxed loads from the log
+    * sink, the message push and the refresh notification, which run
+    * on whatever thread logs or finishes a task, and so must not
+    * touch the live settings (on Windows every log line passes
+    * through here). Staleness across a toggle costs at most one
+    * line. */
+   retro_atomic_int_t desktop_menu_enable;
    uint8_t flags;
 } uico_driver_state_t;
 

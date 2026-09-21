@@ -2876,6 +2876,17 @@ static int setting_action_ok_uint_special(
    return 0;
 }
 
+static int setting_action_ok_crt_switch_resolution_super(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   if (!setting)
+      return -1;
+   generic_action_ok_displaylist_push(
+         NULL, NULL, NULL, 0, idx, 0,
+         ACTION_OK_DL_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION);
+   return 0;
+}
+
 static int setting_action_ok_uint(
       rarch_setting_t *setting, size_t idx, bool wraparound)
 {
@@ -3738,19 +3749,14 @@ static size_t setting_get_string_representation_uint_menu_thumbnails(
       default:
       case 0:
          return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_OFF), len);
-         break;
       case 1:
          return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_THUMBNAIL_MODE_SCREENSHOTS), len);
-         break;
       case 2:
          return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_THUMBNAIL_MODE_TITLE_SCREENS), len);
-         break;
       case 3:
          return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_THUMBNAIL_MODE_BOXARTS), len);
-         break;
       case 4:
          return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_THUMBNAIL_MODE_LOGOS), len);
-         break;
    }
 }
 
@@ -7141,9 +7147,11 @@ static size_t setting_get_string_representation_uint_crt_switch_resolutions(
          case CRT_SWITCH_32_120:
             return strlcpy_lit(s, "31 KHz, 120Hz", len);
          case CRT_SWITCH_INI:
-            return strlcpy_lit(s, "INI", len);
+            return strlcpy_lit(s, "Custom (switchres.ini)", len);
          case CRT_SWITCH_EDID:
-            return strlcpy_lit(s, "EDID", len);
+            return strlcpy_lit(s, "Match Display (EDID)", len);
+         case CRT_SWITCH_LCD:
+            return strlcpy_lit(s, "Match Refresh Only", len);
       }
    }
    return 0;
@@ -9031,7 +9039,16 @@ static void write_handler_logging_verbosity(rarch_setting_t *setting)
 
    rarch_cmd                    = write_handler_get_cmd(setting);
 
-   if (!verbosity_is_enabled())
+   /* The framework has already written the bound flag when this
+    * runs, so the freshly written value names the transition the
+    * person asked for. Reading verbosity_is_enabled() here - the
+    * same memory, post-write - took every transition backwards: the
+    * flag snapped back on each press and the log file churned in
+    * the opposite direction of the display. verbosity_enable() and
+    * verbosity_disable() re-assert the flag idempotently and carry
+    * the console attach/detach side effect the direct write skips,
+    * which is what keeps verbosity_get_ptr()'s binding honest. */
+   if (*setting->value.target.boolean)
    {
       settings_t *settings = config_get_ptr();
       rarch_log_file_init(
@@ -15479,7 +15496,8 @@ static void settings_build_onscreen_notifications(
             ADD_DESC(widget_fs_desc);
       /* The fullscreen variant is an LV row and the LV float grammar
        * has no range or handler slots yet; until it grows them, the
-       * customization stays here. The windowed row carries its own. */
+       * customization stays here. The console/mobile row and the
+       * windowed row carry their own. */
       SETTINGS_ACTION_SET(ok, &(*list)[list_info->index - 1], &setting_action_ok_uint)
       menu_settings_list_current_add_range(list, list_info, 0.2, 5.0, 0.01, true, true);
 #endif
@@ -17473,9 +17491,6 @@ static void settings_build_manual_content_scan(
       GROUP_END();
    }
 }
-
-#ifdef HAVE_MIST
-#endif
 
 #ifdef HAVE_SMBCLIENT
 static void settings_build_smbclient(

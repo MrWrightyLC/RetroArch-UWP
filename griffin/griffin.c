@@ -73,6 +73,7 @@
 
 #if _MSC_VER && !defined(__WINRT__)
 #include "../libretro-common/compat/compat_snprintf.c"
+#include "../libretro-common/compat/compat_strtoll.c"
 #endif
 
 #include "../verbosity.c"
@@ -359,6 +360,10 @@ VIDEO CONTEXT
 #include "../gfx/display_servers/dispserv_kms.c"
 #endif
 
+#if defined(HAVE_VIDEOCORE)
+#include "../gfx/display_servers/dispserv_videocore.c"
+#endif
+
 #if defined(HAVE_EGL)
 #include "../gfx/common/egl_common.c"
 
@@ -389,7 +394,7 @@ VIDEO CONTEXT
 #include "../gfx/drivers_context/x_ctx.c"
 #endif
 
-#ifdef HAVE_VULKAN
+#if defined(HAVE_VULKAN) && defined(HAVE_XCB)
 #include "../gfx/drivers_context/x_vk_ctx.c"
 #endif
 
@@ -527,6 +532,10 @@ VIDEO IMAGE
 /* Shared 10-bit / HDR I420->RGB blits: used by the webm/mp4 rvp9 paths
  * and by rmp4_video's H.265 Main10 arm, so RMP4 alone needs them too. */
 #include "../libretro-common/formats/image/image_hdr_blit.c"
+#endif
+#if defined(HAVE_RWEBM) || defined(HAVE_RMP4)
+/* The row-band splitter the video streams' blits run through. */
+#include "../libretro-common/formats/image/image_blit_bands.c"
 #endif
 #ifdef HAVE_RDDS
 #include "../libretro-common/formats/dds/rdds.c"
@@ -708,9 +717,6 @@ FONTS
 
 #include "../gfx/bitmapfont.c"
 
-#ifdef HAVE_LANGEXTRA
-#endif
-
 #include "../gfx/font_driver.c"
 
 #include "../gfx/drivers_font_renderer/stb.c"
@@ -728,6 +734,7 @@ INPUT
 ============================================================ */
 
 #include "../input/input_driver.c"
+#include "../input/input_overlay_textures.c"
 #ifdef HAVE_BSV_MOVIE
 #include "../input/bsv/bsvmovie.c"
 #include "../input/bsv/uint32s_index.c"
@@ -927,6 +934,8 @@ FIFO BUFFER
 #if defined(HAVE_THREADS)
 #include "../libretro-common/queues/retro_waitable_spsc.c"
 #include "../libretro-common/rthreads/retro_eventcount.c"
+#include "../libretro-common/rthreads/retro_procbarrier.c"
+#include "../libretro-common/rthreads/retro_asym_eventcount.c"
 #endif
 
 /*============================================================
@@ -1018,8 +1027,12 @@ AUDIO
 #include "../audio/drivers/wiiu_audio.c"
 #elif defined(HAVE_RWEBAUDIO)
 #include "../audio/drivers/rwebaudio.c"
-#elif defined(PSP) || defined(VITA) || defined(ORBIS)
+#elif defined(PSP)
 #include "../audio/drivers/psp_audio.c"
+#elif defined(VITA)
+#include "../audio/drivers/psp2_audio.c"
+#elif defined(ORBIS)
+#include "../audio/drivers/ps4_audio.c"
 #elif defined(PS2)
 #include "../audio/drivers/ps2_audio.c"
 #elif defined(_3DS)
@@ -1049,10 +1062,15 @@ AUDIO
 #include "../gfx/drivers_context/sdl3_vk_ctx.c"
 #endif
 #elif defined(HAVE_SDL2)
-#include "../audio/drivers/sdl_audio.c"
-#include "../input/drivers/sdl_input.c"
-#include "../input/drivers_joypad/sdl_joypad.c"
-#include "../gfx/drivers_context/sdl_gl_ctx.c"
+#include "../audio/drivers/sdl2_audio.c"
+#include "../input/drivers/sdl2_input.c"
+#include "../input/drivers_joypad/sdl2_joypad.c"
+#include "../gfx/drivers_context/sdl2_gl_ctx.c"
+#elif defined(HAVE_SDL)
+#include "../audio/drivers/sdl1_audio.c"
+#include "../input/drivers/sdl1_input.c"
+#include "../input/drivers_joypad/sdl1_joypad.c"
+#include "../gfx/drivers_context/sdl1_gl_ctx.c"
 #endif
 
 #ifdef HAVE_DSOUND
@@ -1134,6 +1152,8 @@ DRIVERS
 #endif
 #include "../gfx/gfx_animation.c"
 #include "../gfx/gfx_display.c"
+#include "../gfx/gfx_instrument.c"
+#include "../gfx/gfx_surface.c"
 #include "../gfx/gfx_thumbnail.c"
 #include "../gfx/gfx_anim_preview.c"
 
@@ -1285,12 +1305,6 @@ FILE
 
 #include "../libretro-common/string/rstrtod.c"
 #include "../libretro-common/string/stdstring.c"
-#if defined(__linux__)
-#endif
-#if defined(HAVE_MMAP) && defined(BSD)
-#endif
-#if defined(HAVE_MMAP_WIN32)
-#endif
 
 /*============================================================
 MESSAGE
@@ -1448,6 +1462,7 @@ THREAD
 #endif
 
 #include "../libretro-common/rthreads/rthreads.c"
+#include "../libretro-common/rthreads/tpool.c"
 #include "../gfx/video_thread_wrapper.c"
 #include "../gfx/video_thread_hw.c"
 #include "../audio/audio_thread_wrapper.c"
@@ -1823,9 +1838,6 @@ ANDROID PLAY FEATURE DELIVERY
 /*============================================================
 FFMPEG
 ============================================================ */
-#ifdef HAVE_FFMPEG
-#include "../libretro-common/rthreads/tpool.c"
-#endif
 
 /*============================================================
 STEAM INTEGRATION USING MIST

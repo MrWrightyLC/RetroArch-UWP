@@ -190,8 +190,6 @@ typedef struct disp_widget_msg
 
    uint16_t flags;
    int8_t task_progress;
-   /* How many tasks have used this notification? */
-   uint8_t task_count;
    bool alternative_look;
 } disp_widget_msg_t;
 
@@ -200,11 +198,9 @@ typedef struct dispgfx_widget
 #ifdef HAVE_THREADS
    /* Serialises producer and consumer access to msg_queue.
     * Producers (gfx_widgets_msg_queue_push) can be called from
-    * any thread -- the threaded task system at libretro-common/
-    * queues/task_queue.c runs a worker thread, and several call
-    * paths reach the producer without holding any other lock
-    * (notably gfx/video_driver.c::video_driver_frame, which
-    * releases RUNLOOP_MSG_QUEUE_LOCK before the call).  The
+    * any thread, and no caller holds any other lock across the
+    * call (the runloop message queue is main-thread state with no
+    * lock at all; its off-main producers ride a deferral).  The
     * consumer is whichever thread owns the widgets: the threaded
     * video worker when it draws them, the main thread otherwise.
     * msg_queue_lock guards the pending ring (msg_queue[] /
@@ -229,6 +225,11 @@ typedef struct dispgfx_widget
     * when neither thread is in the widgets; a field of its own rather
     * than a bit in 'flags', which the main thread read-modify-writes
     * while the worker would read this. */
+   /* The video singleton's stable address, captured at
+    * gfx_widgets_init on the main thread before the draw worker
+    * exists: the worker's step and the state-lock dispatch reach
+    * ra-video state through this, never through the getter. */
+   void *video_st;
    bool worker;
 #endif
    /* Messages pushed but not yet on screen: a ring of pointers,
@@ -287,7 +288,6 @@ typedef struct dispgfx_widget
    unsigned msg_queue_icon_offset_y;
    unsigned msg_queue_scissor_start_x;
    unsigned msg_queue_default_rect_width;
-   unsigned msg_queue_regular_padding_x;
    unsigned msg_queue_regular_text_start;
    unsigned msg_queue_task_text_start_x;
    unsigned divider_width_1px;
@@ -495,6 +495,10 @@ void gfx_widget_set_cheevos_set_loading(bool visible);
 /* TODO/FIXME/WARNING: Not thread safe! */
 void gfx_widget_set_generic_message(
       const char *message, unsigned duration);
+void gfx_widget_set_generic_message_fixed(const char *prefix,
+      const char *name, const char *suffix, const char *slot,
+      unsigned duration);
+void gfx_widget_set_generic_message_progress(const char *label);
 void gfx_widget_set_libretro_message(
       const char *message, unsigned duration);
 void gfx_widget_set_progress_message(

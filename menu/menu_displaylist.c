@@ -9243,6 +9243,10 @@ unsigned menu_displaylist_build_list(
             static menu_displaylist_build_info_selective_t build_list[] = {
                {MENU_ENUM_LABEL_AUDIO_SYNC,                      PARSE_ONLY_BOOL,     true  },
                {MENU_ENUM_LABEL_AUDIO_THREADED_PIPELINE,         PARSE_ONLY_BOOL,     true  },
+#ifdef HAVE_THREADS
+               {MENU_ENUM_LABEL_AUDIO_TIME_STRETCH,              PARSE_ONLY_BOOL,     true  },
+               {MENU_ENUM_LABEL_AUDIO_TIME_STRETCH_LOWPASS,      PARSE_ONLY_BOOL,     true  },
+#endif
                {MENU_ENUM_LABEL_AUDIO_THREAD_PRIORITY,           PARSE_ONLY_BOOL,     true  },
 #ifdef HAVE_WASAPI
                /* Which way the thread's priority is asked for, so it
@@ -9297,6 +9301,7 @@ unsigned menu_displaylist_build_list(
             {MENU_ENUM_LABEL_AUDIO_REWIND_MUTE,               PARSE_ONLY_BOOL,  true },
             {MENU_ENUM_LABEL_AUDIO_FASTFORWARD_MUTE,          PARSE_ONLY_BOOL,  true },
             {MENU_ENUM_LABEL_AUDIO_FASTFORWARD_SPEEDUP,       PARSE_ONLY_BOOL,  true },
+            {MENU_ENUM_LABEL_AUDIO_FASTFORWARD_CALLBACK,      PARSE_ONLY_BOOL,  true },
 #if defined(HAVE_DSP_FILTER)
             {MENU_ENUM_LABEL_AUDIO_DSP_PLUGIN,                PARSE_ONLY_PATH,  true },
 #endif
@@ -9551,6 +9556,7 @@ unsigned menu_displaylist_build_list(
                {MENU_ENUM_LABEL_INPUT_HAPTIC_FEEDBACK_SETTINGS,        PARSE_ACTION,     true},
                {MENU_ENUM_LABEL_INPUT_MAX_USERS,                       PARSE_ONLY_UINT,  true},
                {MENU_ENUM_LABEL_INPUT_AUTO_MOUSE_GRAB,                 PARSE_ONLY_BOOL,  true},
+               {MENU_ENUM_LABEL_INPUT_JOYPAD_BACKGROUND,               PARSE_ONLY_BOOL,  true},
                {MENU_ENUM_LABEL_INPUT_AUTO_GAME_FOCUS,                 PARSE_ONLY_UINT,  true},
                {MENU_ENUM_LABEL_PAUSE_ON_DISCONNECT,                   PARSE_ONLY_BOOL,  true},
                {MENU_ENUM_LABEL_CONFIRM_QUIT,                          PARSE_ONLY_BOOL,  true},
@@ -9972,6 +9978,39 @@ unsigned menu_displaylist_build_list(
 
          break;
 #endif
+      case DISPLAYLIST_DROPDOWN_LIST_CRT_SUPER_RESOLUTION:
+         menu_entries_clear(list);
+         {
+            unsigned i;
+            settings_t *settings           = config_get_ptr();
+            unsigned current               = settings->uints.crt_switch_resolution_super;
+            static const unsigned values[] = { 0, 1, 1920, 2560, 3840 };
+            static const char * const names[] =
+               { "NATIVE", "DYNAMIC", "1920", "2560", "3840" };
+
+            for (i = 0; i < sizeof(values) / sizeof(values[0]); i++)
+            {
+               char val_d[16];
+               snprintf(val_d, sizeof(val_d), "%u", values[i]);
+               if (menu_entries_append(list,
+                        names[i],
+                        val_d,
+                        MENU_ENUM_LABEL_NO_ITEMS,
+                        MENU_SETTING_DROPDOWN_ITEM_CRT_SUPER_RESOLUTION,
+                        i, 0, NULL))
+                  count++;
+
+               if (values[i] == current)
+               {
+                  menu_file_list_cbs_t *cbs = (menu_file_list_cbs_t*)
+                     list->list[i].actiondata;
+                  if (cbs)
+                     cbs->checked           = true;
+                  menu_st->selection_ptr    = i;
+               }
+            }
+         }
+         break;
       case DISPLAYLIST_DROPDOWN_LIST_RESOLUTION:
          menu_entries_clear(list);
          {
@@ -12312,6 +12351,7 @@ unsigned menu_displaylist_build_list(
                {MENU_ENUM_LABEL_FPS_UPDATE_INTERVAL,                     PARSE_ONLY_UINT,  false },
                {MENU_ENUM_LABEL_FRAMECOUNT_SHOW,                         PARSE_ONLY_BOOL,  false },
                {MENU_ENUM_LABEL_STATISTICS_SHOW,                         PARSE_ONLY_BOOL,  false },
+               {MENU_ENUM_LABEL_STATISTICS_HIDE_IN_MENU,                 PARSE_ONLY_BOOL,  false },
                {MENU_ENUM_LABEL_MEMORY_SHOW,                             PARSE_ONLY_BOOL,  false },
                {MENU_ENUM_LABEL_MEMORY_UPDATE_INTERVAL,                  PARSE_ONLY_UINT,  false },
                {MENU_ENUM_LABEL_TIME_SHOW,                               PARSE_ONLY_UINT,  false },
@@ -12359,6 +12399,10 @@ unsigned menu_displaylist_build_list(
                      break;
                   case MENU_ENUM_LABEL_STATISTICS_SHOW:
                      build_list[i].checked = notifications_active && video_font_enable;
+                     break;
+                  case MENU_ENUM_LABEL_STATISTICS_HIDE_IN_MENU:
+                     build_list[i].checked = notifications_active && video_font_enable
+                        && settings->bools.video_statistics_show;
                      break;
 #ifdef HAVE_GFX_WIDGETS
 #ifdef HAVE_NETWORKING
@@ -13279,6 +13323,7 @@ unsigned menu_displaylist_build_list(
                {MENU_ENUM_LABEL_FASTFORWARD_FRAMESKIP,       PARSE_ONLY_BOOL,  true },
                {MENU_ENUM_LABEL_AUDIO_FASTFORWARD_MUTE,      PARSE_ONLY_BOOL,  true },
                {MENU_ENUM_LABEL_AUDIO_FASTFORWARD_SPEEDUP,   PARSE_ONLY_BOOL,  true },
+               {MENU_ENUM_LABEL_AUDIO_FASTFORWARD_CALLBACK,  PARSE_ONLY_BOOL,  true },
                {MENU_ENUM_LABEL_SLOWMOTION_RATIO,            PARSE_ONLY_FLOAT, true },
                {MENU_ENUM_LABEL_VRR_RUNLOOP_ENABLE,          PARSE_ONLY_BOOL,  true },
                {MENU_ENUM_LABEL_MENU_THROTTLE_FRAMERATE,     PARSE_ONLY_BOOL,  false},
@@ -13408,6 +13453,7 @@ unsigned menu_displaylist_build_list(
                {MENU_ENUM_LABEL_MENU_RGUI_THUMBNAIL_DELAY,                    PARSE_ONLY_UINT,   true},
                {MENU_ENUM_LABEL_MENU_THUMBNAIL_BACKGROUND_ENABLE,             PARSE_ONLY_BOOL,   true},
                {MENU_ENUM_LABEL_MENU_THUMBNAIL_PREVIEW_AUDIO,                 PARSE_ONLY_BOOL,   true},
+               {MENU_ENUM_LABEL_MENU_THUMBNAIL_PREVIEW_THREADS,               PARSE_ONLY_UINT,   true},
                {MENU_ENUM_LABEL_XMB_FONT,                                     PARSE_ONLY_PATH,   true},
                {MENU_ENUM_LABEL_OZONE_FONT,                                   PARSE_ONLY_PATH,   true},
                {MENU_ENUM_LABEL_OZONE_FONT_SCALE,                             PARSE_ONLY_UINT,   true},
@@ -16061,6 +16107,7 @@ static bool menu_displaylist_ctl_internal(
          case DISPLAYLIST_OPTIONS_CHEATS:
          case DISPLAYLIST_NETWORK_INFO:
          case DISPLAYLIST_DROPDOWN_LIST_RESOLUTION:
+         case DISPLAYLIST_DROPDOWN_LIST_CRT_SUPER_RESOLUTION:
          case DISPLAYLIST_DROPDOWN_LIST_PLAYLIST_DEFAULT_CORE:
          case DISPLAYLIST_DROPDOWN_LIST_PLAYLIST_LABEL_DISPLAY_MODE:
          case DISPLAYLIST_DROPDOWN_LIST_PLAYLIST_RIGHT_THUMBNAIL_MODE:
@@ -16150,6 +16197,7 @@ static bool menu_displaylist_ctl_internal(
 #endif
                   case DISPLAYLIST_ADD_CONTENT_LIST:
                   case DISPLAYLIST_DROPDOWN_LIST_RESOLUTION:
+                  case DISPLAYLIST_DROPDOWN_LIST_CRT_SUPER_RESOLUTION:
                   case DISPLAYLIST_DROPDOWN_LIST_PLAYLIST_DEFAULT_CORE:
                   case DISPLAYLIST_DROPDOWN_LIST_PLAYLIST_LABEL_DISPLAY_MODE:
                   case DISPLAYLIST_DROPDOWN_LIST_PLAYLIST_RIGHT_THUMBNAIL_MODE:

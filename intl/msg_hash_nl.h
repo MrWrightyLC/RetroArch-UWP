@@ -2493,7 +2493,6 @@ static const struct
    char s_79b8ce4a[72];
    char s_a1a8257e[119];
    char s_282f7955[108];
-   char s_d5231783[102];
    char s_a68d6d11[53];
    char s_74022c02[104];
    char s_8abad013[82];
@@ -2630,8 +2629,6 @@ static const struct
    char s_d9153542[53];
    char s_8e48ec69[44];
    char s_cd43c108[77];
-   char s_cd46e260[96];
-   char s_cd482ffe[94];
    char s_49336383[49];
    char s_e92351d4[142];
    char s_8e22cdce[49];
@@ -3381,7 +3378,6 @@ static const struct
    char s_261210b3[74];
    char s_3a4b246c[98];
    char s_2ceab671[153];
-   char s_977f8e82[101];
    char s_3c679f0a[287];
    char s_5b059407[142];
    char s_36033606[198];
@@ -6700,8 +6696,6 @@ static const struct
    " inhoud wordt geladen.",
    "Ga door deze opties heen om de horizontale instellingen aan te passen om de afbeeldingsgrootte t"
    "e wijzigen.",
-   "Alleen voor CRT-schermen. Pogingen om exacte core-/spelresolutie en verversingssnelheid te gebru"
-   "iken.",
    "Schakel tussen native en ultrabrede superresoluties.",
    "Gebruik indien nodig een aangepaste vernieuwingsfrequentie die is opgegeven in het configuratieb"
    "estand.",
@@ -6884,8 +6878,6 @@ static const struct
    "Slaat de staat op in het huidige geselecteerde slot.",
    "Maakt een afbeelding van de huidige inhoud.",
    "Houdt de huidige geselecteerde shader aan/uit wanneer toets wordt ingedrukt.",
-   "Laadt en past het volgende shader preset-bestand toe in de hoofdmap van de map 'Video Shaders'.",
-   "Laadt en past het vorige shader preset-bestand toe in de hoofdmap van de map 'Video Shaders'.",
    "Schakelt de huidig geselecteerde shader aan/uit.",
    "Maakt slow-motion mogelijk wanneer het knop is vastgehouden. Inhoud wordt op normale snelheid ui"
    "tgevoerd wanneer de sleutel wordt losgelaten.",
@@ -7932,8 +7924,6 @@ static const struct
    ".",
    "Sla een shader preset op die een link heeft naar de oorspronkelijk geladen voorinstelling en geb"
    "ruik alleen de door u aangebrachte parameterwijzigingen.",
-   "Open bestandsbrowser in de laatst gebruikte map bij het laden van shader-voorinstellingen en pas"
-   "ses.",
    "WAARSCHUWING: Snelle knipperen kan afbeeldingen in sommige schermen inbranden. Gebruik op eigen "
    "risico // Simuleert een standaard scanlijn over meerdere sub-frames door het scherm verticaal te"
    " verdelen en elk deel van het scherm weer te geven afhankelijk van hoeveel sub-frames er zijn.",
@@ -8575,7 +8565,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_nl_blob_check[
-      (sizeof(msg_hash_nl_blob) == (174222u
+      (sizeof(msg_hash_nl_blob) == (173829u
 #ifdef ANDROID
        + 375u
 #endif
@@ -11460,7 +11450,6 @@ static const uint32_t msg_hash_nl_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCHRES_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_HIRES_MENU,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_PORCH_ADJUST,
-   (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_SUPER,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_USE_CUSTOM_REFRESH_RATE,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_VERTICAL_ADJUST,
@@ -11597,8 +11586,6 @@ static const uint32_t msg_hash_nl_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SAVE_STATE_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SCREENSHOT,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_HOLD,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_NEXT,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_PREV,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_TOGGLE,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_HOLD_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_KEY,
@@ -12348,7 +12335,6 @@ static const uint32_t msg_hash_nl_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_GLOBAL,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_PARENT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_REFERENCE,
-   (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_REMEMBER_LAST_DIR,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_SUBFRAMES,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHARED_CONTEXT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SMOOTH,

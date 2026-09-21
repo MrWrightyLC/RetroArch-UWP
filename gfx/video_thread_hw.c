@@ -33,9 +33,11 @@
 #endif
 #ifdef HAVE_D3D12
 #include <libretro_d3d12.h>
+#include "common/d3d12_hw_interface.h"
 #endif
 #ifdef HAVE_D3D11
 #include <libretro_d3d11.h>
+#include "common/d3d11_hw_interface.h"
 #endif
 
 #if defined(HAVE_VULKAN) || defined(HAVE_D3D12) || defined(HAVE_D3D11) \
@@ -67,6 +69,22 @@ typedef struct
     * publish; after that the core may do what it likes with its own. */
    const void      *texture;
    unsigned         format;
+   /* Version 2 (set_texture_fenced): the driver reads the core's own
+    * texture, once `fence` has reached `value`; nothing is copied. The
+    * slot holds a reference to both until it is handed over again. */
+   ID3D12Resource  *v2_texture;
+   ID3D12Fence     *v2_fence;
+   UINT64           v2_value;
+   bool             v2;
+#endif
+#ifdef HAVE_D3D11
+   /* Direct3D 11, interface version 2: the texture the core named with
+    * set_texture for this frame. Not referenced: the driver copies it at
+    * publish, inside the video_refresh the core called with it. */
+   ID3D11Texture2D *d3d11_texture;
+   /* Version 3: the texture is the core's own and is read directly. The
+    * slot holds a reference from publish until it is handed over again. */
+   ID3D11Texture2D *d3d11_direct;
 #endif
    void            *fence;
    /* The video thread has driven the driver with this slot and its
@@ -104,6 +122,15 @@ typedef struct
     * the proxy in front of the core's deferred context. Both from
     * hw_ring_context_new. */
    void *core_ctx;
+   /* Direct3D 11, interface version 2: the core holds the immediate
+    * context, by taking turns with the driver; there is no core_ctx.
+    * Version 3 on top of that: frames are not copied into the slots. */
+   bool  d3d11_v2;
+   /* The interface version last reported in the log. A core may ask for
+    * the interface more than once - when it first needs the context, and
+    * again when it builds its device - and gets the same answer each
+    * time; the log says it once per ring, or again if it ever changed. */
+   unsigned logged_version;
    const struct retro_hw_render_interface *real;
    hw_slot_t slot[VIDEO_THREAD_HW_RING];
    /* The core's current sync index: the slot it is rendering into.
@@ -264,7 +291,46 @@ static void hw_set_signal_semaphore(void *handle, VkSemaphore semaphore)
 #endif /* VIDEO_THREAD_HW_ANY */
 
 /* --- Direct3D 12: the core's side, main thread ------------------------ */
+#if defined(HAVE_D3D11) || defined(HAVE_D3D12)
+/* --- slots that are the core's own texture -----------------------------
+ * libretro_d3d12.h version 2 and libretro_d3d11.h version 3: nothing is
+ * copied into the slot, the driver reads the core's texture itself. */
+
+/* Under thr->lock: whether a frame the video thread is drawing, or has
+ * yet to claim, names ring slot i. The pending frame is tail, both are
+ * pending at two, and the one being drawn is tail ^ 1. */
+static bool hw_slot_queued(const thread_video_t *thr, unsigned i)
+{
+   unsigned w;
+   for (w = 0; w < 2; w++)
+   {
+      if (thr->frame.slot[w].hw_slot != (int)i)
+         continue;
+      if (     thr->frame.pending == 2
+            || (thr->frame.pending == 1 && w == thr->frame.tail)
+            || (thr->frame.busy && w == (thr->frame.tail ^ 1)))
+         return true;
+   }
+   return false;
+}
+
+/* The wait itself, for any slot that is the core's own texture. */
+static void hw_wait_queued(hw_ring_t *ring, unsigned i, bool locked)
+{
+   thread_video_t *thr = ring->thr;
+   if (!locked)
+      slock_lock(thr->lock);
+   while (hw_slot_queued(thr, i))
+      scond_wait(thr->cond_ring, thr->lock);
+   if (!locked)
+      slock_unlock(thr->lock);
+}
+#endif
+
 #ifdef HAVE_D3D12
+static void hw_d3d12_slot_release_v2(hw_slot_t *s);
+static void hw_d3d12_wait_queued(hw_ring_t *ring, unsigned i, bool locked);
+
 static void hw_d3d12_set_texture(void *handle, ID3D12Resource *texture,
       DXGI_FORMAT format)
 {
@@ -275,8 +341,164 @@ static void hw_d3d12_set_texture(void *handle, ID3D12Resource *texture,
    s          = &ring->slot[ring->index];
    s->texture = texture;
    s->format  = (unsigned)format;
+   /* A version 1 handoff, whatever the slot carried before. */
+   if (s->v2)
+   {
+      hw_d3d12_wait_queued(ring, ring->index, false);
+      hw_wait_slot(ring, ring->index);
+      hw_d3d12_slot_release_v2(s);
+   }
+}
+
+/* --- Direct3D 12, interface version 2 ----------------------------------
+ * The core keeps one present texture per ring slot and says when each is
+ * complete; the wrapper says when it is done with it. No copy. */
+
+/* The slot's fence says the video thread has driven the driver with the
+ * slot and the GPU is done. It says nothing until then: a frame that is
+ * queued but not yet claimed, or claimed and still being recorded, has
+ * armed no fence. With a copy per slot that window costs nothing - the
+ * copy is simply replaced by a newer one. With version 2 the slot IS the
+ * core's texture, and a core let back in during that window draws into
+ * a texture the frame about to be recorded will read. So for version 2
+ * the wait covers the window too: until no queued frame names the slot.
+ * The video thread broadcasts cond_ring when it claims a frame and when
+ * it finishes one. */
+static void hw_d3d12_wait_queued(hw_ring_t *ring, unsigned i, bool locked)
+{
+   thread_video_t *thr = ring->thr;
+   if (!ring->slot[i].v2)
+      return;
+   hw_wait_queued(ring, i, locked);
+}
+
+
+static void hw_d3d12_slot_release_v2(hw_slot_t *s)
+{
+   if (s->v2_texture)
+      s->v2_texture->lpVtbl->Release(s->v2_texture);
+   if (s->v2_fence)
+      s->v2_fence->lpVtbl->Release(s->v2_fence);
+   s->v2_texture = NULL;
+   s->v2_fence   = NULL;
+   s->v2_value   = 0;
+   s->v2         = false;
+}
+
+static unsigned hw_d3d12_get_sync_index(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   return ring ? ring->index : 0;
+}
+
+static unsigned hw_d3d12_get_sync_index_mask(void *handle)
+{
+   (void)handle;
+   return (1u << VIDEO_THREAD_HW_RING) - 1;
+}
+
+static void hw_d3d12_wait_sync_index(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   if (!ring)
+      return;
+   hw_d3d12_wait_queued(ring, ring->index, false);
+   hw_wait_slot(ring, ring->index);
+}
+
+/* Main thread. The slot's previous frame is done with - the core called
+ * wait_sync_index, and publish waited the slot before moving onto it -
+ * so its references can go. */
+static void hw_d3d12_set_texture_fenced(void *handle, ID3D12Resource *texture,
+      DXGI_FORMAT format, ID3D12Fence *fence, UINT64 value)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   hw_slot_t *s;
+   if (!ring)
+      return;
+   s = &ring->slot[ring->index];
+   hw_d3d12_wait_queued(ring, ring->index, false);
+   hw_wait_slot(ring, ring->index);
+   hw_d3d12_slot_release_v2(s);
+   if (!texture)
+      return;
+   texture->lpVtbl->AddRef(texture);
+   if (fence)
+      fence->lpVtbl->AddRef(fence);
+   s->v2_texture = texture;
+   s->v2_fence   = fence;
+   s->v2_value   = value;
+   s->format     = (unsigned)format;
+   s->v2         = true;
 }
 #endif /* HAVE_D3D12 */
+
+#ifdef HAVE_D3D11
+/* --- Direct3D 11, interface version 2 ----------------------------------
+ * The lock is the driver's, and so is what it reports; the ring only
+ * stands where the core expects its handle and remembers the frame. */
+
+static bool hw_d3d11_lock_context(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   const struct retro_hw_render_interface_d3d11 *real = ring
+      ? (const struct retro_hw_render_interface_d3d11*)ring->real : NULL;
+   return real ? real->lock_context(real->handle) : false;
+}
+
+static void hw_d3d11_unlock_context(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   const struct retro_hw_render_interface_d3d11 *real = ring
+      ? (const struct retro_hw_render_interface_d3d11*)ring->real : NULL;
+   if (real)
+      real->unlock_context(real->handle);
+}
+
+static void hw_d3d11_set_texture(void *handle, ID3D11Texture2D *texture)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   if (ring)
+      ring->slot[ring->index].d3d11_texture = texture;
+}
+
+/* --- Direct3D 11, interface version 3 ----------------------------------
+ * The core keeps a present texture per ring slot, the driver reads it
+ * where it used to read the slot's copy, and the core waits here before
+ * it draws into one again. */
+
+static void hw_d3d11_slot_release_direct(hw_slot_t *s)
+{
+   if (s->d3d11_direct)
+      s->d3d11_direct->lpVtbl->Release(s->d3d11_direct);
+   s->d3d11_direct = NULL;
+}
+
+static unsigned hw_d3d11_get_sync_index(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   return ring ? ring->index : 0;
+}
+
+static unsigned hw_d3d11_get_sync_index_mask(void *handle)
+{
+   (void)handle;
+   return (1u << VIDEO_THREAD_HW_RING) - 1;
+}
+
+/* Until no queued frame names the slot, and the video thread has issued
+ * its read of the one that did: see hw_wait_queued. The slot's fence is
+ * a CPU event the video thread sets once its frame call has returned,
+ * and on one context that is all "done" has to mean. */
+static void hw_d3d11_wait_sync_index(void *handle)
+{
+   hw_ring_t *ring = hw_ring_of(handle);
+   if (!ring)
+      return;
+   hw_wait_queued(ring, ring->index, false);
+   hw_wait_slot(ring, ring->index);
+}
+#endif /* HAVE_D3D11 */
 
 /* --- the wrapper's side ---------------------------------------------- */
 
@@ -367,6 +589,30 @@ bool video_thread_get_hw_render_interface(void *data,
          ring->iface.d3d12             = *(const struct retro_hw_render_interface_d3d12*)real;
          ring->iface.d3d12.handle      = thr;
          ring->iface.d3d12.set_texture = hw_d3d12_set_texture;
+         /* Version 2 for a core that asked for it, and only if the
+          * driver can take the core's texture as it is. Everything the
+          * struct copy above brought along from the driver's own version
+          * 2 is replaced: the ring answers for the sync index. */
+         ring->iface.d3d12.interface_version   = RETRO_HW_RENDER_INTERFACE_D3D12_VERSION;
+         ring->iface.d3d12.get_sync_index      = NULL;
+         ring->iface.d3d12.get_sync_index_mask = NULL;
+         ring->iface.d3d12.wait_sync_index     = NULL;
+         ring->iface.d3d12.set_texture_fenced  = NULL;
+         if (     thr->poke->hw_ring_install
+               && d3d12_hw_interface_negotiated_version()
+                  >= RETRO_HW_RENDER_INTERFACE_D3D12_VERSION_2)
+         {
+            ring->iface.d3d12.interface_version   = RETRO_HW_RENDER_INTERFACE_D3D12_VERSION_2;
+            ring->iface.d3d12.get_sync_index      = hw_d3d12_get_sync_index;
+            ring->iface.d3d12.get_sync_index_mask = hw_d3d12_get_sync_index_mask;
+            ring->iface.d3d12.wait_sync_index     = hw_d3d12_wait_sync_index;
+            ring->iface.d3d12.set_texture_fenced  = hw_d3d12_set_texture_fenced;
+            if (ring->logged_version != RETRO_HW_RENDER_INTERFACE_D3D12_VERSION_2)
+            {
+               ring->logged_version = RETRO_HW_RENDER_INTERFACE_D3D12_VERSION_2;
+               RARCH_LOG("[Video] Threaded video: D3D12 hardware render interface version 2, no frame copy.\n");
+            }
+         }
          *iface = (const struct retro_hw_render_interface*)&ring->iface.d3d12;
          return true;
 #endif
@@ -377,6 +623,41 @@ bool video_thread_get_hw_render_interface(void *data,
             return false;
          if (!hw_ring_setup(thr, &ring))
             return false;
+         /* hw_ring_install is how the texture is handed over without a
+          * copy, which is all version 2 is; without it the core gets
+          * version 1. */
+         if (     thr->poke->hw_ring_install
+               && ((const struct retro_hw_render_interface_d3d11*)real)->interface_version
+                  >= RETRO_HW_RENDER_INTERFACE_D3D11_VERSION_2
+               && d3d11_hw_interface_negotiated_version()
+                  >= RETRO_HW_RENDER_INTERFACE_D3D11_VERSION_2)
+         {
+            /* Version 2: the core gets the immediate context itself and
+             * takes turns on it with the driver. No deferred context, no
+             * proxy, no command list to replay - and everything a
+             * deferred context cannot do, reading back above all, works. */
+            ring->api                          = HW_API_D3D11;
+            ring->real                         = real;
+            ring->d3d11_v2                     = true;
+            ring->iface.d3d11                  = *(const struct retro_hw_render_interface_d3d11*)real;
+            ring->iface.d3d11.handle           = thr;
+            ring->iface.d3d11.lock_context     = hw_d3d11_lock_context;
+            ring->iface.d3d11.unlock_context   = hw_d3d11_unlock_context;
+            ring->iface.d3d11.set_texture      = hw_d3d11_set_texture;
+            ring->iface.d3d11.interface_version   = RETRO_HW_RENDER_INTERFACE_D3D11_VERSION_2;
+            ring->iface.d3d11.get_sync_index      = hw_d3d11_get_sync_index;
+            ring->iface.d3d11.get_sync_index_mask = hw_d3d11_get_sync_index_mask;
+            ring->iface.d3d11.wait_sync_index     = hw_d3d11_wait_sync_index;
+            *iface = (const struct retro_hw_render_interface*)&ring->iface.d3d11;
+            if (ring->logged_version != ring->iface.d3d11.interface_version)
+            {
+               ring->logged_version = ring->iface.d3d11.interface_version;
+               RARCH_LOG("[Video] Threaded video: D3D11 hardware render interface version %u, the core keeps the immediate context%s.\n",
+                     ring->iface.d3d11.interface_version,
+                     ", no frame copy");
+            }
+            return true;
+         }
          if (!ring->core_ctx
                && !thr->poke->hw_ring_context_new(thr->driver_data, &ring->core_ctx))
             return false;
@@ -388,6 +669,11 @@ bool video_thread_get_hw_render_interface(void *data,
          ring->iface.d3d11         = *(const struct retro_hw_render_interface_d3d11*)real;
          ring->iface.d3d11.handle  = thr;
          ring->iface.d3d11.context = (ID3D11DeviceContext*)ring->core_ctx;
+         /* Version 1, whatever the driver's own interface says. */
+         ring->iface.d3d11.interface_version = RETRO_HW_RENDER_INTERFACE_D3D11_VERSION;
+         ring->iface.d3d11.lock_context      = NULL;
+         ring->iface.d3d11.unlock_context    = NULL;
+         ring->iface.d3d11.set_texture       = NULL;
          *iface = (const struct retro_hw_render_interface*)&ring->iface.d3d11;
          return true;
 #endif
@@ -460,7 +746,24 @@ int video_thread_hw_publish(thread_video_t *thr)
       /* Close the core's recording into the slot; the slot must not be
        * mid-replay on the video thread. */
       hw_wait_slot(ring, published);
-      if (!thr->poke->hw_ring_capture(thr->driver_data, published,
+      if (ring->d3d11_v2)
+      {
+         /* Version 2: the driver copies the texture the core named into
+          * the slot, now, on the immediate context the core's thread
+          * holds the lock for. */
+         hw_slot_t *s            = &ring->slot[published];
+         ID3D11Texture2D *texture = s->d3d11_texture;
+         s->d3d11_texture        = NULL;
+         if (!texture)
+            return -1;
+         /* Nothing to do with the texture on this thread but keep it
+          * alive. The core waited for this slot before it drew into the
+          * texture, so what the slot held is free. */
+         hw_d3d11_slot_release_direct(s);
+         texture->lpVtbl->AddRef(texture);
+         s->d3d11_direct = texture;
+      }
+      else if (!thr->poke->hw_ring_capture(thr->driver_data, published,
                ring->core_ctx, 0))
          return -1;
    }
@@ -479,7 +782,14 @@ int video_thread_hw_publish(thread_video_t *thr)
        * the video thread first. */
       hw_slot_t *s = &ring->slot[published];
       hw_wait_slot(ring, published);
-      if (!s->texture || !thr->poke->hw_ring_capture(thr->driver_data,
+      if (s->v2)
+      {
+         /* Version 2: nothing to do on this thread. The video thread
+          * reads the core's texture itself, behind the core's fence. */
+         if (!s->v2_texture)
+            return -1;
+      }
+      else if (!s->texture || !thr->poke->hw_ring_capture(thr->driver_data,
                published, s->texture, s->format))
          return -1;
    }
@@ -487,6 +797,15 @@ int video_thread_hw_publish(thread_video_t *thr)
    ring->index = (ring->index + 1) % VIDEO_THREAD_HW_RING;
    /* The slot the core fills next was last driven two frames ago;
     * normally long done, and if not this is where the core waits. */
+#ifdef HAVE_D3D12
+   /* Called from video_thread_frame() with thr->lock held. */
+   if (ring->api == HW_API_D3D12)
+      hw_d3d12_wait_queued(ring, ring->index, true);
+#endif
+#ifdef HAVE_D3D11
+   if (ring->api == HW_API_D3D11 && ring->d3d11_v2)
+      hw_wait_queued(ring, ring->index, true);
+#endif
    hw_wait_slot(ring, ring->index);
    return (int)published;
 }
@@ -511,12 +830,26 @@ void video_thread_hw_before_frame(thread_video_t *thr, int hw_slot)
 #endif
 #ifdef HAVE_D3D12
       case HW_API_D3D12:
-         thr->poke->hw_ring_present_slot(thr->driver_data, (unsigned)hw_slot);
+      {
+         hw_slot_t *s = &ring->slot[hw_slot];
+         if (s->v2)
+         {
+            d3d12_hw_ring_frame_t f;
+            f.texture = s->v2_texture;
+            f.format  = (DXGI_FORMAT)s->format;
+            f.fence   = s->v2_fence;
+            f.value   = s->v2_value;
+            thr->poke->hw_ring_install(thr->driver_data, &f, NULL, 0, 0, NULL, 0);
+         }
+         else
+            thr->poke->hw_ring_present_slot(thr->driver_data, (unsigned)hw_slot);
          break;
+      }
 #endif
 #ifdef HAVE_D3D11
       case HW_API_D3D11:
-         thr->poke->hw_ring_present_slot(thr->driver_data, (unsigned)hw_slot);
+         thr->poke->hw_ring_install(thr->driver_data,
+               ring->slot[hw_slot].d3d11_direct, NULL, 0, 0, NULL, 0);
          break;
 #endif
       case HW_API_GL:
@@ -564,6 +897,15 @@ void video_thread_hw_free(thread_video_t *thr)
 #ifdef HAVE_VULKAN
       free(s->semaphores);
       free(s->cmd);
+#endif
+#ifdef HAVE_D3D12
+      /* The references a version 2 handoff took. */
+      if (ring->api == HW_API_D3D12)
+         hw_d3d12_slot_release_v2(s);
+#endif
+#ifdef HAVE_D3D11
+      if (ring->api == HW_API_D3D11)
+         hw_d3d11_slot_release_direct(s);
 #endif
    }
    if (ring->core_ctx && thr->poke && thr->poke->hw_ring_context_free)

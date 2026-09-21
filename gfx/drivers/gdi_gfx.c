@@ -3167,7 +3167,7 @@ static bool gdi_alive(void *data)
    gdi_t *gdi           = (gdi_t*)data;
 
    /* Read from local bookkeeping rather than video_st (which would
-    * acquire context_lock + display_lock).  gdi->full_{width,height}
+    * cross threads needlessly).  gdi->full_{width,height}
     * is written at every set_size call site in this driver. */
    temp_width  = gdi->full_width;
    temp_height = gdi->full_height;
@@ -3837,6 +3837,7 @@ static void gdi_overlays_render(gdi_t *gdi,
 static const video_overlay_interface_t gdi_overlay_interface = {
    gdi_overlay_enable,
    gdi_overlay_load,
+   NULL, /* load_textures */
    gdi_overlay_tex_geom,
    gdi_overlay_vertex_geom,
    gdi_overlay_full_screen,

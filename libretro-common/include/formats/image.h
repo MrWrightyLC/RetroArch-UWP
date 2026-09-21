@@ -145,6 +145,10 @@ enum image_type_enum image_texture_get_type(const char *path);
 bool image_texture_load_buffer(struct texture_image *img,
    enum image_type_enum type, void *s, size_t len);
 
+/* ->pix10 is an ask on the way in and an answer on the way out: set
+ * it before the call to have a decoder that can emit XRGB2101010 do
+ * so, and read it after to find out whether it did. Clear on entry
+ * means the ordinary 8-bit image, as before. */
 bool image_texture_load(struct texture_image *img, const char *path);
 
 /* image_texture_load with an abort hook: both decode stages are
@@ -306,6 +310,31 @@ const uint32_t *image_transfer_anim_stream_next(void *stream,
  * caller must keep converting. */
 bool image_transfer_anim_stream_set_argb(void *stream,
       enum image_type_enum type, int argb);
+
+/* Ask the stream to decode its frames straight into @out (width *
+ * height words of the caller's), which image_transfer_anim_stream_next
+ * then returns, instead of into a frame of its own that the caller
+ * would copy from. NULL restores the stream's own frame. Returns true
+ * when the stream type does so (WEBM, MP4: the blit out of the
+ * decoder's planes has one destination either way); false for APNG
+ * and WEBP, whose frames are composed on a persistent canvas, where
+ * the caller keeps copying. @out must stay valid until the next call
+ * that decodes has returned. */
+bool image_transfer_anim_stream_set_output(void *stream,
+      enum image_type_enum type, uint32_t *out);
+
+/* Have the stream convert each decoded frame to pixels in @bands row
+ * bands on @pool (an rthreads tpool_t with at least bands - 1 threads;
+ * the decoding thread takes one band and joins the rest), so a large
+ * frame's colour conversion is spread over cores, and decode a VP9
+ * frame's tile columns on the same threads where the stream carries
+ * more than one. NULL or bands <= 1 keeps all of it on the decoding
+ * thread as before. Returns true for the
+ * stream types that convert this way (WEBM, MP4); APNG and WEBP
+ * compose their frames and have no such pass. The pool is the
+ * caller's and must outlive every decode made while it is set. */
+bool image_transfer_anim_stream_set_blit_pool(void *stream,
+      enum image_type_enum type, void *pool, unsigned bands);
 
 /* For decoding a still from a file whose read is still in progress:
  * declare how many leading bytes of the buffer are valid.  Monotonic.

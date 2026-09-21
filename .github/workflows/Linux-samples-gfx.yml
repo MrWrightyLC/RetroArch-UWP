@@ -20,6 +20,61 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
+  video-thread-state:
+    name: The video thread reads its snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Tree check
+        shell: bash
+        run: |
+          set -eu
+          # The main thread builds a video_frame_info_t and hands it
+          # over; a driver that reaches back into config_get_ptr() from
+          # frame() or present_last() reads settings the main thread
+          # may be writing. TSan found one of those in the null driver
+          # rather than anyone noticing it by reading, so this looks
+          # for the rest: it walks what those two entry points call
+          # and fails on live-state access it can reach. The drivers
+          # for platforms with no video thread are listed in the
+          # checker with that reason, and the list has to shrink when
+          # one of them stops doing it.
+          python3 tools/video_thread_state_check.py
+
+  surface-requirements:
+    name: Producers ask the surface layer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Self-test
+        shell: bash
+        run: |
+          set -eu
+          # A producer outside the allowlist that reads the video flags
+          # directly must be caught, and so must an entry whose file has
+          # stopped reading them - the second is what makes the list
+          # shrink as producers migrate instead of sitting there.
+          python3 tools/surface_requirements_check.py --selftest
+
+      - name: Tree check
+        shell: bash
+        run: |
+          set -eu
+          # What a producer should emit is the surface layer's answer
+          # (gfx_surface_query_requirements), so a decoder has one place
+          # to ask rather than three unrelated flags to know about. The
+          # files still asking directly are listed in the checker and
+          # are migrated one at a time; a new one may not join them.
+          python3 tools/surface_requirements_check.py
+
   samples-gfx:
     name: Build and run samples/gfx
     runs-on: ubuntu-latest
@@ -259,6 +314,42 @@ jobs:
           test -x slang_texture_index_bounds_test
           timeout 60 ./slang_texture_index_bounds_test
           echo "[pass] slang_texture_index_bounds_test"
+
+      - name: Build and run shader_dir_cycle_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/shader_dir_cycle
+        run: |
+          set -eu
+          # Which folder the Next/Previous Shader hotkeys cycle, over a
+          # shader tree built on disk, with gfx/video_shader_parse.c
+          # compiled for real and only the frontend stubbed.
+          #
+          # The folder is chosen from the loaded preset, and the cases
+          # that decide it are all shapes the menu itself writes:
+          # retroarch.slangp and the core auto preset are simple
+          # presets (#reference), so they stand in for what they point
+          # at, while a preset the user loaded as itself anchors where
+          # it sits however it is written - "Save Preset As" emits a
+          # #reference too, and following those would cycle a preset's
+          # source folder instead of the folder it was saved into.
+          #
+          # Two orderings are what this pins.  Following a reference
+          # one hop further than the wrapper puts the cycling in a
+          # folder the user never loaded from; and re-deriving the
+          # anchor from a preset the hotkey itself just applied walks
+          # back to whatever that preset references, so an entry that
+          # is a simple preset traps the cycling on the pair forever.
+          # The setting is also toggled mid-run: the list is built
+          # under one value and must be dropped when it changes, or
+          # turning it on never leaves the root it was cycling.
+          make clean all SANITIZER=address,undefined
+          test -x shader_dir_cycle_test
+          # The tree is built under a scratch dir, never in the repo.
+          T=$(mktemp -d)
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+             timeout 60 ./shader_dir_cycle_test "$T"
+          rm -rf "${T:?}"
+          echo "[pass] shader_dir_cycle_test"
 
       - name: Build and run vulkan_mailbox_init_leak_test (ASan + LSan)
         shell: bash
@@ -635,6 +726,50 @@ jobs:
           pkill openbox || true
           sudo kill "$XORG_PID" || true
 
+      - name: D3D11 hardware ring under threaded video (mingw + Wine, headless)
+        shell: bash
+        run: |
+          set -o pipefail
+          # The threaded wrapper hands a D3D11 hardware core a deferred
+          # context and replays its frames on the video thread. Nothing
+          # on Linux exercises that, and it shipped showing one frame
+          # and then black. The real proxy and the driver's own
+          # FinishCommandList argument, run under Wine, where wined3d
+          # implements deferred contexts over OpenGL. Requires the ring
+          # and the immediate context to show every frame, and the ring
+          # as it used to be to fail.
+          sudo apt-get install -y -qq xvfb > /dev/null
+          samples/gfx/d3d11_hw_ring/run.sh
+
+      - name: libretro_d3d11.h version 2, the contract run (mingw + Wine, headless)
+        shell: bash
+        run: |
+          set -o pipefail
+          # Version 2 of the D3D11 hardware render interface lets a core
+          # and a frontend that presents from another thread share the
+          # device's one immediate context by taking turns, so the core
+          # keeps everything a deferred context cannot do - reading back
+          # above all. This runs the two against each other on a real
+          # D3D11 device (wined3d), and requires every frame and every
+          # readback to be right, and a core that ignores what
+          # lock_context tells it to be caught.
+          sudo apt-get install -y -qq xvfb > /dev/null
+          REQUIRE_D3D11=1 samples/gfx/d3d11_hw_interface_v2/run.sh
+
+      - name: libretro_d3d12.h version 2, the contract run (mingw + Wine + vkd3d, headless)
+        shell: bash
+        run: |
+          set -o pipefail
+          # Version 2 of the D3D12 hardware render interface lets a core
+          # hand a frame to a frontend that presents from another thread
+          # without the copy version 1 forces. This runs a core and such a
+          # frontend against each other on a real D3D12 device - vkd3d
+          # over Mesa's software Vulkan driver - and requires every frame
+          # to arrive intact, and a core that ignores wait_sync_index to
+          # be caught.
+          sudo apt-get install -y -qq xvfb libvkd3d1 mesa-vulkan-drivers > /dev/null
+          REQUIRE_D3D12=1 samples/gfx/d3d12_hw_interface_v2/run.sh
+
       - name: Build and run display_servers_kms_test (ASan + UBSan)
         shell: bash
         working-directory: samples/gfx/display_servers_kms
@@ -690,6 +825,40 @@ jobs:
           test -x modeline_edid_parse_test
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
              timeout 60 ./modeline_edid_parse_test
+
+      - name: Build and run font_lifecycle_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/font_lifecycle
+        run: |
+          set -eu
+          # Where a font is created follows the threading hint; where
+          # it is REBUILT does not - a rebuild marshals whenever the
+          # wrapper is up, because a GL backend making its context
+          # current on the main thread while the video thread holds it
+          # is an X BadAccess. Nothing ran this sample, and it had the
+          # older rule written into it.
+          make clean all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 timeout 120 make check SANITIZER=address,undefined
+          make clean
+
+      - name: Build and run overlay_apng_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/gfx/overlay_apng
+        run: |
+          set -eu
+          # An animated overlay image is a surface with slots whose
+          # texture is updated in place, so the pages' handles stand
+          # while its frames advance. The sample builds its own APNG
+          # fixture and holds that contract: distinct frames, a pass
+          # that ends and replays, one texture across the submits, and
+          # a free with a frame still in flight.
+          make clean all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 timeout 120 ./overlay_apng_test fixtures/anim.png
+          make clean all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./overlay_apng_test fixtures/anim.png
+          make clean
 
       - name: Build and run gfx_thumbnail_anim_test (ASan + UBSan, TSan)
         shell: bash
@@ -750,27 +919,63 @@ jobs:
         working-directory: samples/cheevos/badge_cache
         run: |
           set -eu
-          # rcheevos_get_badge_texture() used to read, decode and
-          # upload a badge inline on the calling thread, at the moment
-          # an achievement popped during gameplay. It now posts the
-          # decode to the image task and the upload to the video
-          # thread, and hands the handle to the first caller after it
-          # lands. The test links the real cheevos/cheevos_badge.c
-          # with the task and upload stubbed as steppable queues and
-          # checks: nothing synchronous on the first ask, one decode
-          # per badge, the upload posted only from the decode's
-          # completion, the handle handed out exactly once and owned
-          # by the taker, locked and unlocked as separate keys, a
-          # missing file requesting a download only when asked, a
-          # failed decode or upload forgotten rather than stuck, a
-          # reset unloading ready handles and orphaning in-flight
-          # ones (their late delivery unloaded, never handed out),
-          # off-main-thread calls with no side effects, and a refused
-          # async upload treated as a failure.
+          # rcheevos_get_badge_texture() never reads, decodes or
+          # uploads on the calling thread, so the achievement widgets
+          # can ask from the video thread. The test links the real
+          # cheevos/cheevos_badge.c with the task and upload stubbed
+          # as steppable queues and checks: nothing synchronous on
+          # the first ask, one decode per badge, the upload posted
+          # only from the decode's completion, the handle handed out
+          # exactly once and owned by the taker, locked and unlocked
+          # as separate keys, a missing file requesting a download
+          # only when asked and loading when the download lands, a
+          # failed load not retried per ask, a reset unloading ready
+          # handles and orphaning in-flight ones (their late delivery
+          # unloaded, never handed to whatever reused the slot), an
+          # off-main-thread ask only recorded until the main thread's
+          # service starts it, the default badge lent rather than
+          # given, a 0 reported as a short wait only while a file on
+          # disk is loading, and a refused async upload treated as a
+          # failure.
           make clean all SANITIZER=address,undefined
           test -x badge_cache_test
           ASAN_OPTIONS=detect_leaks=1 timeout 60 ./badge_cache_test
           echo "[pass] badge_cache_test (ASan)"
+          make clean
+
+      - name: Build and run psp1_gfx_contracts_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/psp1_gfx_contracts
+        run: |
+          set -eu
+          # gfx/drivers/psp1_gfx.c is reached only by the griffin unity
+          # build for PSP, so nothing else here compiles it, let alone
+          # runs it. This links the real driver against a stand-in for
+          # the parts of the machine its correctness turns on: main RAM
+          # and VRAM each mapped twice so the cached and uncached
+          # aliases genuinely alias, a no-access page after VRAM so a
+          # blit off the end faults, display lists that stay the GE's
+          # until they are waited on, and a vblank sub-interrupt that
+          # can be fired from inside free().
+          #
+          # What it holds: the 24bpp BGR byte order video_driver.h
+          # specifies for read_viewport, filling the whole buffer the
+          # screenshot task hands over, releasing the interrupt handler
+          # before the driver struct it writes through, keeping the GE
+          # off a display list or framebuffer that is in use, both blits
+          # staying inside the buffers they target, cache-line ownership
+          # of everything the GE writes, and init failing cleanly when
+          # an allocation does.
+          make clean all SANITIZER=address,undefined
+          rc=0
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+             timeout 120 ./psp1_gfx_contracts_test || rc=$?
+          # 77: the runner would not hand over the PSP address windows.
+          if [ "$rc" = 77 ]; then
+             echo "[skip] PSP address windows unavailable"
+             exit 0
+          fi
+          [ "$rc" = 0 ]
           make clean
 
       - name: Build and run gfx_thumbnail_preview_test (ASan + UBSan, TSan)
@@ -885,6 +1090,18 @@ jobs:
              ./preview_audio_decode_test_norwebm fixtures/trailing_large.mp4 1024 island
              ./preview_audio_decode_test_norwebm fixtures/trailing_large.mp4 262144 island'
           echo "[pass] preview_audio_decode_test (ASan)"
+          # The threaded decode against the single-threaded one, frame
+          # for frame: the colour conversion in row bands on a pool,
+          # for the VP9 fixture (four tile columns) the columns decoded
+          # side by side, for the HEVC fixture (WPP) the CTB rows on a
+          # wavefront. Every frame must be byte-identical.
+          test -x preview_blit_bands_test
+          ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 timeout 300 bash -c '
+             ./preview_blit_bands_test fixtures/long_video.mp4
+             ./preview_blit_bands_test fixtures/vp9_tiles.webm
+             ./preview_blit_bands_test fixtures/hevc_wpp.mp4'
+          echo "[pass] preview_blit_bands_test (ASan)"
           # clean keeps fixtures/ by design; regenerate anyway so the
           # step cannot silently run against an empty glob.
           make clean all SANITIZER=thread
@@ -892,6 +1109,14 @@ jobs:
           TSAN_OPTIONS=halt_on_error=1:allocator_may_return_null=1 FRAMES=60 timeout 300 \
              ./gfx_thumbnail_preview_test fixtures/*.mp4 fixtures/anim_lossless.webp
           echo "[pass] gfx_thumbnail_preview_test (TSan)"
+          # The pool and the tile-column threads under TSan: the
+          # shared frame buffers and contexts are written in disjoint
+          # columns, the counts merged after the join.
+          TSAN_OPTIONS=halt_on_error=1:allocator_may_return_null=1 timeout 300 bash -c '
+             ./preview_blit_bands_test fixtures/long_video.mp4
+             ./preview_blit_bands_test fixtures/vp9_tiles.webm
+             ./preview_blit_bands_test fixtures/hevc_wpp.mp4'
+          echo "[pass] preview_blit_bands_test (TSan)"
           TSAN_OPTIONS=halt_on_error=1 timeout 600 bash -c '
              ./preview_audio_decode_test fixtures/trailing_large.mp4 1024 island
              ./preview_audio_decode_test fixtures/trailing_large.mp4 262144 island'

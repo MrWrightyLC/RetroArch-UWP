@@ -1,7 +1,10 @@
 CC = gcc
 ROOT = ../../..
 CPPFLAGS += -I$(ROOT)/libretro-common/include
-CFLAGS += -O2 -std=c89 -Wall -Wextra
+# -std=c89 is deliberate: the pipeline headers have to stay C89-clean.
+# _POSIX_C_SOURCE is what lets retro_timers.h still see struct timespec
+# and nanosleep under it, for the yield in the spin waits.
+CFLAGS += -O2 -std=c89 -Wall -Wextra -D_POSIX_C_SOURCE=199309L
 WRAP_LDFLAGS = -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free
 LDLIBS += -lm
 ifneq ($(SANITIZER),)
@@ -28,15 +31,15 @@ stretch_bench: stretch_bench.c $(ROOT)/audio/audio_stretch.c $(ROOT)/audio/audio
 	$(CC) $(CPPFLAGS) $(CFLAGS) stretch_bench.c $(ROOT)/audio/audio_stretch.c $(LDFLAGS) $(LDLIBS) -o $@
 bench: stretch_bench
 	./stretch_bench
-check: stretch_filter_test stretch_test stretch_src_test stretch_search_test stretch_canonical_test stretch_epoch_test stretch_pipeline_test resampler_reset_test
-	./stretch_filter_test
-	./stretch_test
-	./stretch_src_test
-	./stretch_search_test
-	./stretch_canonical_test
-	./stretch_epoch_test
-	./stretch_pipeline_test
-	./resampler_reset_test
+TESTS = stretch_filter_test stretch_test stretch_src_test stretch_search_test stretch_canonical_test stretch_epoch_test stretch_pipeline_test resampler_reset_test
+# Override with an empty TIMEOUT on hosts that lack coreutils timeout.
+TIMEOUT ?= timeout 600
+
+check: $(TESTS:%=run-%)
+
+run-%: %
+	@echo "=== $* ==="
+	$(TIMEOUT) ./$*
 stretch_filter_test: stretch_filter_test.c $(ROOT)/audio/audio_pipeline_stretch.c $(ROOT)/audio/audio_stretch.c $(ROOT)/audio/audio_speed_lpf.c $(ROOT)/audio/audio_pipeline_stretch.h $(ROOT)/audio/audio_pipeline_layout.h $(ROOT)/audio/audio_speed_lpf.h $(ROOT)/audio/audio_stretch.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) stretch_filter_test.c $(ROOT)/audio/audio_pipeline_stretch.c $(ROOT)/audio/audio_stretch.c $(ROOT)/audio/audio_speed_lpf.c $(ROOT)/libretro-common/queues/retro_spsc.c $(LDFLAGS) $(WRAP_LDFLAGS) $(LDLIBS) -o $@
 clean:

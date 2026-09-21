@@ -69,7 +69,6 @@
 #include "../video_thread_hw.h"
 #endif
 
-static bool gl2_hw_ring_expected(void);
 static bool gl2_core_context_is_mains(gl2_t *gl);
 
 #include "../font_driver.h"
@@ -2975,7 +2974,12 @@ bool gl2_load_luts(
 #ifdef HAVE_OVERLAY
 static void gl2_free_overlay(gl2_t *gl)
 {
-   glDeleteTextures(gl->overlays, gl->overlay_tex);
+   /* A page shown through load_textures holds the pack's names, which
+    * are the pack's to delete (input_overlay_release_textures) and are
+    * on the pack's other pages as well. */
+   if (gl->overlay_tex && !(gl->flags & GL2_FLAG_OVERLAY_BORROWED))
+      glDeleteTextures(gl->overlays, gl->overlay_tex);
+   gl->flags &= ~GL2_FLAG_OVERLAY_BORROWED;
 
    /* The three coordinate arrays are views into the overlay_tex block. */
    free(gl->overlay_tex);
@@ -2994,10 +2998,10 @@ static void gl2_overlay_vertex_geom(void *data,
    GLfloat *vertex = NULL;
    gl2_t *gl       = (gl2_t*)data;
 
-   if (!gl)
+   if (!gl || !gl->overlay_vertex_coord)
       return;
 
-   if (image > gl->overlays)
+   if (image >= gl->overlays)
    {
       RARCH_ERR("[GL] Invalid overlay id: %u\n", image);
       return;
@@ -3027,7 +3031,10 @@ static void gl2_overlay_tex_geom(void *data,
    GLfloat *tex = NULL;
    gl2_t *gl    = (gl2_t*)data;
 
-   if (!gl)
+   if (!gl || !gl->overlay_tex_coord)
+      return;
+
+   if (image >= gl->overlays)
       return;
 
    tex          = (GLfloat*)&gl->overlay_tex_coord[image * 8];
@@ -3266,15 +3273,6 @@ static bool gl2_shader_init(gl2_t *gl, const gfx_ctx_driver_t *ctx_driver,
 /* Whether the threaded wrapper's hardware ring will drive this driver:
  * decided at init, when the wrapper is already up, from the core's
  * context type and the setting. */
-static bool gl2_hw_ring_expected(void)
-{
-#ifdef HAVE_THREADS
-   return video_driver_thread_wrapper_active() && video_thread_hw_allowed();
-#else
-   return false;
-#endif
-}
-
 /* Whether the core's context belongs to the main thread: it does once
  * the wrapper's ring has taken it (the flag), and it will as soon as
  * the ring is set up (expected, from init on). Every place this
@@ -3285,7 +3283,13 @@ static bool gl2_hw_ring_expected(void)
  * a core with no current context, and no GL function resolved. */
 static bool gl2_core_context_is_mains(gl2_t *gl)
 {
-   return (gl->flags & GL2_FLAG_HW_RING) || gl2_hw_ring_expected();
+   /* Both bits are set on the video thread inside blocking command
+    * handlers (init, ring bring-up) while the main thread is parked
+    * in the wrapper's send-and-wait, and read here from the frame
+    * path. The live-settings consultation this replaces read
+    * settings->arrays.video_driver every frame from the video
+    * thread with the main thread running free. */
+   return (gl->flags & (GL2_FLAG_HW_RING | GL2_FLAG_HW_RING_EXPECTED)) != 0;
 }
 
 
@@ -4144,7 +4148,6 @@ static GLuint gl2_ui_target_fbo(gl2_t *gl)
  * a displayable SDR image in the ordinary way. */
 static void gl2_encode_pq_to_sdr(gl2_t *gl)
 {
-   settings_t *settings = config_get_ptr();
    static const float quad_pos[8] = {
       0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f
    };
@@ -4171,8 +4174,9 @@ static void gl2_encode_pq_to_sdr(gl2_t *gl)
    if (gl->scrgb.loc_ui_tex >= 0)
       glUniform1i(gl->scrgb.loc_ui_tex, 0);
    if (gl->scrgb.loc_nits >= 0)
-      glUniform1f(gl->scrgb.loc_nits, settings
-            ? gl->scrgb.paper_white_nits : 200.0f);
+      /* Driver-owned, latched by the HDR poke path: no live
+       * settings on the frame path. */
+      glUniform1f(gl->scrgb.loc_nits, gl->scrgb.paper_white_nits);
    if (gl->scrgb.loc_expand >= 0)
       glUniform1f(gl->scrgb.loc_expand, 0.0f);
    if (gl->scrgb.loc_mode >= 0)
@@ -5238,6 +5242,23 @@ static const gfx_ctx_driver_t *gl2_get_context(gl2_t *gl)
          && (hwr->context_type != RETRO_HW_CONTEXT_NONE))
       gl->flags                        |=  GL2_FLAG_SHARED_CONTEXT_USE;
 
+#ifdef HAVE_THREADS
+   /* Under the threaded wrapper a hardware core renders on the main
+    * thread while this driver draws on the video thread, so the core
+    * cannot borrow this driver's context the way it does unthreaded:
+    * it needs one of its own, shared with this one. That is the
+    * shared context, and gl2_hw_ring_context_new() refuses without
+    * it. It was only ever made when the setting or the core asked,
+    * so a core that did neither - the ffmpeg core is one - was sent
+    * into context_reset with no context at all: every GL function it
+    * looked up came back NULL on WGL, and it called the first one.
+    * glcore has always forced it for hardware cores. */
+   if (     (hwr->context_type != RETRO_HW_CONTEXT_NONE)
+         && video_driver_thread_wrapper_active()
+         && video_thread_hw_allowed())
+      gl->flags                        |=  GL2_FLAG_SHARED_CONTEXT_USE;
+#endif
+
    gfx_ctx = video_context_driver_init_first(gl,
          settings->arrays.video_context_driver,
          api, major, minor,
@@ -5416,6 +5437,15 @@ static void *gl2_init(const video_info_t *video,
 
    if (!gl || !ctx_driver)
       goto error;
+
+   /* Latched here, inside the wrapper's blocking CMD_INIT (the main
+    * thread is parked in send-and-wait, so the settings read is
+    * race-free), for every later gl2_core_context_is_mains() -
+    * including the frame path, where main runs free. */
+#ifdef HAVE_THREADS
+   if (video_driver_thread_wrapper_active() && video_thread_hw_allowed())
+      gl->flags |= GL2_FLAG_HW_RING_EXPECTED;
+#endif
 
    video_context_driver_set((const gfx_ctx_driver_t*)ctx_driver);
 
@@ -6193,11 +6223,57 @@ unsigned *height_p, size_t *pitch_p)
 #endif
 
 #ifdef HAVE_OVERLAY
-static bool gl2_overlay_load(void *data,
-      const void *image_data, unsigned num_images)
+/* The texture names and the vertex, texture and colour coordinate
+ * arrays of a page's images come out of one zeroed block, each region
+ * starting on a 64-byte boundary; overlay_tex owns it. Geometry starts
+ * as the whole screen, colour as opaque white. Names come from
+ * @textures when the page shows the pack's textures, else are made
+ * here for the upload that follows. */
+static bool gl2_overlay_alloc(gl2_t *gl, unsigned num_images,
+      const uintptr_t *textures)
 {
    size_t o_vertex, o_tex, o_color;
    unsigned i, j;
+
+   gl2_free_overlay(gl);
+   o_vertex = ((num_images * sizeof(GLuint)) + 63) & ~(size_t)63;
+   o_tex    = o_vertex + ((2 * 4 * num_images * sizeof(GLfloat) + 63) & ~(size_t)63);
+   o_color  = o_tex    + ((2 * 4 * num_images * sizeof(GLfloat) + 63) & ~(size_t)63);
+   gl->overlay_tex = (GLuint*)
+      calloc(1, o_color + 4 * 4 * num_images * sizeof(GLfloat));
+
+   if (!gl->overlay_tex)
+      return false;
+
+   gl->overlay_vertex_coord = (GLfloat*)((uint8_t*)gl->overlay_tex + o_vertex);
+   gl->overlay_tex_coord    = (GLfloat*)((uint8_t*)gl->overlay_tex + o_tex);
+   gl->overlay_color_coord  = (GLfloat*)((uint8_t*)gl->overlay_tex + o_color);
+
+   gl->overlays = num_images;
+   if (textures)
+   {
+      for (i = 0; i < num_images; i++)
+         gl->overlay_tex[i] = (GLuint)textures[i];
+      gl->flags |= GL2_FLAG_OVERLAY_BORROWED;
+   }
+   else
+      glGenTextures(num_images, gl->overlay_tex);
+
+   for (i = 0; i < num_images; i++)
+   {
+      gl2_overlay_tex_geom(gl, i, 0, 0, 1, 1);
+      gl2_overlay_vertex_geom(gl, i, 0, 0, 1, 1);
+      for (j = 0; j < 16; j++)
+         gl->overlay_color_coord[16 * i + j] = 1.0f;
+   }
+   return true;
+}
+
+static bool gl2_overlay_load(void *data,
+      const void *image_data, unsigned num_images)
+{
+   unsigned i;
+   bool ok;
    gl2_t *gl = (gl2_t*)data;
    const struct texture_image *images =
       (const struct texture_image*)image_data;
@@ -6208,54 +6284,37 @@ static bool gl2_overlay_load(void *data,
    if (gl->flags & GL2_FLAG_SHARED_CONTEXT_USE)
       gl->ctx_driver->bind_hw_render(gl->ctx_data, false);
 
-   gl2_free_overlay(gl);
-   /* The texture names and the vertex, texture and colour coordinate
-    * arrays of all overlay images come out of one zeroed block, each
-    * region starting on a 64-byte boundary; overlay_tex owns it. */
-   o_vertex = ((num_images * sizeof(GLuint)) + 63) & ~(size_t)63;
-   o_tex    = o_vertex + ((2 * 4 * num_images * sizeof(GLfloat) + 63) & ~(size_t)63);
-   o_color  = o_tex    + ((2 * 4 * num_images * sizeof(GLfloat) + 63) & ~(size_t)63);
-   gl->overlay_tex = (GLuint*)
-      calloc(1, o_color + 4 * 4 * num_images * sizeof(GLfloat));
-
-   if (!gl->overlay_tex)
+   if ((ok = gl2_overlay_alloc(gl, num_images, NULL)))
    {
-      if (     (gl->flags & GL2_FLAG_SHARED_CONTEXT_USE)
-            && !gl2_core_context_is_mains(gl))
-         gl->ctx_driver->bind_hw_render(gl->ctx_data, true);
-      return false;
-   }
+      for (i = 0; i < num_images; i++)
+      {
+         unsigned alignment = gl2_get_alignment(images[i].width
+               * sizeof(uint32_t));
 
-   gl->overlay_vertex_coord = (GLfloat*)((uint8_t*)gl->overlay_tex + o_vertex);
-   gl->overlay_tex_coord    = (GLfloat*)((uint8_t*)gl->overlay_tex + o_tex);
-   gl->overlay_color_coord  = (GLfloat*)((uint8_t*)gl->overlay_tex + o_color);
-
-   gl->overlays = num_images;
-   glGenTextures(num_images, gl->overlay_tex);
-
-   for (i = 0; i < num_images; i++)
-   {
-      unsigned alignment = gl2_get_alignment(images[i].width
-            * sizeof(uint32_t));
-
-      gl_load_texture_data(gl->overlay_tex[i],
-            RARCH_WRAP_EDGE, TEXTURE_FILTER_LINEAR,
-            alignment,
-            images[i].width, images[i].height, images[i].pixels,
-            sizeof(uint32_t));
-
-      /* Default. Stretch to whole screen. */
-      gl2_overlay_tex_geom(gl, i, 0, 0, 1, 1);
-      gl2_overlay_vertex_geom(gl, i, 0, 0, 1, 1);
-
-      for (j = 0; j < 16; j++)
-         gl->overlay_color_coord[16 * i + j] = 1.0f;
+         gl_load_texture_data(gl->overlay_tex[i],
+               RARCH_WRAP_EDGE, TEXTURE_FILTER_LINEAR,
+               alignment,
+               images[i].width, images[i].height, images[i].pixels,
+               sizeof(uint32_t));
+      }
    }
 
    if (     (gl->flags & GL2_FLAG_SHARED_CONTEXT_USE)
          && !gl2_core_context_is_mains(gl))
       gl->ctx_driver->bind_hw_render(gl->ctx_data, true);
-   return true;
+   return ok;
+}
+
+/* A page of the pack's textures: no upload, no GL call but the
+ * geometry setup. The names are gl2_load_texture's, valid on this
+ * context. */
+static bool gl2_overlay_load_textures(void *data,
+      const uintptr_t *textures, unsigned num_textures)
+{
+   gl2_t *gl = (gl2_t*)data;
+   if (!gl)
+      return false;
+   return gl2_overlay_alloc(gl, num_textures, textures);
 }
 
 static void gl2_overlay_enable(void *data, bool state)
@@ -6290,7 +6349,9 @@ static void gl2_overlay_set_alpha(void *data, unsigned image, float mod)
    GLfloat *color;
    gl2_t *gl = (gl2_t*)data;
 
-   if (!gl)
+   /* As the geometry setters: no page loaded is a NULL array, and an
+    * index off the end of the page is the neighbouring block. */
+   if (!gl || !gl->overlay_color_coord || image >= gl->overlays)
       return;
 
    color         = (GLfloat*)&gl->overlay_color_coord[image * 16];
@@ -6303,6 +6364,7 @@ static void gl2_overlay_set_alpha(void *data, unsigned image, float mod)
 static const video_overlay_interface_t gl2_overlay_interface = {
    gl2_overlay_enable,
    gl2_overlay_load,
+   gl2_overlay_load_textures,
    gl2_overlay_tex_geom,
    gl2_overlay_vertex_geom,
    gl2_overlay_full_screen,
@@ -6380,6 +6442,7 @@ typedef struct
 {
    gl2_t     *gl;
    void      *payload;
+   uintptr_t  handle;
 } gl2_texture_cmd_t;
 
 static uintptr_t video_texture_load_wrap_gl2_mipmap(void *data)
@@ -6484,6 +6547,58 @@ static void gl2_unload_texture(void *data,
 
    glid = (GLuint)id;
    glDeleteTextures(1, &glid);
+}
+
+/* Same-size, same-order contents into a texture gl2_load_texture made:
+ * the storage stays, glTexSubImage2D rewrites it. The pixel format is
+ * the one gl_load_texture_data chose from the driver's RGBA flag, so
+ * the caller's order is the order the texture was created with. */
+static void gl2_update_texture_internal(uintptr_t id,
+      const struct texture_image *ti)
+{
+   bool use_rgba = (video_driver_get_disp_flags() & VIDEO_FLAG_USE_RGBA);
+   glBindTexture(GL_TEXTURE_2D, (GLuint)id);
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ti->width, ti->height,
+         use_rgba ? GL_RGBA : RARCH_GL_TEXTURE_TYPE32,
+         RARCH_GL_FORMAT32, ti->pixels);
+}
+
+#ifdef HAVE_THREADS
+static uintptr_t video_texture_update_wrap_gl2(void *data)
+{
+   gl2_texture_cmd_t *cmd  = (gl2_texture_cmd_t*)data;
+   gl2_t             *gl   = cmd->gl;
+
+   if (gl && gl->ctx_driver->make_current)
+      gl->ctx_driver->make_current(false);
+
+   gl2_update_texture_internal((uintptr_t)cmd->handle,
+         (const struct texture_image*)cmd->payload);
+   return 1;
+}
+#endif
+
+static bool gl2_update_texture(void *video_data, uintptr_t id,
+      const struct texture_image *ti, bool threaded)
+{
+   if (!id || !ti || !ti->pixels)
+      return false;
+
+#ifdef HAVE_THREADS
+   if (threaded)
+   {
+      gl2_texture_cmd_t cmd;
+      cmd.gl      = (gl2_t*)video_data;
+      cmd.payload = (void*)ti;
+      cmd.handle  = id;
+      video_thread_texture_handle(&cmd, video_texture_update_wrap_gl2);
+      return true;
+   }
+#endif
+
+   gl2_update_texture_internal(id, ti);
+   return true;
 }
 
 static uint32_t gl2_get_flags(void *data)
@@ -6688,7 +6803,8 @@ static const video_poke_interface_t gl2_poke_interface = {
    gl2_hw_ring_present_slot,
    gl2_hw_ring_context_new,
    gl2_hw_ring_context_free,
-   gl2_hw_ring_framebuffer
+   gl2_hw_ring_framebuffer,
+   gl2_update_texture
 };
 
 static void gl2_get_poke_interface(void *data,

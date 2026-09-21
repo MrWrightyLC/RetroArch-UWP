@@ -63,8 +63,10 @@ void retro_reset(void) { }
 static int      harness_use_fb;
 static unsigned harness_fb_granted;
 
-void harness_core_use_framebuffer(int on) { harness_use_fb = on; }
-unsigned harness_core_fb_granted(void)   { return harness_fb_granted; }
+/* RETRO_API, like the core's own entry points: a Windows DLL exports
+ * only what is marked, and the harness looks these two up by name. */
+RETRO_API void harness_core_use_framebuffer(int on) { harness_use_fb = on; }
+RETRO_API unsigned harness_core_fb_granted(void)   { return harness_fb_granted; }
 
 void retro_run(void)
 {
@@ -80,7 +82,10 @@ void retro_run(void)
       memset(&fb, 0, sizeof(fb));
       fb.width        = W;
       fb.height       = H;
-      fb.access_flags = RETRO_MEMORY_ACCESS_WRITE;
+      /* Read as well as write, as a core that snapshots its frame
+       * for a wipe asks: the lend must not be refused for it. */
+      fb.access_flags = RETRO_MEMORY_ACCESS_WRITE
+                      | RETRO_MEMORY_ACCESS_READ;
       if (     environ_cb(RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER, &fb)
             && fb.format == RETRO_PIXEL_FORMAT_RGB565)
       {

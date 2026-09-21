@@ -27,6 +27,7 @@
 #include <libretro.h>
 #include <dynamic/dylib.h>
 #include <queues/message_queue.h>
+#include <queues/mpsc_stack.h>
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -52,13 +53,13 @@
 /* Arbitrary 10 roms for each subsystem limit */
 #define SUBSYSTEM_MAX_SUBSYSTEM_ROMS 10
 
-#ifdef HAVE_THREADS
-#define RUNLOOP_MSG_QUEUE_LOCK(runloop_st) slock_lock((runloop_st)->msg_queue_lock)
-#define RUNLOOP_MSG_QUEUE_UNLOCK(runloop_st) slock_unlock((runloop_st)->msg_queue_lock)
-#else
-#define RUNLOOP_MSG_QUEUE_LOCK(runloop_st) (void)(runloop_st)
-#define RUNLOOP_MSG_QUEUE_UNLOCK(runloop_st) (void)(runloop_st)
-#endif
+/* The message queue and core_status_msg belong to the main thread:
+ * every push, pull and decay runs there. A producer on any other
+ * thread hands its message to msg_queue_deferred (a lock-free MPSC
+ * stack) and the main thread replays it at the top of the next
+ * iterate - runloop_msg_queue_push and the SET_MESSAGE_EXT STATUS
+ * path both defer themselves. There is no lock, because there is
+ * nothing left for one to serialize. */
 
 #ifdef HAVE_BSV_MOVIE
 #define BSV_MOVIE_IS_EOF() || (((input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_END) && (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_EOF_EXIT)))
@@ -140,6 +141,8 @@ enum runloop_flags
 /* Whether retroarch_main_init() has completed.  Written on the main
  * thread, readable from any thread. */
 void runloop_is_inited_set(void);
+
+void runloop_core_options_save(void);
 void runloop_is_inited_clear(void);
 bool runloop_is_inited(void);
 
@@ -184,7 +187,6 @@ struct runloop
    retro_time_t core_runtime_usec;
    retro_time_t core_run_time;
    retro_time_t frame_limit_minimum_time;
-   retro_time_t frame_limit_last_time;
    /* The same period and anchor in nanoseconds, for the gap limiter's
     * schedule: a period rounded to whole microseconds is 21 ppm off
     * at 59.94 Hz, which the schedule would carry into every frame. */
@@ -254,6 +256,12 @@ struct runloop
    struct retro_subsystem_info subsystem_data[SUBSYSTEM_MAX_SUBSYSTEMS];
    struct retro_callbacks retro_ctx;                     /* ptr alignment */
    msg_queue_t msg_queue;                                /* ptr alignment */
+   /* Messages pushed off the main thread wait here until the main
+    * thread's iterate drains them: the push itself renders widgets and
+    * reads settings, which are the main thread's. A lock-free stack -
+    * a worker's push never touches the message queue lock, and the
+    * per-iterate emptiness probe is an acquire load. */
+   mpsc_stack_t msg_queue_deferred;                      /* ptr alignment */
    retro_input_poll_t input_poll_callback_original;      /* ptr alignment */
    retro_input_state_t input_state_callback_original;    /* ptr alignment */
 #ifdef HAVE_RUNAHEAD
@@ -265,9 +273,6 @@ struct runloop
 #if defined(HAVE_DYNAMIC) || defined(HAVE_DYLIB)
    struct retro_callbacks secondary_callbacks;           /* ptr alignment */
 #endif
-#endif
-#ifdef HAVE_THREADS
-   slock_t *msg_queue_lock;
 #endif
 
    content_state_t            content_st;                /* ptr alignment */
@@ -290,9 +295,11 @@ struct runloop
 #if defined(HAVE_DYNAMIC) || defined(HAVE_DYLIB)
    dylib_t secondary_lib_handle;                         /* ptr alignment */
 #endif
-   size_t runahead_save_state_size;
 #endif
    size_t msg_queue_size;
+   /* The thread runloop_msg_queue_init() ran on: everything else is a
+    * worker to the message push. */
+   uintptr_t msg_queue_main_id;
 
 #if defined(HAVE_RUNAHEAD)
 #if defined(HAVE_DYNAMIC) || defined(HAVE_DYLIB)
@@ -627,6 +634,10 @@ static INLINE unsigned runloop_pace_decide(runloop_pace_facts_t f)
 
 
 typedef struct runloop runloop_state_t;
+
+/* Runs deferred off-main message pushes; the main thread, once per
+ * iterate. */
+void runloop_msg_queue_drain_deferred(void);
 
 RETRO_BEGIN_DECLS
 

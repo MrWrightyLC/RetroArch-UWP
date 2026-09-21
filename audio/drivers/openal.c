@@ -36,7 +36,7 @@
 #include <lists/string_list.h>
 #include <string/stdstring.h>
 #ifdef HAVE_THREADS
-#include <rthreads/rthreads.h>
+#include <rthreads/retro_eventcount.h>
 #endif
 
 #include "../audio_driver.h"
@@ -82,13 +82,16 @@ typedef struct al
    ALCdevice *handle;
    ALCcontext *ctx;
 #ifdef HAVE_THREADS
-   /* Signalled from the mixer thread's event callback; waited on in
-    * al_get_buffer() and al_wait_writable() when events are present. */
-   slock_t *lock;
-   scond_t *cond;
-   /* Bumped by the callback under lock; the waiter sleeps only while
-    * it is unchanged, and never holds the lock across an AL call. */
-   unsigned completed;
+   /* Notified from the mixer thread's event callback; parked on in
+    * al_wait_free() when events are present. The old generation
+    * counter is gone: the eventcount's own epoch is that generation,
+    * and its prepare/commit window is the read-then-wait-if-unchanged
+    * protocol this file used to spell out with a mutex. No AL call is
+    * ever made inside the window. */
+   retro_eventcount_t park;
+   /* Set by the callback on AL_EVENT_TYPE_DISCONNECTED_SOFT, read by
+    * the waiter: release/acquire atomic, no lock. */
+   retro_atomic_int_t disconnected_atomic;
 #endif
    al_event_control_t  event_control;
    al_event_callback_t event_callback;
@@ -131,10 +134,13 @@ typedef struct al
    int          clk_valid;
    /* Raised by the DISCONNECTED event: the device is not coming back,
     * so no wait for it has anything to wait for. */
-   bool disconnected;
    /* Frames the source has finished playing, for the sink rate
     * estimate; see al_frames_consumed(). */
    retro_atomic_size_t consumed;
+   /* Times the source was found STOPPED with a write to make: it had
+    * played its queue out and the device went quiet for want of
+    * audio. INITIAL is the first write, which has not started it. */
+   retro_atomic_size_t underruns;
 } al_t;
 
 static void al_free(void *data)
@@ -170,10 +176,7 @@ static void al_free(void *data)
    if (al->handle)
       alcCloseDevice(al->handle);
 #ifdef HAVE_THREADS
-   if (al->lock)
-      slock_free(al->lock);
-   if (al->cond)
-      scond_free(al->cond);
+   retro_eventcount_free(&al->park);
 #endif
    free(al);
 }
@@ -191,12 +194,9 @@ static void AL_APIENTRY al_event_cb(ALenum event_type, ALuint object,
          && event_type != AL_EVENT_TYPE_DISCONNECTED_SOFT)
       return;
 
-   slock_lock(al->lock);
    if (event_type == AL_EVENT_TYPE_DISCONNECTED_SOFT)
-      al->disconnected = true;
-   al->completed++;
-   scond_signal(al->cond);
-   slock_unlock(al->lock);
+      retro_atomic_store_release_int(&al->disconnected_atomic, 1);
+   retro_eventcount_notify(&al->park);
 }
 
 /* Resolves and arms AL_SOFT_events on the current context. Leaves
@@ -214,9 +214,8 @@ static void al_init_events(al_t *al)
    cb.p  = alGetProcAddress("alEventCallbackSOFT");
    if (!ctl.p || !cb.p)
       return;
-   if (!(al->lock = slock_new()))
-      return;
-   if (!(al->cond = scond_new()))
+   retro_atomic_int_init(&al->disconnected_atomic, 0);
+   if (!retro_eventcount_init(&al->park))
       return;
 
    al->event_control  = ctl.f;
@@ -332,8 +331,14 @@ static void *al_init(const char *device, unsigned rate, unsigned latency,
     * OpenAL Soft extension, so asked for rather than assumed: core
     * OpenAL has nothing of the kind and Apple's does not carry it. */
    if (alcIsExtensionPresent(al->handle, "ALC_SOFT_device_clock"))
-      al->clk_get = (al_get_integer64v_t)alcGetProcAddress(
-            al->handle, "alcGetInteger64vSOFT");
+   {
+      /* Through a union, as al_init_events() resolves its own: an
+       * object pointer cast to a function pointer is not legal C. */
+      union { void *p; al_get_integer64v_t f; } clk;
+      clk.p = alcGetProcAddress(al->handle, "alcGetInteger64vSOFT");
+      if (clk.p)
+         al->clk_get = clk.f;
+   }
    RARCH_LOG("[OpenAL] Device clock: %s.\n",
          al->clk_get ? "reported by the implementation (ALC_SOFT_device_clock)"
                      : "not offered by this implementation");
@@ -439,8 +444,8 @@ error:
 
 /* The device may have gone (a disconnected default device, a lost
  * context), in which case AL_BUFFERS_PROCESSED is never delivered.
- * Bound the sleep-poll in al_get_buffer() so a write against such a
- * device returns short rather than never. */
+ * Bound the wait in al_get_buffer() so a write against such a device
+ * returns short rather than never. */
 #define OPENAL_GET_BUFFER_WAIT_MS 200
 /* Granularity of the event wait: an event ends it early, so this is
  * only how often a device that sends none is re-checked. */
@@ -485,7 +490,9 @@ static bool al_unqueue_buffers(al_t *al)
  * disconnected device, or at once in non-blocking mode. */
 static bool al_wait_free(al_t *al, size_t want)
 {
+#ifdef HAVE_THREADS
    int waited_ms = 0;
+#endif
 
    if (al->res_ptr >= want)
       return true;
@@ -500,46 +507,68 @@ static bool al_wait_free(al_t *al, size_t want)
    {
       for (;;)
       {
-         unsigned gen;
-         bool gone;
-
-         /* Read the generation, then ask the device with the lock
-          * released: no AL call is ever made under it. An event that
-          * lands after the read and before the wait changes the
-          * generation, so the wait below is skipped rather than
-          * missed. */
-         slock_lock(al->lock);
-         gen  = al->completed;
-         gone = al->disconnected;
-         slock_unlock(al->lock);
+         /* The eventcount's prepare/commit window is the old
+          * read-generation-then-wait-if-unchanged protocol without
+          * the mutex: an event landing after prepare bumps the epoch
+          * and the commit falls straight through instead of being
+          * missed. The AL calls happen inside the window, which is
+          * fine - the window is bookkeeping, not a lock, and rule 2
+          * of the eventcount's contract only asks that it be
+          * answered. */
+         int key = retro_eventcount_prepare_wait(&al->park);
 
          al_unqueue_buffers(al);
          if (al->res_ptr >= want)
-            return true;
-         if (gone || waited_ms >= OPENAL_GET_BUFFER_WAIT_MS)
-            return false;
-
-         slock_lock(al->lock);
-         if (al->completed == gen && !al->disconnected)
          {
-            if (!scond_wait_timeout(al->cond, al->lock,
-                     (int64_t)OPENAL_WAIT_STEP_MS * 1000))
-               waited_ms += OPENAL_WAIT_STEP_MS;
+            retro_eventcount_cancel_wait(&al->park);
+            return true;
          }
-         slock_unlock(al->lock);
+         if (   retro_atomic_load_acquire_int(&al->disconnected_atomic)
+             || waited_ms >= OPENAL_GET_BUFFER_WAIT_MS)
+         {
+            retro_eventcount_cancel_wait(&al->park);
+            return false;
+         }
+
+         if (!retro_eventcount_commit_wait_timeout(&al->park, key,
+                  (int64_t)OPENAL_WAIT_STEP_MS * 1000))
+            waited_ms += OPENAL_WAIT_STEP_MS;
       }
    }
 #endif
 
-   /* No events: sleep-poll. A device that processes nothing within
-    * the bound has stopped, and the caller gets what it managed. */
-   while (al->res_ptr < want)
+   /* No events to wait on. What frees a buffer is the source reaching
+    * the end of the one it is playing, and how far it has to go is
+    * known: the offset into that buffer against its length, at the
+    * rate. Sleep exactly that long, then look - instead of looking
+    * every millisecond. A device that processes nothing within the
+    * bound has stopped, and the caller gets what it managed. */
    {
-      if (waited_ms >= OPENAL_GET_BUFFER_WAIT_MS)
-         return false;
-      retro_sleep(1);
-      waited_ms++;
-      al_unqueue_buffers(al);
+      ALint   buf_frames = (ALint)(OPENAL_BUFSIZE / al->frame_size);
+      int64_t waited_us  = 0;
+
+      while (al->res_ptr < want)
+      {
+         ALint   offset = 0;
+         int64_t wait_us;
+
+         if (waited_us >= (int64_t)OPENAL_GET_BUFFER_WAIT_MS * 1000)
+            return false;
+
+         alGetSourcei(al->source, AL_SAMPLE_OFFSET, &offset);
+         if (offset < 0 || offset >= buf_frames)
+            offset = 0;
+         wait_us = ((int64_t)(buf_frames - offset) * 1000000)
+            / (al->rate ? al->rate : 48000);
+         if (wait_us < 1)
+            wait_us = 1;
+         if (waited_us + wait_us > (int64_t)OPENAL_GET_BUFFER_WAIT_MS * 1000)
+            wait_us = (int64_t)OPENAL_GET_BUFFER_WAIT_MS * 1000 - waited_us;
+
+         retro_sleep_us((unsigned)wait_us);
+         waited_us += wait_us;
+         al_unqueue_buffers(al);
+      }
    }
    return true;
 }
@@ -585,7 +614,11 @@ static ssize_t al_write(void *data, const void *s, size_t len)
       ALint val;
       alGetSourcei(al->source, AL_SOURCE_STATE, &val);
       if (val != AL_PLAYING)
+      {
+         if (val == AL_STOPPED)
+            retro_atomic_fetch_add_size(&al->underruns, 1);
          alSourcePlay(al->source);
+      }
    }
 
    return _len;
@@ -765,6 +798,12 @@ static void al_device_list_free(void *u, void *slp)
       string_list_free(sl);
 }
 
+static size_t al_underruns(void *data)
+{
+   al_t *al = (al_t*)data;
+   return al ? retro_atomic_load_acquire_size(&al->underruns) : 0;
+}
+
 audio_driver_t audio_openal = {
    al_init,
    al_write,
@@ -782,7 +821,7 @@ audio_driver_t audio_openal = {
    NULL, /* write_raw */
    al_wait_writable,
    al_frames_consumed,
-   NULL, /* underruns */
+   al_underruns,
    al_layout,
    NULL, /* frames_consumed_fallback */
    al_device_clock_ppm

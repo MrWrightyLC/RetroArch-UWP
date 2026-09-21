@@ -1041,10 +1041,6 @@ static void gl3_ubo_ring_free(struct gl3_ubo_ring *ring)
 struct gl3_pass
 {
 
-#ifdef GL3_ROLLING_SCANLINE_SIMULATION
-
-#endif /* GL3_ROLLING_SCANLINE_SIMULATION */
-
    bool final_pass;
 
    GLuint pipeline;
@@ -1638,7 +1634,7 @@ static bool gl3_pass_init_pipeline(struct gl3_pass *pass)
       if (g->uniform || g->push_constant ||
           a->uniform || a->push_constant ||
           r->uniform || r->push_constant)
-         input_state_get_ptr()->shader_uses_sensors = true;
+         input_driver_set_shader_uses_sensors(true);
    }
 
    gl3_pass_reflect_texture_parameter(pass, "OriginalSize",
@@ -1697,7 +1693,7 @@ static void gl3_pass_get_output_size(struct gl3_pass *pass,
          break;
 
       case GLSLANG_FILTER_CHAIN_SCALE_VIEWPORT:
-         width = (retroarch_get_rotation() % 2 ? pass->curr_vp.height : pass->curr_vp.width) * pass->pass_info.scale_x;
+         width = (pass->rotation % 2 ? pass->curr_vp.height : pass->curr_vp.width) * pass->pass_info.scale_x;
          break;
 
       case GLSLANG_FILTER_CHAIN_SCALE_ABSOLUTE:
@@ -1719,7 +1715,7 @@ static void gl3_pass_get_output_size(struct gl3_pass *pass,
          break;
 
       case GLSLANG_FILTER_CHAIN_SCALE_VIEWPORT:
-         height = (retroarch_get_rotation() % 2 ? pass->curr_vp.width : pass->curr_vp.height) * pass->pass_info.scale_y;
+         height = (pass->rotation % 2 ? pass->curr_vp.width : pass->curr_vp.height) * pass->pass_info.scale_y;
          break;
 
       case GLSLANG_FILTER_CHAIN_SCALE_ABSOLUTE:
@@ -2231,16 +2227,17 @@ static void gl3_pass_build_semantics(struct gl3_pass *pass, uint8_t *buffer,
                          + (pass->current_subframe
                             ? pass->current_subframe - 1 : 0)));
 
-   /* Sensor pass->uniforms — per-frame snapshot cached
-    * by input_driver_poll() on the main thread */
+   /* Sensor pass->uniforms — one coherent seqlock'd snapshot of the
+    * values input_driver_poll() published on the main thread. */
    {
-      input_driver_state_t *input_st = input_state_get_ptr();
+      float gyro[3], accel[3], rest[3];
+      input_driver_read_sensor_snapshot(gyro, accel, rest);
       gl3_pass_build_semantic_vec3(pass, buffer, SLANG_SEMANTIC_GYROSCOPE,
-                        input_st->sensor_gyroscope_cache);
+                        gyro);
       gl3_pass_build_semantic_vec3(pass, buffer, SLANG_SEMANTIC_ACCELEROMETER,
-                        input_st->sensor_accelerometer_cache);
+                        accel);
       gl3_pass_build_semantic_vec3(pass, buffer, SLANG_SEMANTIC_ACCELEROMETER_REST,
-                        input_st->sensor_accelerometer_rest);
+                        rest);
    }
 
    /* Standard inputs */
@@ -2305,13 +2302,21 @@ static void gl3_pass_build_commands(struct gl3_pass *pass,
    gl3_pass_get_output_size(pass, size_orig_width, size_orig_height,
          size_src_width, size_src_height, &size_width, &size_height);
 
+   /* gl3_framebuffer_new() only reserves the name; nothing is attached
+    * until a set_size. Build an unbuilt one even at the 1x1 seed size. */
    if (pass->framebuffer &&
-       (size_width  != pass->framebuffer->size_width ||
-        size_height != pass->framebuffer->size_height))
+       (      !pass->framebuffer->complete
+           || size_width  != pass->framebuffer->size_width
+           || size_height != pass->framebuffer->size_height))
       gl3_framebuffer_set_size(pass->framebuffer, size_width, size_height, 0);
 
    pass->current_framebuffer_size_width  = size_width;
    pass->current_framebuffer_size_height = size_height;
+
+   /* With no target of its own the draw below would land on the
+    * backbuffer, which every pass leaves bound when it finishes. */
+   if (!pass->final_pass && !(pass->framebuffer && pass->framebuffer->complete))
+      return;
 
    glUseProgram(pass->pipeline);
 
@@ -4070,7 +4075,7 @@ struct video_shader *gl3_filter_chain_get_preset(
 void gl3_filter_chain_free(gl3_filter_chain_t *chain)
 {
    gl3_chain_free(chain);
-   input_state_get_ptr()->shader_uses_sensors = false;
+   input_driver_set_shader_uses_sensors(false);
 }
 
 void gl3_filter_chain_set_shader(

@@ -957,17 +957,21 @@ bool command_seek_replay(command_t *cmd, const char *arg)
 {
 #ifdef HAVE_BSV_MOVIE
    char reply[32];
-   char *endptr;
+   char *endptr  = NULL;
    size_t _len;
    bool ret      = true;
-   int64_t frame = strtoll(arg, &endptr, 10);
+   int64_t frame = arg ? (int64_t)strtoll(arg, &endptr, 10) : 0;
    input_driver_state_t *input_st = input_state_get_ptr();
-   if (!endptr)
+   /* strtoll always writes a valid pointer, so the end pointer is
+    * never NULL - an empty or non-numeric argument shows up as no
+    * characters consumed. */
+   if (!arg || endptr == arg)
       ret = false;
    if (!(input_st->bsv_movie_state.flags & (BSV_FLAG_MOVIE_PLAYBACK | BSV_FLAG_MOVIE_RECORDING)))
       ret = false;
 #ifdef HAVE_CHEEVOS
-   ret = !rcheevos_hardcore_active();
+   if (rcheevos_hardcore_active())
+      ret = false;
 #endif
    if (ret)
       ret = movie_seek_to_frame(input_st, frame);
@@ -2798,6 +2802,7 @@ void command_event_reinit(const int flags)
    const input_device_driver_t
       *sec_joypad                 = NULL;
 #endif
+
    /* Snapshot the last cached core frame before tearing the video
     * driver down.  video_driver_free() invalidates the cache as
     * part of the reinit cycle (the pointer was borrowed from the
@@ -2828,6 +2833,35 @@ void command_event_reinit(const int flags)
    unsigned      cached_snapshot_h    = 0;
    size_t        cached_snapshot_p    = 0;
    size_t        cached_snapshot_size = 0;
+   /* A reinit while the video driver is down must not create a
+    * driver instance. It happens when content loads over running
+    * content: core deinit tears the drivers down, then unloading
+    * the old content's override fires CMD_EVENT_REINIT (the
+    * override changed video_fullscreen, and CORE_RUNNING is still
+    * set). An instance created here is replaced by
+    * retroarch_main_init's drivers_init without being freed - an
+    * orphaned window and device that widget fonts keep drawing
+    * into - while the next drivers_init applies the restored mode
+    * anyway. Guarded here, in the layer that owns reinit, so every
+    * caller is covered and call sites stay bare command_events.
+    *
+    * Nothing can be ungrabbed with the drivers down, but the grab
+    * flag is bookkeeping the win32 focus pump and the grab toggle
+    * read later, so leave it as the skipped reinit's game-focus
+    * reapply would have: released, unless exclusive fullscreen
+    * (which re-grabs on init), auto-grab or game focus keeps it.
+    * Everything below reuses this function's own locals. */
+   if (!video_st->data)
+   {
+      if (     !settings->bools.video_fullscreen
+            && !(video_driver_get_disp_flags() & VIDEO_FLAG_FORCE_FULLSCREEN)
+            && !settings->bools.input_auto_mouse_grab
+            && !input_st->game_focus_state.enabled)
+         input_st->flags &= ~INP_FLAG_GRAB_MOUSE_STATE;
+      return;
+   }
+
+
 
    {
       struct command_reinit_snapshot_ctx ctx;

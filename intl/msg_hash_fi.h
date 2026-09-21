@@ -2262,7 +2262,6 @@ static const struct
    char s_9831f77b[167];
    char s_79b8ce4a[92];
    char s_a1a8257e[114];
-   char s_d5231783[100];
    char s_a68d6d11[60];
    char s_74022c02[90];
    char s_8abad013[72];
@@ -2365,8 +2364,6 @@ static const struct
    char s_16ee5cf4[35];
    char s_d9153542[51];
    char s_8e48ec69[39];
-   char s_cd46e260[97];
-   char s_cd482ffe[96];
    char s_e92351d4[125];
    char s_8e22cdce[53];
    char s_86477a78[55];
@@ -2925,7 +2922,6 @@ static const struct
    char s_261210b3[69];
    char s_3a4b246c[98];
    char s_2ceab671[132];
-   char s_977f8e82[113];
    char s_5b059407[141];
    char s_7e96b5ce[36];
    char s_8010a29e[97];
@@ -5831,8 +5827,6 @@ static const struct
    "i CRT-n\303\244ytt\303\266jen kanssa.",
    "Vaihda korkean resoluution tilaan k\303\244ytett\303\244v\303\244ksi korkean resoluution valikos"
    "sa, kun sis\303\244lt\303\266\303\244 ei ole ladattu.",
-   "Vain CRT-n\303\244yt\303\266ille. Yritt\303\244\303\244 k\303\244ytt\303\244\303\244 samaa resol"
-   "uutiota ja virkistystaajuutta kuin ydin/peli.",
    "Vaihda natiivin ja ultraleve\303\244n superresoluution v\303\244lill\303\244.",
    "K\303\244yt\303\244 tarvittaessa mukautettua kokoonpanotiedostossa m\303\244\303\244ritetty\303"
    "\244 virkistystaajuutta.",
@@ -5982,10 +5976,6 @@ static const struct
    "Vaihtaa edell\303\244ajon p\303\244\303\244lle/pois.",
    "Tallenna tila t\303\244ll\303\244 hetkell\303\244 valittuun lohkoon.",
    "Ottaa kuvan nykyisest\303\244 sis\303\244ll\303\266st\303\244.",
-   "Lataa ja k\303\244yt\303\244 seuraavaa varjostimen esiasetetustiedostoa \"Videovarjostimet\"-kan"
-   "sion juuressa.",
-   "Lataa ja k\303\244yt\303\244 edellist\303\244 varjostimen esiasetustiedostoa \"Videovarjostimet"
-   "\"-kansion juuressa.",
    "Ottaa hidastuksen k\303\244ytt\303\266\303\266n, kun pidet\303\244\303\244n pohjassa. Sis\303"
    "\244lt\303\266 py\303\266rii normaalilla nopeudella, kun n\303\244pp\303\244in vapautetaan.",
    "Vaihtaa hidastuksen ja normaalin nopeuden v\303\244lill\303\244.",
@@ -6881,8 +6871,6 @@ static const struct
    "tiedostoille.",
    "Tallenna varjostimen esiasetus, jolla on linkki alkuper\303\244iseen esiasetukseen ja joka sis"
    "\303\244lt\303\244\303\244 vain tekem\303\244si parametrimuutokset.",
-   "Tiedostoselain avautuu viimeksi k\303\244ytetyss\303\244 hakemistossa ladattaessa varjostinasetu"
-   "ksia ja suoritusyksik\303\266it\303\244.",
    "Antaa laitteistorender\303\266iville ytimille oman yksityisen kontekstinsa. N\303\244in v\303"
    "\244ltet\303\244\303\244n laitteiston tilamuutosten arvailu kuvien v\303\244liss\303\244.",
    "Muuta videon synkronointiasetuksia.",
@@ -7465,7 +7453,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_fi_blob_check[
-      (sizeof(msg_hash_fi_blob) == (124162u
+      (sizeof(msg_hash_fi_blob) == (123756u
 #ifdef HAVE_LAKKA
        + 257u
 #endif
@@ -10017,7 +10005,6 @@ static const uint32_t msg_hash_fi_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_CORE_UPDATER_SHOW_EXPERIMENTAL_CORES,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCHRES_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_HIRES_MENU,
-   (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_SUPER,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_USE_CUSTOM_REFRESH_RATE,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_VERTICAL_ADJUST,
@@ -10120,8 +10107,6 @@ static const uint32_t msg_hash_fi_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_RUNAHEAD_TOGGLE,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SAVE_STATE_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SCREENSHOT,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_NEXT,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_PREV,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_HOLD_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_STATE_SLOT_MINUS,
@@ -10680,7 +10665,6 @@ static const uint32_t msg_hash_fi_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_GLOBAL,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_PARENT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_REFERENCE,
-   (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_REMEMBER_LAST_DIR,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHARED_CONTEXT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SYNCHRONIZATION_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_CUSTOM_HEIGHT,

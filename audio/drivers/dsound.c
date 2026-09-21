@@ -52,6 +52,7 @@ static const GUID ra_dsound_subtype_float =
      { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 } };
 #include <retro_atomic.h>
 #include <retro_spsc.h>
+#include <rthreads/retro_eventcount.h>
 #include <string/stdstring.h>
 
 #if defined(_WIN32_WINNT) && (_WIN32_WINNT >= 0x0600 /*_WIN32_WINNT_VISTA */)
@@ -100,8 +101,21 @@ typedef struct dsound
     * tracks dsound_t; initialised in dsound_init, released in
     * dsound_free after the worker has been joined. */
    retro_spsc_t ring;
-
-   HANDLE      event;
+   /* The writer's park, notified by dsound_thread after each block it
+    * moves and once when it clears thread_alive. An eventcount rather
+    * than the auto-reset event it replaces: the notify is gated, so
+    * the steady state - writer keeping ahead, never waiting - costs
+    * the pump no syscall per chunk, where SetEvent always was one. */
+   retro_eventcount_t park;
+   /* The pump's park, the other way round: notified by dsound_write
+    * after each block it queues, and by dsound_stop_thread. The pump
+    * waits here, for a time worked out from how far the play cursor
+    * has to move, instead of retrying every millisecond. Gated like
+    * park, so a writer with nobody waiting pays no syscall. */
+   retro_eventcount_t feed;
+   /* Bytes the device plays per second, for turning a distance on the
+    * play cursor into a wait. */
+   unsigned bytes_per_sec;
 #ifdef HAVE_THREADS
    sthread_t *thread;
 #else
@@ -137,6 +151,9 @@ typedef struct dsound
     * 48 kHz it holds twelve hours, and the estimate treats a wrap as a
     * restart. */
    retro_atomic_int_t frames_played;
+   /* Blocks the mixer thread had room for and nothing to put in, so
+    * the device played the silence written into them instead. */
+   retro_atomic_size_t underruns;
    DWORD              last_read_ptr;
 } dsound_t;
 
@@ -324,14 +341,30 @@ static DWORD CALLBACK dsound_thread(PVOID data)
 
       if (avail < CHUNK_SIZE || ((fifo_avail < CHUNK_SIZE) && (avail < ds->buffer_size / 2)))
       {
-         /* No space to write, or we don't have data in our fifo,
-          * but we can wait some time before it underruns ... */
+         /* No space to write, or no data queued with time left before
+          * the device underruns. Either way the next thing this pass
+          * can do waits on the play cursor moving a known distance:
+          * to free a chunk, or to the point where silence has to go
+          * in. Wait that long - worked out from the rate, rather than
+          * position notifications, which are not reliable on every
+          * driver - or until the writer queues a block or the thread
+          * is stopped, whichever comes first. The old loop slept a
+          * millisecond at a time and looked again. */
+         DWORD   need    = (avail < CHUNK_SIZE)
+            ? CHUNK_SIZE - avail
+            : ds->buffer_size / 2 - avail;
+         int64_t wait_us = ((int64_t)need * 1000000) / ds->bytes_per_sec;
+         int     key     = retro_eventcount_prepare_wait(&ds->feed);
 
-         /* We could opt for using the notification interface,
-          * but it is not guaranteed to work, so use high
-          * priority sleeping patterns.
-          */
-         retro_sleep(1);
+         /* Re-checked inside the window, so a block queued or a stop
+          * issued since the test above cannot be missed. */
+         if (      !retro_atomic_load_acquire_int(&ds->thread_alive)
+               || (   avail >= CHUNK_SIZE
+                   && retro_spsc_read_avail(&ds->ring) >= CHUNK_SIZE))
+            retro_eventcount_cancel_wait(&ds->feed);
+         else
+            retro_eventcount_commit_wait_timeout(&ds->feed, key,
+                  wait_us > 0 ? wait_us : 1);
          continue;
       }
 
@@ -341,7 +374,7 @@ static DWORD CALLBACK dsound_thread(PVOID data)
          if (!dsound_grab_region(ds, write_ptr, &region, res))
          {
             retro_atomic_store_release_int(&ds->thread_alive, 0);
-            SetEvent(ds->event);
+            retro_eventcount_notify(&ds->park);
             break;
          }
       }
@@ -352,6 +385,7 @@ static DWORD CALLBACK dsound_thread(PVOID data)
           * fill block with silence. */
          memset(region.chunk1, 0, region.size1);
          memset(region.chunk2, 0, region.size2);
+         retro_atomic_fetch_add_size(&ds->underruns, 1);
       }
       else
       {
@@ -388,7 +422,7 @@ static DWORD CALLBACK dsound_thread(PVOID data)
          write_ptr -= ds->buffer_size;
 
       if (is_pull)
-         SetEvent(ds->event);
+         retro_eventcount_notify(&ds->park);
    }
 
    /* Return normally: under HAVE_THREADS this function runs inside the
@@ -406,6 +440,8 @@ static void dsound_stop_thread(dsound_t *ds)
       return;
 
    retro_atomic_store_release_int(&ds->thread_alive, 0);
+   /* Out of a wait on the play cursor, which can be most of a buffer. */
+   retro_eventcount_notify(&ds->feed);
 
 #ifdef HAVE_THREADS
    sthread_join(ds->thread);
@@ -470,8 +506,8 @@ static void dsound_free(void *data)
    if (ds->ds)
       IDirectSound_Release(ds->ds);
 
-   if (ds->event)
-      CloseHandle(ds->event);
+   retro_eventcount_free(&ds->park);
+   retro_eventcount_free(&ds->feed);
 
    /* Safe here and only here: dsound_stop_thread has joined the
     * consumer, so the ring has no live reader. */
@@ -546,7 +582,7 @@ static const char *dsound_wave_format_name(const WAVEFORMATEX *format)
  * power of two by retro_spsc, and reported at its real capacity - and
  * the ring takes what is left of the setting after half the fifo, so
  * the two add up to it, floored at 16 ms - or the setting, if lower -
- * to ride out the scheduler between the thread's 1 ms polls, and at
+ * to ride out the scheduler between the thread's wake-ups, and at
  * four chunks in any case. */
 static void dsound_size_stages(dsound_t *ds, unsigned latency,
       const WAVEFORMATEX *wf)
@@ -568,6 +604,7 @@ static void dsound_size_stages(dsound_t *ds, unsigned latency,
       ds->buffer_size   = (unsigned)floor_bytes;
    /* the lock unit: 256 bytes made a multiple of the frame */
    ds->frame_size       = wf->nBlockAlign;
+   ds->bytes_per_sec    = wf->nAvgBytesPerSec;
    ds->chunk            = CHUNK_BASE;
    while (ds->chunk % ds->frame_size)
       ds->chunk        += CHUNK_BASE;
@@ -668,8 +705,9 @@ static void *dsound_init(const char *dev, unsigned rate, unsigned latency,
    bufdesc.dwBufferBytes = ds->buffer_size;
    bufdesc.lpwfxFormat   = wf;
 
-   ds->event = CreateEvent(NULL, false, false, NULL);
-   if (!ds->event)
+   if (!retro_eventcount_init(&ds->park))
+      goto error;
+   if (!retro_eventcount_init(&ds->feed))
       goto error;
 
    /* The formats in the order they are given up: the layout as asked
@@ -816,6 +854,8 @@ static ssize_t dsound_write(void *data, const void *buf_, size_t len)
             avail = len;
 
          retro_spsc_write(&ds->ring, buf, avail);
+         if (avail)
+            retro_eventcount_notify(&ds->feed);
 
          _len += avail;
       }
@@ -831,6 +871,8 @@ static ssize_t dsound_write(void *data, const void *buf_, size_t len)
             avail = len;
 
          retro_spsc_write(&ds->ring, buf, avail);
+         if (avail)
+            retro_eventcount_notify(&ds->feed);
 
          buf  += avail;
          _len += avail;
@@ -844,8 +886,20 @@ static ssize_t dsound_write(void *data, const void *buf_, size_t len)
           * a period with no event is a play cursor that has stalled,
           * not a device gone: the write returns what went, and a lost
           * buffer still reports through the flag on the next call. */
-         if (avail == 0 && !(WaitForSingleObject(ds->event, DSOUND_TIMEOUT) == WAIT_OBJECT_0))
-            break;
+         if (avail == 0)
+         {
+            /* Space and liveness re-checked inside the window, so the
+             * pump's notify - including its last one, clearing
+             * thread_alive - cannot fall between the test and the
+             * park. */
+            int key = retro_eventcount_prepare_wait(&ds->park);
+            if (   retro_spsc_write_avail(&ds->ring)
+                || !retro_atomic_load_acquire_int(&ds->thread_alive))
+               retro_eventcount_cancel_wait(&ds->park);
+            else if (!retro_eventcount_commit_wait_timeout(&ds->park,
+                     key, (int64_t)DSOUND_TIMEOUT * 1000))
+               break;
+         }
       }
    }
 
@@ -877,8 +931,15 @@ static size_t dsound_wait_writable(void *data, size_t len)
        * keeps moving blocks but never frees enough. */
       if (--laps < 0)
          return 0;
-      if (WaitForSingleObject(ds->event, DSOUND_TIMEOUT) != WAIT_OBJECT_0)
-         return 0;
+      {
+         int key = retro_eventcount_prepare_wait(&ds->park);
+         if (   retro_spsc_write_avail(&ds->ring) >= len
+             || !retro_atomic_load_acquire_int(&ds->thread_alive))
+            retro_eventcount_cancel_wait(&ds->park);
+         else if (!retro_eventcount_commit_wait_timeout(&ds->park,
+                  key, (int64_t)DSOUND_TIMEOUT * 1000))
+            return 0;
+      }
    }
 }
 
@@ -925,6 +986,12 @@ static uint32_t dsound_layout(void *data)
    return ds ? ds->layout : AUDIO_LAYOUT_STEREO;
 }
 
+static size_t dsound_underruns(void *data)
+{
+   dsound_t *ds = (dsound_t*)data;
+   return ds ? retro_atomic_load_acquire_size(&ds->underruns) : 0;
+}
+
 audio_driver_t audio_dsound = {
    dsound_init,
    dsound_write,
@@ -942,6 +1009,6 @@ audio_driver_t audio_dsound = {
    NULL, /* write_raw */
    dsound_wait_writable,
    dsound_frames_consumed,
-   NULL, /* underruns */
+   dsound_underruns,
    dsound_layout
 };

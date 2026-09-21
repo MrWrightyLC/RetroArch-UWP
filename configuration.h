@@ -81,7 +81,8 @@ enum crt_switch_type
    CRT_SWITCH_31KHZ,
    CRT_SWITCH_32_120,
    CRT_SWITCH_INI,
-   CRT_SWITCH_EDID
+   CRT_SWITCH_EDID,
+   CRT_SWITCH_LCD
 };
 
 enum video_sdl_display_server_mode
@@ -175,6 +176,8 @@ typedef struct settings
 
 #ifdef HAVE_WASAPI
       unsigned audio_wasapi_sh_buffer_length;
+#endif
+#ifdef HAVE_ASIO
       unsigned audio_asio_output_channel;
 #endif
 
@@ -294,6 +297,7 @@ typedef struct settings
       unsigned menu_left_thumbnails;
       unsigned menu_icon_thumbnails;
       unsigned gfx_thumbnail_upscale_threshold;
+      unsigned menu_thumbnail_preview_threads;
       unsigned menu_rgui_thumbnail_downscaler;
       unsigned menu_rgui_thumbnail_delay;
       unsigned menu_rgui_color_theme;
@@ -614,6 +618,7 @@ typedef struct settings
       bool video_force_srgb_disable;
       bool video_fps_show;
       bool video_statistics_show;
+      bool video_statistics_hide_in_menu;
       bool video_framecount_show;
       bool video_memory_show;
       bool video_msg_bgcolor_enable;
@@ -645,6 +650,7 @@ typedef struct settings
       bool audio_rate_control;
       bool audio_fastforward_mute;
       bool audio_fastforward_speedup;
+      bool audio_fastforward_callback;
       bool audio_fastpath_s16;
       bool audio_resampler_hq_oversampling;
       bool audio_rewind_mute;
@@ -699,6 +705,7 @@ typedef struct settings
       bool input_small_keyboard_enable;
       bool input_keyboard_gamepad_enable;
       bool input_auto_mouse_grab;
+      bool input_joypad_background;
       bool input_turbo_enable;
       bool input_turbo_allow_dpad;
       bool input_hotkey_device_merge;
@@ -1131,6 +1138,8 @@ typedef struct settings
 #ifdef HAVE_SMBCLIENT
       bool smb_client_enable;
 #endif
+      bool audio_time_stretch;
+      bool audio_time_stretch_lowpass;
    } bools;
 
    struct
@@ -1528,7 +1537,7 @@ bool config_overlay_enable_default(void);
 bool config_metal_arg_buffers_default(void);
 #endif
 
-void config_set_defaults(void *data);
+void config_set_defaults(void *data, settings_t *target);
 
 void config_load(void *data);
 

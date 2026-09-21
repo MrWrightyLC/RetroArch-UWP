@@ -4547,7 +4547,22 @@ void menu_driver_frame(bool menu_is_alive, video_frame_info_t *video_info)
 {
    struct menu_state    *menu_st = &menu_driver_state;
    if (menu_is_alive && menu_st->driver_ctx->frame)
+   {
+      gfx_display_t *p_disp = disp_get_ptr();
       menu_st->driver_ctx->frame(menu_st->userdata, video_info);
+      /* Nothing the menu gathered may still be waiting when the frame
+       * it belongs to is over */
+      gfx_display_flush_batch(p_disp);
+      /* The statistics overlay, on top of the menu when it is not
+       * hidden here; drivers only draw it themselves without a menu. */
+      if (     video_info->statistics_show
+            && !video_info->statistics_hide_in_menu
+            && video_info->stat_text_len)
+         font_driver_render_msg(video_info->userdata,
+               video_info->stat_text, video_info->stat_text_len,
+               (const struct font_params*)&video_info->osd_stat_params, NULL);
+      gfx_display_stats_latch(p_disp);
+   }
 }
 
 /* Teardown function for the menu driver. */
@@ -4610,7 +4625,6 @@ static void menu_input_key_event(bool down, unsigned keycode,
 void menu_input_dialog_end(void)
 {
    struct menu_state *menu_st                 = &menu_driver_state;
-   menu_st->input_dialog_kb_type              = 0;
    menu_st->input_dialog_kb_idx               = 0;
    menu_st->input_dialog_kb_text_type         = MENU_INPUT_DIALOG_KB_TYPE_TEXT;
    menu_st->flags                            &= ~MENU_ST_FLAG_INP_DLG_KB_DISPLAY;
@@ -5346,9 +5360,13 @@ unsigned menu_event(
    menu_input_t *menu_input                        = &menu_st->input_state;
    input_driver_state_t *input_st                  = input_state_get_ptr();
    input_driver_t *current_input                   = input_st->current_driver;
-   const input_device_driver_t *joypad             = input_st->primary_joypad;
+   /* Read through the idle stand-in while background controller
+    * input is off and the window is unfocused. */
+   const input_device_driver_t *joypad             =
+      input_driver_joypad_for_read(input_st->primary_joypad);
 #ifdef HAVE_MFI
-   const input_device_driver_t *sec_joypad         = input_st->secondary_joypad;
+   const input_device_driver_t *sec_joypad         =
+      input_driver_joypad_for_read(input_st->secondary_joypad);
 #else
    const input_device_driver_t *sec_joypad         = NULL;
 #endif
@@ -6046,6 +6064,8 @@ MENU_NOINLINE static int menu_input_post_iterate(
    static retro_time_t last_left_action_time       = 0;
    static retro_time_t last_right_action_time      = 0;
    static retro_time_t last_press_direction_time   = 0;
+   static retro_time_t y_accel_decay_time          = 0;
+   static retro_time_t y_accel_decay_carry         = 0;
    bool attenuate_y_accel                          = true;
    bool osk_active                                 = menu_input_dialog_get_display_kb();
    bool messagebox_active                          = false;
@@ -6542,9 +6562,30 @@ MENU_NOINLINE static int menu_input_post_iterate(
 
    /* Adjust acceleration
     * > If acceleration has not been set on this frame,
-    *   apply normal attenuation */
+    *   apply normal attenuation
+    * > Decay steps run on elapsed time, one factor per
+    *   MENU_INPUT_Y_ACCEL_DECAY_PERIOD us with the remainder
+    *   carried, so a flick travels the same distance at
+    *   every refresh rate */
    if (attenuate_y_accel)
-      menu_input->pointer.y_accel *= MENU_INPUT_Y_ACCEL_DECAY_FACTOR;
+   {
+      retro_time_t elapsed = (current_time - y_accel_decay_time)
+            + y_accel_decay_carry;
+      /* Cap the step count so a long gap (menu closed,
+       * dropped frames) costs bounded work; the residual
+       * acceleration after 64 steps is already negligible */
+      if (elapsed > (retro_time_t)MENU_INPUT_Y_ACCEL_DECAY_PERIOD * 64)
+         elapsed = (retro_time_t)MENU_INPUT_Y_ACCEL_DECAY_PERIOD * 64;
+      while (elapsed >= MENU_INPUT_Y_ACCEL_DECAY_PERIOD)
+      {
+         menu_input->pointer.y_accel *= MENU_INPUT_Y_ACCEL_DECAY_FACTOR;
+         elapsed                     -= MENU_INPUT_Y_ACCEL_DECAY_PERIOD;
+      }
+      y_accel_decay_carry = elapsed;
+   }
+   else
+      y_accel_decay_carry = 0;
+   y_accel_decay_time = current_time;
 
    /* If select has been released, disable any existing
     * select inhibit */
@@ -6843,6 +6884,19 @@ void retroarch_menu_running(void)
 
    if (menu)
    {
+#ifdef HAVE_NETWORKING
+      bool menu_pause_libretro = settings->bools.menu_pause_libretro
+            && netplay_driver_ctl(RARCH_NETPLAY_CTL_ALLOW_PAUSE, NULL);
+#else
+      bool menu_pause_libretro = settings->bools.menu_pause_libretro;
+#endif
+      /* Ramp core audio down before the driver toggle, which can take long
+       * enough to matter; here because the hotkey path does not go through
+       * CMD_EVENT_MENU_TOGGLE. Only when the runloop will in fact stop the
+       * core: under netplay it keeps running behind the menu. */
+      if (menu_pause_libretro)
+         audio_driver_pause_fade(true);
+
       if (menu->driver_ctx && menu->driver_ctx->toggle)
          menu->driver_ctx->toggle(menu->userdata, true);
 
@@ -6920,6 +6974,12 @@ void retroarch_menu_running_finished(bool quit)
          menu->driver_ctx->toggle(menu->userdata, false);
 
       menu_st->flags &= ~MENU_ST_FLAG_ALIVE;
+      /* Ramp the core's first frames back up. Not when quitting - nothing
+       * is coming back. Not gated on menu_pause_libretro: the setting can be
+       * turned off from inside the menu it paused, and a resume with no
+       * pause behind it does nothing. */
+      if (!quit)
+         audio_driver_pause_fade(false);
       menu_driver_toggle(
             video_st->current_video,
             video_st->data,
@@ -7343,6 +7403,30 @@ end:
  *
  * Sets shader preset.
  **/
+/* Same bookkeeping as menu_shader_manager_set_preset's success path,
+ * but the menu shader is copied from the driver's already-loaded
+ * struct instead of re-parsing the preset chain from disk (two
+ * chain walks saved per apply). Also removes a latent index
+ * mismatch: the slang backends rebuild the parameter list by
+ * reflection, and menu actions index the live struct with positions
+ * from the menu's own copy - a copy of the driver's struct agrees
+ * with it by construction, where a fresh parse only happens to. */
+bool menu_shader_manager_set_preset_from_live(
+      struct video_shader *menu_shader,
+      const struct video_shader *live_shader)
+{
+   struct menu_state *menu_st = &menu_driver_state;
+
+   if (!menu_shader || !live_shader)
+      return false;
+
+   video_shader_copy_for_menu(menu_shader, live_shader);
+
+   menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+   command_event(CMD_EVENT_SHADER_PRESET_LOADED, NULL);
+   return true;
+}
+
 bool menu_shader_manager_set_preset(struct video_shader *menu_shader,
       enum rarch_shader_type type, const char *preset_path, bool apply)
 {
@@ -8567,7 +8651,6 @@ bool menu_input_dialog_start(menu_input_ctx_line_t *line)
             line->label_setting,
             sizeof(menu_st->input_dialog_kb_label_setting));
 
-   menu_st->input_dialog_kb_type      = line->type;
    menu_st->input_dialog_kb_idx       = line->idx;
    menu_st->input_dialog_kb_text_type = line->text_type;
 

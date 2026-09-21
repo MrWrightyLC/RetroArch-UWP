@@ -18,6 +18,7 @@
  *  with RetroArch. If not, see <http://www.gnu.org/licenses/>.
  **/
 
+#include <limits.h>
 #include <math.h>
 #include <memalign.h>
 
@@ -32,6 +33,8 @@
 
 #include "audio_driver.h"
 #include "../defaults.h"
+#include "audio_stretch.h"
+#include "audio_speed_lpf.h"
 
 #include <retro_assert.h>
 #include <string/stdstring.h>
@@ -64,7 +67,14 @@
 #ifdef HAVE_THREADS
 #include "audio_thread_wrapper.h"
 #include "audio_pipeline_stretch.h"
-#include "audio_speed_lpf.h"
+#define AUDIO_TRANSPORT_FOLLOW 1
+#define AUDIO_TRANSPORT_LOWPASS 2
+#define AUDIO_TRANSPORT_UPDATE 4
+static bool audio_driver_transport_update_runloop(audio_driver_state_t *audio_st);
+static bool audio_driver_transport_recover(bool resume, uint32_t tempo);
+static bool audio_driver_pipe_ff_waits(audio_driver_state_t *audio_st);
+static bool audio_driver_pipeline_transport_publish(uint32_t tempo_q16,
+      bool active, bool reset, uint32_t cutoff, bool engage_ahead);
 #endif
 
 #ifdef HAVE_MENU
@@ -126,6 +136,11 @@
  * throttle, the same thing a blocking driver write was; the cap only
  * exists so a device that stops draining cannot hang the frontend. */
 #define AUDIO_PIPE_WAIT_MAX_US         1000000
+/* The producer's own bound is derived from the ring rather than flat:
+ * this many of its playing times, floored so a tiny ring still leaves
+ * a usable wait. See audio_driver_pipe_wait_us(). */
+#define AUDIO_PIPE_WAIT_FILLS          4
+#define AUDIO_PIPE_WAIT_MIN_US         20000
 
 /* The policy floor on the latency setting, in milliseconds, applied
  * once here before any driver sees it. The setting's range starts at
@@ -159,6 +174,22 @@
 
 #define AUDIO_MAX_RATIO                16
 #define AUDIO_MIN_RATIO                0.0625
+
+/* Frames the pause tail spans: the only place the driver invents audio. */
+#define AUDIO_PAUSE_TAIL_FRAMES        512
+
+/* Period the pause tail repeats, and the window it is matched over, in output
+ * frames. 96..1024 is roughly 47Hz to 500Hz at 48kHz. */
+#define AUDIO_PAUSE_TAIL_MIN_PERIOD    96
+#define AUDIO_PAUSE_TAIL_MAX_PERIOD    1024
+#define AUDIO_PAUSE_TAIL_CORR_FRAMES   128
+
+/* Frames over which the tail's join to what was playing is eased in. */
+#define AUDIO_PAUSE_TAIL_JOIN_FRAMES   128
+
+/* Output frames dropped after the pause tail, to swallow whatever the
+ * resampler was still holding. */
+#define AUDIO_PAUSE_MUTE_FRAMES        512
 
 /* Fastforward timing calculations running average samples. Helps with
  * a consistent pitch when fast-forwarding. */
@@ -217,8 +248,6 @@ audio_driver_t audio_null = {
 audio_driver_t *audio_drivers[] = {
 #ifdef HAVE_ALSA
    &audio_alsa,
-#if !defined(__QNX__) && !defined(MIYOO) && defined(HAVE_THREADS)
-#endif
 #endif
 #ifdef HAVE_TINYALSA
    &audio_tinyalsa,
@@ -262,8 +291,11 @@ audio_driver_t *audio_drivers[] = {
 #ifdef HAVE_DSOUND
    &audio_dsound,
 #endif
-#if defined(HAVE_SDL) || defined(HAVE_SDL2)
-   &audio_sdl,
+#ifdef HAVE_SDL
+   &audio_sdl1,
+#endif
+#ifdef HAVE_SDL2
+   &audio_sdl2,
 #endif
 #ifdef HAVE_SDL3
    &audio_sdl3,
@@ -292,8 +324,14 @@ audio_driver_t *audio_drivers[] = {
 #if defined(HAVE_AUDIOWORKLET)
    &audio_audioworklet,
 #endif
-#if defined(PSP) || defined(VITA) || defined(ORBIS)
+#if defined(PSP)
   &audio_psp,
+#endif
+#if defined(VITA)
+  &audio_psp2,
+#endif
+#if defined(ORBIS)
+  &audio_ps4,
 #endif
 #if defined(PS2)
   &audio_ps2,
@@ -319,7 +357,6 @@ microphone_driver_t microphone_null = {
       NULL,
       NULL,
       NULL,
-      NULL,
       "null",
       NULL,
       NULL,
@@ -330,8 +367,6 @@ microphone_driver_t microphone_null = {
 microphone_driver_t *microphone_drivers[] = {
 #ifdef HAVE_ALSA
       &microphone_alsa,
-#if !defined(__QNX__) && !defined(MIYOO) && defined(HAVE_THREADS)
-#endif
 #endif
 #ifdef HAVE_WASAPI
       &microphone_wasapi,
@@ -364,8 +399,9 @@ static uint32_t audio_driver_layout_of_setting(unsigned value)
       case 2:  return AUDIO_LAYOUT_5POINT1;
       case 3:  return AUDIO_LAYOUT_5POINT1_SURROUND;
       case 4:  return AUDIO_LAYOUT_7POINT1;
-      default: return AUDIO_LAYOUT_STEREO;
+      default: break;
    }
+   return AUDIO_LAYOUT_STEREO;
 }
 
 uint32_t audio_driver_requested_layout(void)
@@ -600,8 +636,8 @@ static void audio_driver_extra_free(audio_driver_state_t *audio_st)
          if (audio_st->resampler_int16_free)
             audio_st->resampler_int16_free(audio_st->extra.res[i]);
       }
-      else if (audio_st->resampler)
-         audio_st->resampler->free(audio_st->extra.res[i]);
+      else if (audio_st->extra.res_drv)
+         audio_st->extra.res_drv->free(audio_st->extra.res[i]);
       audio_st->extra.res[i] = NULL;
    }
    free(audio_st->extra.in_f);
@@ -669,6 +705,7 @@ static bool audio_driver_extra_prepare(audio_driver_state_t *audio_st,
             retro_resampler_realloc_hq(&audio_st->extra.res[i], &drv,
                   audio_st->resampler_ident, audio_st->resampler_quality,
                   audio_st->src_ratio_orig, audio_st->resampler_hq);
+            audio_st->extra.res_drv = drv;
          }
          if (!audio_st->extra.res[i])
          {
@@ -913,6 +950,55 @@ static void audio_driver_extra_resample(audio_driver_state_t *audio_st,
    audio_st->extra.pending    = false;
 }
 
+struct audio_inline_transport
+{
+   audio_stretch_stream_t *stream;
+   void *output, *source, *front;
+   unsigned channels, layout;
+   audio_speed_lpf_t lpf;
+   uint32_t cutoff;
+   bool floating, bypassed, source_progress;
+};
+
+static void audio_driver_inline_reset(audio_driver_state_t *audio_st)
+{
+   struct audio_inline_transport *t = audio_st->inline_transport;
+   if (!t) return;
+   audio_stretch_stream_reset(t->stream);
+   audio_speed_lpf_reset(&t->lpf);
+   t->bypassed = false;
+}
+
+static void audio_driver_inline_free(audio_driver_state_t *audio_st)
+{
+   struct audio_inline_transport *t = audio_st->inline_transport;
+   if (!t) return;
+   audio_stretch_stream_free(t->stream);
+   memalign_free(t->output);
+   free(t);
+   audio_st->inline_transport = NULL;
+}
+
+#ifdef HAVE_THREADS
+/* Whether ring position 'at' lies ahead of 'from': the wrap-safe test
+ * the layout queue uses, since the ring holds at most one capacity. */
+static INLINE bool audio_driver_pipe_ahead(const audio_driver_state_t *audio_st,
+      size_t from, size_t at)
+{
+   size_t d = at - from;
+   return d && d <= audio_st->pipe_ring.capacity;
+}
+
+/* The ring's positions restart with it; so do the marks in them. */
+static void audio_driver_pipe_marks_clear(audio_driver_state_t *audio_st)
+{
+   audio_st->pipe_discard_seen =
+         retro_atomic_load_acquire_int(&audio_st->pipe_discard_gen);
+   retro_atomic_store_release_int(&audio_st->pipe_fade_in_set, 0);
+   audio_st->pipe_arm_fade     = false;
+}
+#endif
+
 static bool audio_driver_deinit_internal(bool audio_enable)
 {
    audio_driver_state_t *audio_st = &audio_driver_st;
@@ -941,15 +1027,32 @@ static bool audio_driver_deinit_internal(bool audio_enable)
 
    audio_st->pipe_pending = NULL;
    audio_st->pipe_pending_bytes = 0;
+   audio_driver_inline_free(audio_st);
+   audio_st->transport_lpf_only = false;
+
+   /* The pause tail continues the waveform, and across a core swap or a
+    * driver change there is no waveform to continue. */
+   audio_st->last_out[0]              = 0.0f;
+   audio_st->last_out[1]              = 0.0f;
+   audio_st->fade_in_frames           = 0;
+   audio_st->fade_in_pending          = false;
+   audio_st->pause_mute_frames        = 0;
+   audio_st->pause_hist_pos           = 0;
+   audio_st->pause_hist_fill          = 0;
+   audio_st->resume_topup_pending     = false;
+   retro_atomic_store_release_int(&audio_st->core_silenced, 0);
 
 #ifdef HAVE_THREADS
    audio_pipeline_stretch_free(audio_st->pipe_transport);
    audio_st->pipe_transport = NULL;
+   audio_pipeline_stretch_free(audio_st->pipe_transport_suspended);
+   audio_st->pipe_transport_suspended = NULL;
    if (audio_st->pipe_transport_output)
       memalign_free(audio_st->pipe_transport_output);
    audio_st->pipe_transport_output = NULL;
    audio_st->pipe_transport_serial = audio_st->pipe_transport_search = 0;
    audio_st->pipe_transport_rate = 0;
+   audio_st->pipe_transport_follow = 0;
 #endif
 
    /* All scratch buffers live in the two arenas; the named pointers are
@@ -967,9 +1070,6 @@ static bool audio_driver_deinit_internal(bool audio_enable)
    free(audio_st->pipe_wide);
    audio_st->pipe_wide                = NULL;
    audio_st->pipe_wide_bytes          = 0;
-   free(audio_st->pipe_canon);
-   audio_st->pipe_canon               = NULL;
-   audio_st->pipe_canon_frames        = 0;
    audio_st->pipe_channels            = 2;
    free(audio_st->multi_fold);
    audio_st->multi_fold               = NULL;
@@ -1003,6 +1103,7 @@ static bool audio_driver_deinit_internal(bool audio_enable)
    audio_st->rewind_buf               = NULL;
    audio_st->rewind_buf_f             = NULL;
    audio_st->rewind_size              = 0;
+   audio_st->rewind_ptr               = 0;
 #endif
 
    if (audio_st->arena_float)
@@ -1045,7 +1146,8 @@ static void audio_driver_mixer_deinit(void)
 {
    unsigned i;
 
-   AUDIO_FLAGS_CLEAR(&audio_driver_st, AUDIO_FLAG_MIXER_ACTIVE);
+   AUDIO_FLAGS_CLEAR(&audio_driver_st, AUDIO_FLAG_MIXER_ACTIVE
+                                      | AUDIO_FLAG_MIXER_INITED);
 
    for (i = 0; i < AUDIO_MIXER_MAX_SYSTEM_STREAMS; i++)
    {
@@ -1328,16 +1430,15 @@ static double audio_driver_sink_pipe_frames(audio_driver_state_t *audio_st)
 static double audio_driver_sink_device_frames(audio_driver_state_t *audio_st)
 {
    const audio_driver_t *audio = audio_st->current_audio;
-   size_t frame_bytes;
-   if (!audio || !audio->write_avail || !audio_st->buffer_size || !audio_st->context_audio_data)
-      return 0.0;
-   frame_bytes = audio_driver_dev_frame_bytes(audio_st);
+   if (audio && audio->write_avail && audio_st->buffer_size && audio_st->context_audio_data)
    {
-      size_t avail = audio->write_avail(audio_st->context_audio_data);
+      size_t frame_bytes = audio_driver_dev_frame_bytes(audio_st);
+      size_t avail       = audio->write_avail(audio_st->context_audio_data);
       if (avail > audio_st->buffer_size)
          avail = audio_st->buffer_size;
       return (double)(audio_st->buffer_size - avail) / (double)frame_bytes;
    }
+   return 0.0;
 }
 
 static void audio_driver_sink_mark(audio_driver_state_t *audio_st,
@@ -1346,8 +1447,8 @@ static void audio_driver_sink_mark(audio_driver_state_t *audio_st,
    m->offered      = audio_st->sink_offered;
    m->consumed     = consumed;
    m->consumed_alt = consumed_alt;
-   m->pipe     = audio_driver_sink_pipe_frames(audio_st);
-   m->device   = audio_driver_sink_device_frames(audio_st);
+   m->pipe         = audio_driver_sink_pipe_frames(audio_st);
+   m->device       = audio_driver_sink_device_frames(audio_st);
 }
 
 static INLINE double audio_driver_sink_ppm(double count, double nominal)
@@ -1628,7 +1729,8 @@ static void audio_driver_sink_refused(audio_driver_state_t *audio_st)
    uint64_t offered  = audio_st->sink_offered_raw;
    uint64_t accepted = audio_st->sink_accepted;
    if (     (audio_st->sink_warned_flush & AUDIO_SINK_WARNED_DROPPED)
-         || !config_get_ptr()->bools.audio_sink_rate_estimation)
+         || !(retro_atomic_load_acquire_int(&audio_st->runloop_snapshot)
+            & AUDIO_SNAP_SINK_EST))
       return;
    if (audio_st->pipe_pending_bytes)
    {
@@ -1653,12 +1755,13 @@ static void audio_driver_sink_refused(audio_driver_state_t *audio_st)
 static void audio_driver_sink_update(audio_driver_state_t *audio_st,
       int64_t now_usec)
 {
-   const audio_driver_t *audio = audio_st->current_audio;
    uint64_t consumed;
    uint64_t consumed_alt;
-   unsigned rate = config_get_ptr()->uints.audio_output_sample_rate;
+   const audio_driver_t *audio = audio_st->current_audio;
+   unsigned rate = audio_st->out_rate;
 
-   if (!config_get_ptr()->bools.audio_sink_rate_estimation)
+   if (!(retro_atomic_load_acquire_int(&audio_st->runloop_snapshot)
+         & AUDIO_SNAP_SINK_EST))
    {
       /* Off means no bias, and no baseline: turning it back on
        * measures afresh. The overlay draws the rates while one is
@@ -1786,17 +1889,17 @@ void audio_driver_update_drc_threshold(audio_driver_state_t *audio_st)
  * AUDIO_FF_EXP_AVG_SAMPLES flushes, and returns a multiplier for the
  * resampler ratio so the audio time-stretches to track the actual output
  * speed rather than crackling or being muted.  The EMA smooths the estimate
- * so pitches stay recognizable (it is not needed to avoid crackling -- the
- * generated waves are continuous either way -- but it avoids time
- * compression/decompression every frame; see
- * https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average).
+ * so pitches stay recognizable and avoids time compression/decompression
+ * every frame. The 1.0x interval is averaged too: batch sizes vary, and a
+ * per-batch figure leaves pitch-preserving playback short of real time; see
+ * https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average.
  *
- * The state (last_flush_time, avg_flush_delta) lives on audio_st and the
- * arithmetic is identical regardless of caller, so it is float/int16
- * agnostic: a session may move between the two paths mid-fast-forward and the
- * wall-clock series stays continuous.  The first flush of a fast-forward
- * seeds the average at the 1.0x delta and returns 1.0, so the
- * multiplier starts from unity and follows the measured speed from
+ * The state (last_flush_time, avg_flush_delta, avg_expected_delta) lives on
+ * audio_st and the arithmetic is identical regardless of caller, so it is
+ * float/int16 agnostic: a session may move between the two paths
+ * mid-fast-forward and the wall-clock series stays continuous.  The first
+ * flush of a fast-forward seeds the averages at the configured fast-forward
+ * ratio and returns its multiplier, and the measured speed takes over from
  * there; audio_driver_ff_mult_reset() arms that seed again once
  * fast-forward is released, so the idle time between two fast-forwards
  * is never read as one enormous flush interval.
@@ -1866,6 +1969,31 @@ static double audio_driver_bound_ratio(double ratio,
  * this, so what is reserved is what is produced. The resampler bound
  * for that ratio is the same sixteen input frames' worth of overshoot
  * audio_driver_bound_ratio() reserves. */
+/* The slowmotion ratio the main thread last published; the audio
+ * side's counterpart to the setting, safe on any thread. */
+static INLINE float audio_driver_snapshot_slowmotion(
+      audio_driver_state_t *audio_st)
+{
+   float ratio;
+   int   bits = retro_atomic_load_acquire_int(
+         &audio_st->runloop_slowmotion_bits);
+   memcpy(&ratio, &bits, sizeof(ratio));
+   return ratio;
+}
+
+/* The fast-forward ratio the main thread last published, the
+ * override's when one is active. Safe on any thread; the estimate's
+ * seed must not read the runloop or the settings mid-submit. */
+static INLINE float audio_driver_snapshot_ffratio(
+      audio_driver_state_t *audio_st)
+{
+   float ratio;
+   int   bits = retro_atomic_load_acquire_int(
+         &audio_st->runloop_ffratio_bits);
+   memcpy(&ratio, &bits, sizeof(ratio));
+   return ratio;
+}
+
 static INLINE double audio_driver_effective_ratio(
       const audio_driver_state_t *audio_st, bool is_slowmotion,
       float slowmotion_ratio, double ff_mult)
@@ -1924,17 +2052,43 @@ static double audio_driver_fastforward_ratio_mult(
       const retro_time_t n      = AUDIO_FF_EXP_AVG_SAMPLES;
       audio_st->avg_flush_delta = audio_st->avg_flush_delta * (n - 1) / n +
             (flush_time - audio_st->last_flush_time) / n;
+      audio_st->avg_expected_delta = audio_st->avg_expected_delta * (n - 1) / n
+            + expected_flush_delta / n;
 
       /* How much does avg_flush_delta deviate from the 1.0x delta? */
       mult = MAX(AUDIO_MIN_RATIO,
             MIN(AUDIO_MAX_RATIO,
-               audio_st->avg_flush_delta / expected_flush_delta));
+               audio_st->avg_flush_delta / audio_st->avg_expected_delta));
    }
    else
-      audio_st->avg_flush_delta = (retro_time_t)expected_flush_delta;
+   {
+      /* Seed at the configured ratio. The limiter has the core there
+       * within a frame, and the average would take some fifty flushes
+       * to follow it, overfilling the non-blocking device meanwhile.
+       * The ratio comes published: this runs mid-submit, on the audio
+       * thread when the core owns its audio callback. */
+      double ratio = audio_driver_snapshot_ffratio(audio_st);
+      if (ratio > 1.0)
+         mult = 1.0 / ratio;
+      else
+         ratio = 1.0;
+      audio_st->avg_flush_delta    = (retro_time_t)(expected_flush_delta / ratio);
+      audio_st->avg_expected_delta = expected_flush_delta;
+   }
 
    audio_st->last_flush_time = flush_time;
    return mult;
+}
+
+/* The inline flush's multiplier. The first flush of a hold spans the
+ * frame before the limiter lifted, so it plays at 1.0: at the seeded
+ * ratio the device is a frame short at the edge. */
+static double audio_driver_inline_ff_mult(audio_driver_state_t *audio_st,
+      size_t input_frames)
+{
+   bool seed   = !audio_st->last_flush_time;
+   double mult = audio_driver_fastforward_ratio_mult(audio_st, input_frames);
+   return seed ? 1.0 : mult;
 }
 
 static INLINE void audio_driver_ff_mult_reset(audio_driver_state_t *audio_st)
@@ -1946,26 +2100,133 @@ static INLINE void audio_driver_ff_mult_reset(audio_driver_state_t *audio_st)
 }
 
 #ifdef HAVE_THREADS
+#define AUDIO_PIPE_FF_TRIM_MAX  0.08
+#define AUDIO_PIPE_FF_TRIM_GAIN 0.5
+
+/* The pull rate the multiplier sets and the core's rate never agree
+ * exactly, and a core that waits on a full ring runs at the pull rate.
+ * Steer the ring toward half full: above it the consumer pulls faster,
+ * so the core it holds back speeds up and is measured faster; below it
+ * slower, so the ring is not run dry. */
+static double audio_driver_pipe_ff_trim(audio_driver_state_t *audio_st)
+{
+   double cap = (double)audio_st->pipe_ring.capacity;
+   double err;
+   if (!(cap > 0.0))
+      return 1.0;
+   err = AUDIO_PIPE_FF_TRIM_GAIN
+      * ((double)retro_spsc_read_avail(&audio_st->pipe_ring) - cap * 0.5) / cap;
+   if (err > AUDIO_PIPE_FF_TRIM_MAX)
+      err = AUDIO_PIPE_FF_TRIM_MAX;
+   else if (err < -AUDIO_PIPE_FF_TRIM_MAX)
+      err = -AUDIO_PIPE_FF_TRIM_MAX;
+   return 1.0 + err;
+}
+#endif
+
 static void audio_driver_ff_frame_end(audio_driver_state_t *audio_st)
 {
-   size_t frames;
-   if (!audio_st->pipe_threaded) return;
-   frames = audio_st->pipe_ff_frames;
-   if (!frames)
+#ifdef HAVE_THREADS
+   if (audio_st->pipe_threaded)
    {
-      /* Some cores deliver audio only every few video frames. Keep their
-       * interval while fast-forward runs, but exclude paused/released gaps. */
-      if (audio_st->last_flush_time)
+      size_t frames = audio_st->pipe_ff_frames;
+      if (audio_st->pipe_transport_follow)
+         audio_st->pipe_transport_follow |= AUDIO_TRANSPORT_UPDATE;
+      if (frames)
       {
-         int snap = retro_atomic_load_acquire_int(&audio_st->runloop_snapshot);
-         if (!(snap & AUDIO_SNAP_FASTMOTION) || (snap & AUDIO_SNAP_PAUSED))
-            audio_driver_ff_mult_reset(audio_st);
+         double mult = audio_driver_fastforward_ratio_mult(audio_st, frames);
+         audio_st->pipe_ff_frames = 0;
+         if (audio_driver_pipe_ff_waits(audio_st))
+            mult = MIN(AUDIO_MAX_RATIO, MAX(AUDIO_MIN_RATIO,
+                     mult / audio_driver_pipe_ff_trim(audio_st)));
+         retro_atomic_store_release_int(&audio_st->pipe_ff_mult_q16,
+               (int)(mult * 65536.0));
+         return;
       }
-      return;
    }
-   audio_st->pipe_ff_frames = 0;
-   retro_atomic_store_release_int(&audio_st->pipe_ff_mult_q16,
-         (int)(audio_driver_fastforward_ratio_mult(audio_st, frames) * 65536.0));
+#endif
+   /* Keep intervals across batched audio, but exclude released/paused gaps. */
+   if (audio_st->last_flush_time)
+   {
+      int snap = retro_atomic_load_acquire_int(&audio_st->runloop_snapshot);
+      if (!(snap & AUDIO_SNAP_FASTMOTION) || (snap & AUDIO_SNAP_PAUSED)
+            || ((snap & AUDIO_SNAP_MENU_ALIVE) && (snap & AUDIO_SNAP_MENU_PAUSES)
+               && (snap & AUDIO_SNAP_ALLOW_PAUSE)))
+         audio_driver_ff_mult_reset(audio_st);
+   }
+}
+
+/* The callback-core variant of the producer measurement above. A
+ * callback core delivers no frames on the main thread, so there is
+ * nothing to count - but what fast-forward changes for it is
+ * retro_run cadence, so that is what gets measured: one video frame's
+ * worth of audio at the core's input rate is the expected interval,
+ * the wall clock between frame ends is the achieved one, and the EMA
+ * turns the pair into the achieved-speed multiplier exactly as the
+ * threaded pipeline's producer does. Published in pipe_ff_mult_q16
+ * for the audio thread, whose flush reads it and never runs the
+ * cadence measurement itself - on that thread the cadence is the
+ * device draining, and measuring it would only read back the
+ * multiplier last applied (see audio_driver_ff_mult()).
+ *
+ * Runs only when the snapshot carries the fastmotion bit, which
+ * publish withholds for callback cores unless the person opted in
+ * (audio_fastforward_callback), so the off state costs one load. The
+ * reset stores race the audio thread's own idle reset at fast-forward
+ * boundaries; both only ever store zeros and unity there, so the
+ * worst case is one stale EMA sample that the next frame corrects. */
+static void audio_driver_ff_callback_frame_end(audio_driver_state_t *audio_st)
+{
+   int snap = retro_atomic_load_acquire_int(&audio_st->runloop_snapshot);
+   if ((snap & AUDIO_SNAP_FASTMOTION) && !(snap & AUDIO_SNAP_PAUSED))
+   {
+      video_driver_state_t *video_st = video_state_get_ptr();
+      double fps        = (video_st->av_info.timing.fps > 1.0)
+            ? video_st->av_info.timing.fps
+            : AUDIO_DRC_FALLBACK_FPS;
+      double input_rate = (audio_st->input > 0.0f)
+            ? audio_st->input
+            : (double)config_get_ptr()->uints.audio_output_sample_rate;
+      size_t frames     = (size_t)(input_rate / fps);
+      if (frames < 1)
+         frames         = 1;
+      retro_atomic_store_release_int(&audio_st->pipe_ff_mult_q16,
+            (int)(audio_driver_fastforward_ratio_mult(audio_st, frames)
+               * 65536.0));
+   }
+   else if (audio_st->last_flush_time)
+   {
+      audio_driver_ff_mult_reset(audio_st);
+      retro_atomic_store_release_int(&audio_st->pipe_ff_mult_q16, 65536);
+   }
+}
+
+/* Whether fast-forward audio follows the measured speed: Speedup asks
+ * for it outright, and pitch preservation needs it to hold pitch. The
+ * filter-only transport keeps the ordinary Speedup or discard handling. */
+static INLINE bool audio_driver_ff_follows(const audio_driver_state_t *audio_st,
+      bool speedup)
+{
+   if (speedup)
+      return true;
+#ifdef HAVE_THREADS
+   if (audio_st->pipe_threaded)
+      return audio_st->pipe_transport && !audio_st->transport_lpf_only;
+#endif
+   return audio_st->inline_transport && !audio_st->transport_lpf_only;
+}
+
+#ifdef HAVE_THREADS
+/* Whether a fast-forward producer waits on a full ring rather than
+ * dropping: when the consumer pulls at the core's speed and a limiter
+ * bounds that speed. Unlimited, waiting would hold the core to the
+ * fastest tempo the audio can play. */
+static bool audio_driver_pipe_ff_waits(audio_driver_state_t *audio_st)
+{
+   int snap = retro_atomic_load_acquire_int(&audio_st->runloop_snapshot);
+   return (snap & AUDIO_SNAP_SYNC)
+      && audio_driver_ff_follows(audio_st, (snap & AUDIO_SNAP_FF_SPEEDUP) != 0)
+      && audio_driver_snapshot_ffratio(audio_st) > 1.0;
 }
 #endif
 
@@ -1980,7 +2241,14 @@ static double audio_driver_ff_mult(audio_driver_state_t *audio_st,
       return (double)retro_atomic_load_acquire_int(
             &audio_st->pipe_ff_mult_q16) / 65536.0;
 #endif
-   return audio_driver_fastforward_ratio_mult(audio_st, input_frames);
+   /* A callback core's flush runs on the audio thread, where cadence
+    * is the device draining: measuring it here would read back the
+    * multiplier last applied. Take the frame-end measurement instead
+    * (see audio_driver_ff_callback_frame_end()). */
+   if (audio_st->callback.callback)
+      return (double)retro_atomic_load_acquire_int(
+            &audio_st->pipe_ff_mult_q16) / 65536.0;
+   return audio_driver_inline_ff_mult(audio_st, input_frames);
 }
 
 /* Frames of headroom deliberately resampled beyond what the device
@@ -2059,7 +2327,8 @@ static size_t audio_driver_ff_discard_bound(audio_driver_state_t *audio_st,
 static bool audio_driver_mixer_use_s16(bool is_float)
 {
    return    (audio_driver_st.resampler_data_int16 != NULL)
-          &&  config_get_ptr()->bools.audio_fastpath_s16
+          && (retro_atomic_load_acquire_int(
+                &audio_driver_st.runloop_snapshot) & AUDIO_SNAP_FASTPATH_S16)
           && !is_float
 #ifdef HAVE_DSP_FILTER
           && (!audio_driver_st.dsp
@@ -2273,9 +2542,39 @@ static void audio_driver_extra_merge_s16(audio_driver_state_t *audio_st,
    }
 }
 
+/* A non-blocking write the ring cannot take is cut short. The discard
+ * path means to lose that; the pitch-preserving stream is continuous, and
+ * its first output after a press meets the ring the 1x blocking writes
+ * left full. Wait for the room instead: the ring frees it within a period. */
+static ssize_t audio_driver_dev_write(audio_driver_state_t *audio_st,
+      const audio_driver_t *audio, const void *buf, size_t bytes,
+      bool wait_room)
+{
+   ssize_t w = audio->write(audio_st->context_audio_data, buf, bytes);
+   if (     wait_room
+         && w >= 0 && (size_t)w < bytes
+         && (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_NONBLOCK)
+         && !audio_st->pipe_threaded
+         && audio_st->inline_transport
+         && !audio_st->inline_transport->bypassed
+         && !audio_st->transport_lpf_only
+         && audio->set_nonblock_state)
+   {
+      ssize_t rest;
+      audio->set_nonblock_state(audio_st->context_audio_data, false);
+      rest = audio->write(audio_st->context_audio_data,
+            (const uint8_t*)buf + w, bytes - (size_t)w);
+      audio->set_nonblock_state(audio_st->context_audio_data,
+            (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_NONBLOCK) != 0);
+      if (rest > 0)
+         w += rest;
+   }
+   return w;
+}
+
 static ssize_t audio_driver_write_frames(audio_driver_state_t *audio_st,
       const audio_driver_t *audio, const void *stereo, size_t frames,
-      bool stereo_is_float)
+      bool stereo_is_float, bool wait_room)
 {
    bool   dev_float = (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_USE_FLOAT) != 0;
    size_t sample    = dev_float ? sizeof(float) : sizeof(int16_t);
@@ -2312,16 +2611,16 @@ static ssize_t audio_driver_write_frames(audio_driver_state_t *audio_st,
       }
       audio_binaural_process(&audio_st->binaural, audio_st->upmix_buf, audio_st->virt_buf, frames);
       if (dev_float)
-         return audio->write(audio_st->context_audio_data, audio_st->upmix_buf,
-               frames * 2 * sizeof(float));
+         return audio_driver_dev_write(audio_st, audio, audio_st->upmix_buf,
+               frames * 2 * sizeof(float), wait_room);
       convert_float_to_s16(audio_st->upmix_i16, audio_st->upmix_buf, frames * 2);
-      return audio->write(audio_st->context_audio_data, audio_st->upmix_i16,
-            frames * 2 * sizeof(int16_t));
+      return audio_driver_dev_write(audio_st, audio, audio_st->upmix_i16,
+            frames * 2 * sizeof(int16_t), wait_room);
    }
 
    if (audio_st->out_channels <= 2 || !audio_st->upmix_buf)
-      return audio->write(audio_st->context_audio_data, stereo,
-            frames * 2 * sample);
+      return audio_driver_dev_write(audio_st, audio, stereo,
+            frames * 2 * sample, wait_room);
 
    if (frames > audio_st->upmix_frames)
       frames = audio_st->upmix_frames;
@@ -2345,8 +2644,8 @@ static ssize_t audio_driver_write_frames(audio_driver_state_t *audio_st,
          }
          audio_st->extra.out_frames = 0;
       }
-      return audio->write(audio_st->context_audio_data, audio_st->upmix_i16,
-            frames * audio_st->out_channels * sizeof(int16_t));
+      return audio_driver_dev_write(audio_st, audio, audio_st->upmix_i16,
+            frames * audio_st->out_channels * sizeof(int16_t), wait_room);
    }
    if (!stereo_is_float)
    {
@@ -2375,13 +2674,13 @@ static ssize_t audio_driver_write_frames(audio_driver_state_t *audio_st,
       audio_st->extra.out_frames = 0;
    }
    if (dev_float)
-      return audio->write(audio_st->context_audio_data, audio_st->upmix_buf,
-            frames * audio_st->out_channels * sizeof(float));
+      return audio_driver_dev_write(audio_st, audio, audio_st->upmix_buf,
+            frames * audio_st->out_channels * sizeof(float), wait_room);
    /* a float mix into an int16 device: the one narrowing it needs */
    convert_float_to_s16(audio_st->upmix_i16, audio_st->upmix_buf,
          frames * audio_st->out_channels);
-   return audio->write(audio_st->context_audio_data, audio_st->upmix_i16,
-         frames * audio_st->out_channels * sizeof(int16_t));
+   return audio_driver_dev_write(audio_st, audio, audio_st->upmix_i16,
+         frames * audio_st->out_channels * sizeof(int16_t), wait_room);
 }
 
 /* The three software flush exits pass persistent stereo output scratch.
@@ -2413,12 +2712,238 @@ static INLINE void audio_driver_retain_output(audio_driver_state_t *audio_st,
    }
 }
 
+/* Copy or sanitize in place without modifying borrowed core/ring input. */
+static void audio_driver_copy_clamp(float *buf, const float *input,
+      unsigned total_samples)
+{
+   unsigned i              = 0;
+
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(HAVE_NEON))
+   if (clamp_float_neon_enabled)
+   {
+      float32x4_t vpos1 = vdupq_n_f32( 1.0f);
+      float32x4_t vneg1 = vdupq_n_f32(-1.0f);
+      uint32x4_t  vabsm = vdupq_n_u32(0x7FFFFFFFu);
+      uint32x4_t  vinfb = vdupq_n_u32(0x7F800000u);
+      for (; i + 8 <= total_samples; i += 8)
+      {
+         float32x4_t v0 = vld1q_f32(input + i);
+         float32x4_t v1 = vld1q_f32(input + i + 4);
+         /* Squash NaN to silence first: vmin/vmax propagate a NaN
+          * rather than clamping it, so without this it would reach
+          * the driver untouched.
+          *
+          * The test is on the bit pattern (NaN iff the exponent is
+          * all ones and the mantissa is non-zero, i.e. the value
+          * masked of its sign exceeds the +inf encoding) rather
+          * than vceqq_f32(v, v): -Ofast (HAVE_C_A7A7) implies
+          * -ffinite-math-only, under which GCC folds the float
+          * compare to all-ones and drops the mask entirely.
+          * Integer compares are immune to that. */
+         {
+            uint32x4_t b0 = vreinterpretq_u32_f32(v0);
+            uint32x4_t b1 = vreinterpretq_u32_f32(v1);
+            v0 = vreinterpretq_f32_u32(vandq_u32(b0,
+                  vcleq_u32(vandq_u32(b0, vabsm), vinfb)));
+            v1 = vreinterpretq_f32_u32(vandq_u32(b1,
+                  vcleq_u32(vandq_u32(b1, vabsm), vinfb)));
+         }
+         v0             = vminq_f32(v0, vpos1);
+         v0             = vmaxq_f32(v0, vneg1);
+         v1             = vminq_f32(v1, vpos1);
+         v1             = vmaxq_f32(v1, vneg1);
+         vst1q_f32(buf + i,     v0);
+         vst1q_f32(buf + i + 4, v1);
+      }
+   }
+#elif defined(__SSE__)
+   {
+      __m128 vpos1 = _mm_set1_ps( 1.0f);
+      __m128 vneg1 = _mm_set1_ps(-1.0f);
+      for (; i + 4 <= total_samples; i += 4)
+      {
+         __m128 v = _mm_loadu_ps(input + i);
+         /* Squash NaN to silence first. _mm_min_ps/_mm_max_ps
+          * return their second operand when either input is NaN,
+          * which would silently turn a NaN into full scale here.
+          * _mm_cmpord_ps(v, v) is all-zero only for NaN lanes, and
+          * unlike a plain float compare it survives -ffast-math
+          * because it lowers to cmpordps directly. Kept as an SSE1
+          * op so the SSE-without-SSE2 build still compiles. */
+         v        = _mm_and_ps(v, _mm_cmpord_ps(v, v));
+         v        = _mm_min_ps(v, vpos1);
+         v        = _mm_max_ps(v, vneg1);
+         _mm_storeu_ps(buf + i, v);
+      }
+   }
+#endif
+   for (; i < total_samples; i++)
+   {
+      /* NaN fails both ordered comparisons below, so test for it
+       * explicitly. The test is done on the bit pattern rather than
+       * as (v != v) because -Ofast (HAVE_C_A7A7) implies -ffast-math,
+       * under which the compiler is entitled to fold that to false.
+       * Zero matches wav_to_s16's handling of non-finite input. */
+      uint32_t bits;
+      buf[i] = input[i];
+      memcpy(&bits, &buf[i], sizeof(bits));
+      if      ((bits & 0x7FFFFFFFu) > 0x7F800000u)
+         buf[i] =  0.0f;
+      else if (buf[i] >  1.0f)
+         buf[i] =  1.0f;
+      else if (buf[i] < -1.0f)
+         buf[i] = -1.0f;
+   }
+}
+
+/* The pause ramp runs on whichever buffer is about to reach the device:
+ * float on the resampler path, int16 on the deterministic one. History is
+ * kept in normalised float so the tail can go back out through
+ * audio_driver_write_float(). */
+static float audio_driver_pause_read(const void *buf, bool is_float, size_t i)
+{
+   if (is_float)
+      return ((const float*)buf)[i];
+   return (float)((const int16_t*)buf)[i] * (1.0f / 0x8000);
+}
+
+static void audio_driver_pause_write(void *buf, bool is_float, size_t i,
+      float v)
+{
+   if (is_float)
+   {
+      ((float*)buf)[i] = v;
+      return;
+   }
+   ((int16_t*)buf)[i] = (int16_t)audio_float_to_s16_sat(v);
+}
+
+/**
+ * audio_driver_pause_track:
+ * @buf        : interleaved stereo, the last buffer before the device.
+ * @num_frames : frame count in @buf.
+ * @is_float   : whether @buf is float rather than int16.
+ *
+ * Applies the resume ramp if one is outstanding, drops what a pause left
+ * in the pipeline, and keeps a copy of the tail for the pause concealment
+ * to continue from. Belongs on the last buffer before the device so it
+ * sees exactly what is played. See audio_driver_pause_fade().
+ **/
+static void audio_driver_pause_track(audio_driver_state_t *audio_st,
+      void *buf, size_t num_frames, bool is_float)
+{
+   if (num_frames < 1)
+      return;
+
+   if (audio_st->fade_in_frames > 0)
+   {
+      size_t n = (audio_st->fade_in_frames < num_frames)
+            ? audio_st->fade_in_frames : num_frames;
+      size_t j;
+      for (j = 0; j < n; j++)
+      {
+         /* Progress against the whole ramp, not what is left of it: the
+          * counter falls as the ramp is spent, so measuring from it would
+          * restart the gain near zero at the head of every buffer. */
+         unsigned done  = AUDIO_PAUSE_TAIL_FRAMES
+               - audio_st->fade_in_frames + (unsigned)j + 1;
+         float    g     = 0.5f * (1.0f - cosf((float)M_PI * (float)done
+               / (float)AUDIO_PAUSE_TAIL_FRAMES));
+         audio_driver_pause_write(buf, is_float, (j * 2) + 0,
+               audio_driver_pause_read(buf, is_float, (j * 2) + 0) * g);
+         audio_driver_pause_write(buf, is_float, (j * 2) + 1,
+               audio_driver_pause_read(buf, is_float, (j * 2) + 1) * g);
+      }
+      audio_st->fade_in_frames -= (unsigned)n;
+   }
+
+   /* Drop what the pipeline was still holding when the pause tail was
+    * written straight to the device ahead of it. */
+   if (audio_st->pause_mute_frames > 0)
+   {
+      size_t n = (audio_st->pause_mute_frames < num_frames)
+            ? audio_st->pause_mute_frames : num_frames;
+      memset(buf, 0, n * 2 * (is_float ? sizeof(float) : sizeof(int16_t)));
+      audio_st->pause_mute_frames -= (unsigned)n;
+   }
+
+   audio_st->last_out[0] = audio_driver_pause_read(buf, is_float,
+         ((num_frames - 1) * 2) + 0);
+   audio_st->last_out[1] = audio_driver_pause_read(buf, is_float,
+         ((num_frames - 1) * 2) + 1);
+
+   /* Keep the tail of what is about to be played, for the pause
+    * concealment to continue from. */
+   {
+      size_t first = 0;
+      size_t n     = num_frames;
+      size_t j;
+      if (n > AUDIO_PAUSE_HIST_FRAMES)
+      {
+         first = n - AUDIO_PAUSE_HIST_FRAMES;
+         n     = AUDIO_PAUSE_HIST_FRAMES;
+      }
+      for (j = 0; j < n; j++)
+      {
+         audio_st->pause_hist[(audio_st->pause_hist_pos * 2) + 0] =
+               audio_driver_pause_read(buf, is_float, ((first + j) * 2) + 0);
+         audio_st->pause_hist[(audio_st->pause_hist_pos * 2) + 1] =
+               audio_driver_pause_read(buf, is_float, ((first + j) * 2) + 1);
+         audio_st->pause_hist_pos =
+               (audio_st->pause_hist_pos + 1) % AUDIO_PAUSE_HIST_FRAMES;
+      }
+      audio_st->pause_hist_fill =
+            (audio_st->pause_hist_fill + (unsigned)n
+                  > AUDIO_PAUSE_HIST_FRAMES)
+            ? AUDIO_PAUSE_HIST_FRAMES
+            : audio_st->pause_hist_fill + (unsigned)n;
+   }
+}
+
+/**
+ * audio_driver_resume_topup:
+ *
+ * Fills the device with silence before the first buffer after a resume.
+ * The runloop hands nothing over between the last write of a pause and the
+ * first of resumed core audio, so the device drains, and rate control
+ * refills it too slowly to keep the driver's pulls whole.
+ *
+ * On the first flush rather than at the resume, so it lands after that hole
+ * whatever its length; the surplus is what rate control already takes out.
+ * Chunked against a driver's per-write limit and bounded by write_avail(),
+ * so a blocking write cannot wait on it.
+ **/
+static void audio_driver_resume_topup(audio_driver_state_t *audio_st)
+{
+   const audio_driver_t *audio = audio_st->current_audio;
+   static const float zeros[1024 * 2];
+   size_t room;
+
+   audio_st->resume_topup_pending = false;
+   if (     !audio || !audio->write || !audio->write_avail
+         || !audio_st->context_audio_data
+         || audio_st->buffer_size == 0)
+      return;
+   room = audio->write_avail(audio_st->context_audio_data);
+   while (room > 0)
+   {
+      size_t n = (room < sizeof(zeros)) ? room : sizeof(zeros);
+      if (audio->write(audio_st->context_audio_data, zeros, n) <= 0)
+         break;
+      room -= n;
+   }
+}
+
 static void audio_driver_flush(audio_driver_state_t *audio_st,
       float slowmotion_ratio,
       const void *data, size_t samples, bool is_float,
       bool is_slowmotion, bool is_fastforward)
 {
    struct resampler_data src_data;
+   bool output_sanitized          = false;
+   int snap                       = retro_atomic_load_acquire_int(
+         &audio_st->runloop_snapshot);
+   bool ff_speedup                = (snap & AUDIO_SNAP_FF_SPEEDUP) != 0;
    const audio_driver_t *audio    = audio_st->current_audio;
    float audio_volume_gain        =
          (audio_st->mute_enable || AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_MUTED)
@@ -2427,6 +2952,9 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
 
    /* Record the core's delivered sample format for the statistics overlay. */
    audio_st->stat_core_is_float = is_float;
+
+   if (audio_st->resume_topup_pending)
+      audio_driver_resume_topup(audio_st);
 
    /* Fast path: if driver handles resampling and no DSP/mixer is active,
     * bypass software resampling entirely. An active in-process MIDI synth
@@ -2439,6 +2967,11 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
    if (audio->write_raw
          && !audio_st->resampler_hq
          && !is_float
+         /* The resume ramp and the pause mute are applied on the last
+          * buffer before the device, which this path never sees; take
+          * the normal path until they are spent. */
+         && !audio_st->fade_in_frames
+         && !audio_st->pause_mute_frames
          /* The raw path hands the driver stereo int16 as it is: no
           * upmix, no headphone render. Only when the output is plain
           * stereo. */
@@ -2478,6 +3011,22 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
       if (is_slowmotion)
          rate_adjust                *= slowmotion_ratio;
 
+      /* Nothing at the output rate passes through here to keep as history,
+       * so the pause tail has nothing true to continue from. Forget what
+       * the normal path last recorded rather than let a later pause repeat
+       * audio from long ago. */
+      audio_st->last_out[0]      = 0.0f;
+      audio_st->last_out[1]      = 0.0f;
+      audio_st->pause_hist_pos   = 0;
+      audio_st->pause_hist_fill  = 0;
+
+      /* Driver-side SRC needs the same speed multiplier as software SRC.
+       * In the threaded path this reads the producer's cadence estimate. */
+      if (!is_fastforward && !audio_st->pipe_threaded)
+         audio_driver_ff_mult_reset(audio_st);
+      if (is_fastforward && ff_speedup)
+         rate_adjust *= audio_driver_ff_mult(audio_st, frames);
+
       /* Note: mute/volume is not applied here.  Per the write_raw
        * contract in audio_driver.h the driver MUST apply the passed
        * gain (0.0 when muted) to its output - a driver that drops it
@@ -2497,23 +3046,27 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
           * by rate control's adjustment. sink_offered wants that with
           * the adjustment divided out, as the other write sites do, so
           * the bias measures the clocks and not rate control's own
-          * corrections. write_raw returns device frames accepted, so it
-          * goes straight into sink_accepted with no byte conversion.
+          * corrections. write_raw returns accepted input frames; scale
+          * those to output frames as well before comparing the counters.
           *
           * The bias reaches the driver only through the rate_adjust
           * above, which compute_rate_adjust() multiplies it into - so
           * with rate control off it is measured and shown but not
           * applied, exactly as it is for a blocking writer. */
-         unsigned out_rate = config_get_ptr()->uints.audio_output_sample_rate;
+         unsigned out_rate = audio_st->out_rate;
          if (out_rate && input_rate)
          {
             double nominal = (double)frames * (double)out_rate
                   / (double)input_rate;
-            audio_st->sink_offered_raw += (uint64_t)(nominal * rate_adjust);
+            uint64_t offered = (uint64_t)(nominal * rate_adjust);
+            audio_st->sink_offered_raw += offered;
             if (!audio_st->pipe_threaded)
                audio_st->sink_offered  += nominal;
             if (w > 0)
-               audio_st->sink_accepted += (uint64_t)w;
+               /* Reuse the full-write count, including identical rounding. */
+               audio_st->sink_accepted += (size_t)w == frames ? offered
+                  : (uint64_t)((double)w * (double)out_rate
+                        / (double)input_rate * rate_adjust);
          }
       }
       audio_driver_sink_refused(audio_st);
@@ -2659,12 +3212,12 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
             audio_driver_ff_mult_reset(audio_st);
          i16_ratio = audio_driver_effective_ratio(audio_st, is_slowmotion,
                slowmotion_ratio,
-               (is_fastforward && config_get_ptr()->bools.audio_fastforward_speedup)
+               (is_fastforward && ff_speedup)
                   ? audio_driver_ff_mult(audio_st, rs_frames) : 1.0);
          /* Without speedup the device is pinned near full and the
           * write below drops most of the output; resample only what
           * it can accept.  See audio_driver_ff_discard_bound. */
-         if (is_fastforward && !config_get_ptr()->bools.audio_fastforward_speedup)
+         if (is_fastforward && !ff_speedup)
             rs_frames = (unsigned)audio_driver_ff_discard_bound(
                   audio_st, i16_ratio, rs_frames);
 
@@ -2722,10 +3275,12 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
                      out_frames, mixer_gain, override);
             }
 #endif
+            audio_driver_pause_track(audio_st,
+                  audio_st->output_samples_buf, out_frames, true);
             AUDIO_FLAGS_SET(audio_st, AUDIO_FLAG_WROTE);
             {
                ssize_t w = audio_driver_write_frames(audio_st, audio,
-                     audio_st->output_samples_buf, out_frames, true);
+                     audio_st->output_samples_buf, out_frames, true, true);
                audio_driver_retain_output(audio_st, audio_st->output_samples_buf, out_frames, w);
                audio_st->sink_offered_raw += out_frames;
                if (!audio_st->pipe_threaded)
@@ -2806,10 +3361,12 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
                         mixer_gain, override);
             }
 #endif
+            audio_driver_pause_track(audio_st,
+                  audio_st->output_samples_int16, out_frames, false);
             AUDIO_FLAGS_SET(audio_st, AUDIO_FLAG_WROTE);
             {
                ssize_t w = audio_driver_write_frames(audio_st, audio,
-                     audio_st->output_samples_int16, out_frames, false);
+                     audio_st->output_samples_int16, out_frames, false, true);
                audio_driver_retain_output(audio_st, audio_st->output_samples_int16, out_frames, w);
                audio_st->sink_offered_raw += out_frames;
                if (!audio_st->pipe_threaded)
@@ -2987,7 +3544,7 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
       audio_driver_ff_mult_reset(audio_st);
    src_data.ratio           = audio_driver_effective_ratio(audio_st,
          is_slowmotion, slowmotion_ratio,
-         (is_fastforward && config_get_ptr()->bools.audio_fastforward_speedup)
+         (is_fastforward && ff_speedup)
             ? audio_driver_ff_mult(audio_st, src_data.input_frames) : 1.0);
 
    if (is_fastforward)
@@ -2995,7 +3552,7 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
       /* Without speedup the device is pinned near full and the write
        * below drops most of the output; resample only what it can
        * accept.  See audio_driver_ff_discard_bound. */
-      if (!config_get_ptr()->bools.audio_fastforward_speedup)
+      if (!ff_speedup)
          src_data.input_frames = audio_driver_ff_discard_bound(
                audio_st, src_data.ratio, src_data.input_frames);
    }
@@ -3054,8 +3611,19 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
          && src_data.ratio == 1.0
          && !audio_st->resampler_hq)
    {
-      memcpy(audio_st->output_samples_buf, src_data.data_in,
-            src_data.input_frames * 2 * sizeof(float));
+      if ((AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_USE_FLOAT)
+#ifdef HAVE_AUDIOMIXER
+            && !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_MIXER_ACTIVE)
+#endif
+         )
+      {
+         audio_driver_copy_clamp(audio_st->output_samples_buf,
+               src_data.data_in, (unsigned)src_data.input_frames * 2);
+         output_sanitized = true;
+      }
+      else
+         memcpy(audio_st->output_samples_buf, src_data.data_in,
+               src_data.input_frames * 2 * sizeof(float));
       src_data.output_frames       = src_data.input_frames;
       audio_st->resampler_bypassed = true;
    }
@@ -3145,93 +3713,21 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
        * AltiVec vec_packs, PSP/Allegrex vi2s.q) uses a saturating narrow.
        * Skipping the float-clamp pass on the s16 path produces a
        * bit-identical result with one fewer touch of the buffer. */
-      if (
+      if (!output_sanitized &&
             (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_USE_FLOAT)
 #ifdef HAVE_AUDIOMIXER
          && !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_MIXER_ACTIVE)
 #endif
          )
       {
-         unsigned i              = 0;
-         unsigned total_samples  = output_frames * 2; /* stereo */
-         float *buf              = audio_st->output_samples_buf;
-
-#if (defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(HAVE_NEON))
-         if (clamp_float_neon_enabled)
-         {
-            float32x4_t vpos1 = vdupq_n_f32( 1.0f);
-            float32x4_t vneg1 = vdupq_n_f32(-1.0f);
-            uint32x4_t  vabsm = vdupq_n_u32(0x7FFFFFFFu);
-            uint32x4_t  vinfb = vdupq_n_u32(0x7F800000u);
-            for (; i + 8 <= total_samples; i += 8)
-            {
-               float32x4_t v0 = vld1q_f32(buf + i);
-               float32x4_t v1 = vld1q_f32(buf + i + 4);
-               /* Squash NaN to silence first: vmin/vmax propagate a NaN
-                * rather than clamping it, so without this it would reach
-                * the driver untouched.
-                *
-                * The test is on the bit pattern (NaN iff the exponent is
-                * all ones and the mantissa is non-zero, i.e. the value
-                * masked of its sign exceeds the +inf encoding) rather
-                * than vceqq_f32(v, v): -Ofast (HAVE_C_A7A7) implies
-                * -ffinite-math-only, under which GCC folds the float
-                * compare to all-ones and drops the mask entirely.
-                * Integer compares are immune to that. */
-               {
-                  uint32x4_t b0 = vreinterpretq_u32_f32(v0);
-                  uint32x4_t b1 = vreinterpretq_u32_f32(v1);
-                  v0 = vreinterpretq_f32_u32(vandq_u32(b0,
-                        vcleq_u32(vandq_u32(b0, vabsm), vinfb)));
-                  v1 = vreinterpretq_f32_u32(vandq_u32(b1,
-                        vcleq_u32(vandq_u32(b1, vabsm), vinfb)));
-               }
-               v0             = vminq_f32(v0, vpos1);
-               v0             = vmaxq_f32(v0, vneg1);
-               v1             = vminq_f32(v1, vpos1);
-               v1             = vmaxq_f32(v1, vneg1);
-               vst1q_f32(buf + i,     v0);
-               vst1q_f32(buf + i + 4, v1);
-            }
-         }
-#elif defined(__SSE__)
-         {
-            __m128 vpos1 = _mm_set1_ps( 1.0f);
-            __m128 vneg1 = _mm_set1_ps(-1.0f);
-            for (; i + 4 <= total_samples; i += 4)
-            {
-               __m128 v = _mm_loadu_ps(buf + i);
-               /* Squash NaN to silence first. _mm_min_ps/_mm_max_ps
-                * return their second operand when either input is NaN,
-                * which would silently turn a NaN into full scale here.
-                * _mm_cmpord_ps(v, v) is all-zero only for NaN lanes, and
-                * unlike a plain float compare it survives -ffast-math
-                * because it lowers to cmpordps directly. Kept as an SSE1
-                * op so the SSE-without-SSE2 build still compiles. */
-               v        = _mm_and_ps(v, _mm_cmpord_ps(v, v));
-               v        = _mm_min_ps(v, vpos1);
-               v        = _mm_max_ps(v, vneg1);
-               _mm_storeu_ps(buf + i, v);
-            }
-         }
-#endif
-         for (; i < total_samples; i++)
-         {
-            /* NaN fails both ordered comparisons below, so test for it
-             * explicitly. The test is done on the bit pattern rather than
-             * as (v != v) because -Ofast (HAVE_C_A7A7) implies -ffast-math,
-             * under which the compiler is entitled to fold that to false.
-             * Zero matches wav_to_s16's handling of non-finite input. */
-            uint32_t bits;
-            memcpy(&bits, &buf[i], sizeof(bits));
-            if      ((bits & 0x7FFFFFFFu) > 0x7F800000u)
-               buf[i] =  0.0f;
-            else if (buf[i] >  1.0f)
-               buf[i] =  1.0f;
-            else if (buf[i] < -1.0f)
-               buf[i] = -1.0f;
-         }
+         audio_driver_copy_clamp(audio_st->output_samples_buf,
+               audio_st->output_samples_buf, output_frames * 2);
       }
+
+      /* Resume ramp, and remember where the waveform got to: both belong on
+       * the last buffer before the device. See audio_driver_pause_fade(). */
+      audio_driver_pause_track(audio_st, (void*)output_data, output_frames,
+            true);
 
       /* A float driver takes the float mix as it is; an int16 one gets
        * it narrowed. A wider device gets either widened on the way. */
@@ -3247,7 +3743,7 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
          size_t  fb = audio_driver_dev_frame_bytes(audio_st);
          ssize_t w  = audio_driver_write_frames(audio_st, audio, output_data,
                output_frames,
-               (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_USE_FLOAT) != 0);
+               (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_USE_FLOAT) != 0, true);
          audio_driver_retain_output(audio_st, output_data, output_frames, w);
          audio_st->sink_offered_raw += (uint64_t)output_frames;
          if (!audio_st->pipe_threaded)
@@ -3284,6 +3780,253 @@ unsigned audio_driver_mixer_get_streams_playing(void)
 }
 
 #endif
+
+static bool audio_driver_multi_discrete(audio_driver_state_t *audio_st, unsigned layout);
+static INLINE bool audio_driver_pipe_widen_prefix(void *output, const void *input,
+      size_t frames, unsigned channels, unsigned layout, bool floating);
+
+static void audio_driver_inline_pack(struct audio_inline_transport *t,
+      const void *data, size_t frames, unsigned channels, unsigned layout)
+{
+   unsigned bit, count = 0, c, slots[AUDIO_PIPE_CANON_CHANNELS];
+   size_t f, sample = t->floating ? sizeof(float) : sizeof(int16_t);
+   if (audio_driver_pipe_widen_prefix(t->source, data, frames, channels, layout, t->floating))
+      return;
+   for (bit = 0; bit < t->channels; bit++)
+      if (layout & (1u << bit)) slots[count++] = bit;
+   memset(t->source, 0, frames * t->channels * sample);
+   if (t->floating)
+   {
+      float *dst = (float*)t->source;
+      const float *src = (const float*)data;
+      for (f = 0; f < frames; f++)
+         for (c = 0; c < count; c++)
+            dst[f*t->channels+slots[c]] = src[f*channels+c];
+   }
+   else
+   {
+      int16_t *dst = (int16_t*)t->source;
+      const int16_t *src = (const int16_t*)data;
+      for (f = 0; f < frames; f++)
+         for (c = 0; c < count; c++)
+            dst[f*t->channels+slots[c]] = src[f*channels+c];
+   }
+}
+
+static void audio_driver_inline_render(audio_driver_state_t *audio_st,
+      const void *data, size_t frames, unsigned layout, float slowmotion_ratio,
+      bool slowmotion, bool fastforward)
+{
+   struct audio_inline_transport *t = audio_st->inline_transport;
+   const void *front = data;
+   if (t->channels > 2)
+   {
+      unsigned positions = layout & ~AUDIO_LAYOUT_STEREO;
+      unsigned ex = audio_layout_channels(positions), bit, c = 0;
+      unsigned slots[AUDIO_PIPE_CANON_CHANNELS];
+      size_t f;
+      bool discrete = ex && audio_driver_multi_discrete(audio_st, layout)
+         && audio_driver_extra_prepare(audio_st, ex, positions, AUDIO_CHUNK_SIZE_NONBLOCKING >> 1,
+               t->floating, audio_driver_mixer_use_s16(t->floating));
+      if (discrete) audio_st->extra.in_frames = frames;
+      for (bit = 2; bit < t->channels; bit++)
+         if (positions & (1u << bit)) slots[c++] = bit;
+      if (discrete || layout == AUDIO_LAYOUT_STEREO)
+      {
+         if (t->floating)
+         {
+            const float *src = (const float*)data;
+            float *dst = (float*)t->front;
+            for (f = 0; f < frames; f++)
+            {
+               dst[2*f] = src[f*t->channels]; dst[2*f+1] = src[f*t->channels+1];
+               if (discrete)
+                  for (c = 0; c < ex; c++)
+                     audio_st->extra.in_f[f*ex+c] = src[f*t->channels+slots[c]];
+            }
+         }
+         else
+         {
+            const int16_t *src = (const int16_t*)data;
+            int16_t *dst = (int16_t*)t->front;
+            for (f = 0; f < frames; f++)
+            {
+               dst[2*f] = src[f*t->channels]; dst[2*f+1] = src[f*t->channels+1];
+               if (discrete)
+                  for (c = 0; c < ex; c++)
+                     audio_st->extra.in_i[f*ex+c] = src[f*t->channels+slots[c]];
+            }
+         }
+         audio_st->extra.pending = discrete;
+      }
+      else if (t->floating)
+         audio_downmix_f32((float*)t->front, (const float*)data, frames,
+               (1u << AUDIO_PIPE_CANON_CHANNELS) - 1, t->channels);
+      else
+         audio_downmix_s16((int16_t*)t->front, (const int16_t*)data, frames,
+               (1u << AUDIO_PIPE_CANON_CHANNELS) - 1, t->channels);
+      front = t->front;
+   }
+   audio_driver_flush(audio_st, slowmotion_ratio, front, frames * 2,
+         t->floating, slowmotion, fastforward);
+   audio_st->extra.pending = false;
+}
+
+/* Called with the audio state lock, before SRC and device output. */
+#if defined(__GNUC__)
+__attribute__((noinline))
+#elif defined(_MSC_VER)
+__declspec(noinline)
+#endif
+static bool audio_driver_inline_process(audio_driver_state_t *audio_st,
+      float slowmotion_ratio, const void *data, size_t frames, bool floating,
+      bool slowmotion, bool fastforward, unsigned layout)
+{
+   struct audio_inline_transport *t = audio_st->inline_transport;
+   int snap = retro_atomic_load_acquire_int(&audio_st->runloop_snapshot);
+   size_t left = frames;
+   size_t frame;
+   const uint8_t *source = (const uint8_t*)data;
+   retro_time_t old_time = audio_st->last_flush_time;
+   retro_time_t old_delta = audio_st->avg_flush_delta, source_time;
+   double old_expected = audio_st->avg_expected_delta;
+   double duration = slowmotion ? slowmotion_ratio : 1.0;
+   uint64_t bits;
+   uint32_t tempo, cutoff;
+   bool supported, follow;
+   if (!t) return false;
+   follow = audio_driver_ff_follows(audio_st, (snap & AUDIO_SNAP_FF_SPEEDUP) != 0);
+   frame = t->channels * (floating ? sizeof(float) : sizeof(int16_t));
+   supported = floating == t->floating && !audio_st->extra.pending
+      && audio_st->core_layout == layout
+      && (layout & AUDIO_LAYOUT_STEREO) == AUDIO_LAYOUT_STEREO;
+#ifdef HAVE_REWIND
+   supported = supported && !state_manager_frame_is_reversed();
+#endif
+   if (supported && fastforward && follow)
+      duration *= audio_driver_inline_ff_mult(audio_st, left);
+   memcpy(&bits, &duration, sizeof(bits));
+   supported = supported && bits < UINT64_C(0x7ff0000000000000)
+      && duration >= 1.0 / 32.0 && duration <= 4.0;
+   if (!supported)
+   {
+      audio_st->last_flush_time = old_time;
+      audio_st->avg_flush_delta = old_delta;
+      audio_st->avg_expected_delta = old_expected;
+      if (!t->bypassed)
+      {
+         bool pending = audio_st->extra.pending;
+         audio_driver_inline_reset(audio_st);
+         audio_driver_reset_resamplers(audio_st);
+         audio_st->extra.pending = pending;
+         t->bypassed = true;
+      }
+      return false;
+   }
+   if (t->bypassed || t->layout != layout)
+   {
+      audio_driver_inline_reset(audio_st);
+      audio_driver_reset_resamplers(audio_st);
+   }
+   t->layout = layout;
+   source_time = fastforward ? audio_st->last_flush_time : 0;
+   tempo = (uint32_t)(65536.0 / duration + 0.5);
+   cutoff = (snap & AUDIO_SNAP_STRETCH_LPF)
+      ? audio_speed_lpf_cutoff(t->lpf.rate, tempo) : 0;
+   if (cutoff != t->cutoff)
+   {
+      audio_speed_lpf_set(&t->lpf, cutoff != 0,
+            cutoff ? cutoff : (t->cutoff ? t->cutoff : 20));
+      t->cutoff = cutoff;
+   }
+   do
+   {
+      size_t used, frames;
+      const void *output;
+      /* Once active, the engine stays active at unity rather than
+       * exiting to raw: the exit would drain the lookahead its search
+       * kept as one burst onto a device the hold left full, and the
+       * next engage would pause output to fill it again. The cost is
+       * that lookahead as holdback after the first speed change. */
+      if (!audio_stretch_stream_push_view_limit(t->stream, source, left,
+               &used, tempo / 65536.0,
+               !audio_st->transport_lpf_only && (tempo != 65536
+                  || !audio_stretch_stream_quiescent(t->stream)),
+               AUDIO_CHUNK_SIZE_NONBLOCKING >> 1))
+         break;
+      if (used) t->source_progress = true;
+      source += used * frame; left -= used;
+      output = audio_stretch_stream_peek(t->stream, &frames);
+      if (frames)
+      {
+         if (!audio_speed_lpf_quiescent(&t->lpf))
+         {
+            audio_speed_lpf_process_into(&t->lpf, output, t->output, frames);
+            output = t->output;
+         }
+         /* Filter-only retains ordinary pitch-changing SRC. The achieved
+          * fast-forward duration was already measured above, once per input. */
+         audio_driver_inline_render(audio_st, output, frames, layout,
+               audio_st->transport_lpf_only ? (float)duration : 1.0f,
+               audio_st->transport_lpf_only, fastforward && !follow);
+         audio_stretch_stream_consume(t->stream, frames);
+      }
+      if (!used && !frames) break;
+   } while (left || !audio_stretch_stream_needs_input(t->stream));
+   /* Flush cadence must not replace the core's source cadence. */
+   audio_st->last_flush_time = source_time;
+   return true;
+}
+
+static bool audio_driver_inline_flush(audio_driver_state_t *audio_st,
+      float slowmotion_ratio, const void *data, size_t samples, bool floating,
+      bool slowmotion, bool fastforward)
+{
+   struct audio_inline_transport *t = audio_st->inline_transport;
+   if (!t) return false;
+   if (t->channels > 2 && floating == t->floating)
+   {
+      if (samples > AUDIO_CHUNK_SIZE_NONBLOCKING) return false;
+      audio_driver_inline_pack(t, data, samples >> 1, 2, AUDIO_LAYOUT_STEREO);
+      data = t->source;
+   }
+   return audio_driver_inline_process(audio_st, slowmotion_ratio, data,
+         samples >> 1, floating, slowmotion, fastforward, AUDIO_LAYOUT_STEREO);
+}
+
+static bool audio_driver_inline_prepare(audio_driver_state_t *audio_st,
+      bool floating, unsigned channels)
+{
+   struct audio_inline_transport *t;
+   size_t bytes, capacity = AUDIO_CHUNK_SIZE_NONBLOCKING >> 1;
+   if (audio_st->inline_transport) return true;
+   t = (struct audio_inline_transport*)calloc(1, sizeof(*t));
+   if (!t) return false;
+   t->floating = floating;
+   t->channels = channels;
+   t->layout = AUDIO_LAYOUT_STEREO;
+   t->stream = audio_stretch_stream_new((unsigned)audio_st->input, t->channels, t->floating, 3);
+   bytes = capacity * t->channels * (t->floating ? sizeof(float) : sizeof(int16_t));
+   t->output = memalign_alloc(64, t->channels > 2 ? bytes * 2 + bytes * 2 / t->channels : bytes);
+   if (!t->stream || !t->output || !audio_stretch_stream_bind(t->stream,
+            t->output, AUDIO_CHUNK_SIZE_NONBLOCKING >> 1))
+   {
+      audio_stretch_stream_free(t->stream);
+      if (t->output) memalign_free(t->output);
+      free(t);
+      return false;
+   }
+   if (t->channels > 2)
+   {
+      t->source = (uint8_t*)t->output + bytes;
+      t->front = (uint8_t*)t->source + bytes;
+   }
+   audio_speed_lpf_init(&t->lpf, (unsigned)audio_st->input, t->channels, t->floating);
+   audio_st->inline_transport = t;
+   return true;
+}
+
+static bool audio_driver_transport_configure(const settings_t *settings);
 
 bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
 {
@@ -3382,6 +4125,7 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
 #ifdef HAVE_REWIND
    audio_driver_st.rewind_buf                  = arena_int16 + i16_rewind;
    audio_driver_st.rewind_size                 = max_buffer_samples;
+   audio_driver_st.rewind_ptr                  = max_buffer_samples;
 #endif
    /* Set now so a return before the driver starts (audio disabled)
     * leaves the float output region reachable through its pointer. */
@@ -3466,6 +4210,7 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
          RARCH_ERR("[Audio] Cannot allocate the pipeline ring. Exiting...\n");
          return false;
       }
+      audio_driver_pipe_marks_clear(&audio_driver_st);
       audio_driver_st.pipe_pass_frames    = per_frame;
       if (audio_driver_st.pipe_pass_frames > AUDIO_PIPE_SLICE_INT16S / 2)
          audio_driver_st.pipe_pass_frames = AUDIO_PIPE_SLICE_INT16S / 2;
@@ -3499,7 +4244,7 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
          }
          if (!audio_driver_st.pipe_wide)
          {
-            RARCH_ERR("[Audio] Cannot allocate the wide-frame bounce. Exiting...\n");
+            RARCH_ERR("[Audio] Cannot allocate wide-frame storage. Exiting...\n");
             retro_spsc_free(&audio_driver_st.pipe_ring);
             return false;
          }
@@ -3527,7 +4272,7 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
       audio_driver_st.pipe_park_ready     = true;
       AUDIO_FLAGS_SET(&audio_driver_st, AUDIO_FLAG_PIPELINE_THREADED);
       audio_driver_st.pipe_threaded       = true;
-      audio_driver_st.pipe_consumer_gone  = false;
+      retro_atomic_int_init(&audio_driver_st.pipe_consumer_gone, 0);
       RARCH_LOG("[Audio] Threaded pipeline: ring holds %u frames of %s core audio.\n",
             (unsigned)(audio_driver_st.pipe_ring.capacity / audio_driver_st.pipe_frame_bytes),
             audio_driver_st.pipe_float ? "float" : "int16");
@@ -3682,6 +4427,7 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
    audio_driver_st.src_ratio_orig    =
       audio_driver_st.src_ratio_curr =
       (double)settings->uints.audio_output_sample_rate / audio_driver_st.input;
+   audio_driver_st.out_rate          = settings->uints.audio_output_sample_rate;
 
    if (*settings->arrays.audio_resampler)
       strlcpy(audio_driver_st.resampler_ident,
@@ -3869,7 +4615,8 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
        * SIGFPE" workaround for the same hazard. Check it once, centrally,
        * and fall back to no rate control rather than making every driver
        * defend itself. */
-      if (!audio_driver_st.current_audio->buffer_size)
+      if (    !audio_driver_st.current_audio->write_avail
+           || !audio_driver_st.current_audio->buffer_size)
          RARCH_WARN("[Audio] Rate control was desired, but driver does not support needed features.\n");
       else if (audio_driver_st.buffer_size == 0)
          RARCH_WARN("[Audio] Rate control was desired, but the driver "
@@ -3903,7 +4650,11 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
 
 #ifdef HAVE_AUDIOMIXER
    audio_mixer_init(settings->uints.audio_output_sample_rate);
+   AUDIO_FLAGS_SET(&audio_driver_st, AUDIO_FLAG_MIXER_INITED);
 #endif
+
+   if (!audio_driver_transport_configure(settings))
+      RARCH_WARN("[Audio] Pitch-preserving playback unavailable; using ordinary playback.\n");
 
    /* The wrapper thread is created parked and nothing restarts it after
     * a mid-session reinit (SET_SYSTEM_AV_INFO) - the runloop only issues
@@ -3922,23 +4673,69 @@ error:
 
 void audio_driver_pipeline_consumer_exit(void)
 {
-   audio_driver_st.pipe_consumer_gone = true;
+   /* Release: the consumer's loop is done before the word that says so. */
+   retro_atomic_store_release_int(&audio_driver_st.pipe_consumer_gone, 1);
 }
 
 void audio_driver_publish_runloop(void)
 {
+   int      ratio_bits;
+   float    ratio;
+   settings_t *settings = config_get_ptr();
    uint32_t rf = runloop_get_flags();
    int      v  = 0;
    if (rf & RUNLOOP_FLAG_PAUSED)
       v |= AUDIO_SNAP_PAUSED;
    if (rf & RUNLOOP_FLAG_SLOWMOTION)
       v |= AUDIO_SNAP_SLOWMOTION;
-   if (rf & RUNLOOP_FLAG_FASTMOTION)
+   /* A callback core's audio is paced by the device, not by retro_run:
+    * fast-forward speeds the video while the callback keeps rendering
+    * real time, so there is no surplus for the speed machinery to
+    * absorb. Worse, that machinery measures flush cadence, and on the
+    * callback's audio thread the cadence IS the device draining - the
+    * measurement confirms whatever multiplier it last applied, seeded
+    * at the configured ratio, which sped the audio up and crackled.
+    * Every speed consumer reads this snapshot and callback cores never
+    * run the threaded pipeline, so withholding the bit here restores
+    * the stable behavior: fast-forward leaves callback audio alone.
+    * Opting in publishes the bit, and the multiplier then comes from
+    * the frame-end cadence measurement, never the flush's own (see
+    * audio_driver_ff_callback_frame_end()). */
+   if ((rf & RUNLOOP_FLAG_FASTMOTION)
+         && (   !audio_driver_st.callback.callback
+             || settings->bools.audio_fastforward_callback))
       v |= AUDIO_SNAP_FASTMOTION;
+   if (settings->bools.audio_sync)
+      v |= AUDIO_SNAP_SYNC;
+   if (settings->bools.audio_fastforward_speedup)
+      v |= AUDIO_SNAP_FF_SPEEDUP;
+   if (settings->bools.audio_sink_rate_estimation)
+      v |= AUDIO_SNAP_SINK_EST;
+   if (settings->bools.audio_fastpath_s16)
+      v |= AUDIO_SNAP_FASTPATH_S16;
+   if (settings->bools.audio_time_stretch_lowpass)
+      v |= AUDIO_SNAP_STRETCH_LPF;
+   ratio = settings->floats.slowmotion_ratio;
+   memcpy(&ratio_bits, &ratio, sizeof(ratio_bits));
+   retro_atomic_store_release_int(
+         &audio_driver_st.runloop_slowmotion_bits, ratio_bits);
+   {
+      /* The seed of the fast-forward estimate wants the ratio the
+       * limiter runs the core at: the override's while one is
+       * active, the setting's otherwise, resolved here where both
+       * are the main thread's to read. */
+      const struct retro_fastforwarding_override *o =
+            &runloop_state_get_ptr()->fastmotion_override.current;
+      ratio = (o->fastforward && o->ratio >= 0.0f)
+            ? o->ratio : settings->floats.fastforward_ratio;
+      memcpy(&ratio_bits, &ratio, sizeof(ratio_bits));
+      retro_atomic_store_release_int(
+            &audio_driver_st.runloop_ffratio_bits, ratio_bits);
+   }
 #ifdef HAVE_MENU
    if (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE)
       v |= AUDIO_SNAP_MENU_ALIVE;
-   if (config_get_ptr()->bools.menu_pause_libretro)
+   if (settings->bools.menu_pause_libretro)
       v |= AUDIO_SNAP_MENU_PAUSES;
 #ifdef HAVE_NETWORKING
    if (netplay_driver_ctl(RARCH_NETPLAY_CTL_ALLOW_PAUSE, NULL))
@@ -4010,6 +4807,20 @@ static void audio_driver_pipeline_signal(audio_driver_state_t *audio_st)
  * mixer from another thread outside an initialised audio driver would
  * find no lock and no diagnostic, so anything that widens who touches
  * that state has to widen this lifetime with it.
+ *
+ * This lock is the deliberate remainder of the subsystem's threading
+ * design, not a candidate for the atomics treatment the rest of the
+ * audio state received. Everything cheap to publish already crosses
+ * without it - runloop_snapshot, the AUDIO_FLAGS word, the SPSC pipe
+ * ring, the eventcount wakeups - and what it still serializes is the
+ * part atomics cannot: the driver's own write() and control calls
+ * against device reinit, the resampler and DSP instances against
+ * their replacement, the mixer's voice table against task-thread
+ * play() calls, and a nesting contract the mixer_lock sample pins.
+ * The per-batch cost is one uncontended acquire around work that is
+ * microseconds of resampling and device I/O; the batch budget holds
+ * with room. Shrinking a section here is welcome; removing the lock
+ * means re-answering every one of those ownership questions at once.
  **/
 void audio_driver_state_lock(void)
 {
@@ -4025,6 +4836,306 @@ void audio_driver_state_unlock(void)
    if (audio_driver_st.state_lock)
       slock_unlock(audio_driver_st.state_lock);
 #endif
+}
+
+/* Converts to the device's format if it needs it, and writes. The pause
+ * tail reaches the device outside audio_driver_flush()'s own conversion. */
+static void audio_driver_write_float(audio_driver_state_t *audio_st,
+      const audio_driver_t *audio, const float *data, size_t frames)
+{
+   if (frames < 1)
+      return;
+   if (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_USE_FLOAT)
+      audio_driver_write_frames(audio_st, audio, data, frames, true, false);
+   else
+   {
+      int16_t buf[AUDIO_PAUSE_TAIL_FRAMES * 2];
+      if (frames > AUDIO_PAUSE_TAIL_FRAMES)
+         frames = AUDIO_PAUSE_TAIL_FRAMES;
+      convert_float_to_s16(buf, data, frames * 2);
+      audio_driver_write_frames(audio_st, audio, buf, frames, false, false);
+   }
+}
+
+/* Index into pause_hist for a given age. The one modulo here is paid once
+ * per call; audio_driver_pause_tail_period()'s search instead walks the
+ * ring with audio_driver_pause_hist_prev() to avoid paying it per frame. */
+static unsigned audio_driver_pause_hist_idx(
+      audio_driver_state_t *audio_st, unsigned age)
+{
+   return (audio_st->pause_hist_pos + AUDIO_PAUSE_HIST_FRAMES - age)
+         % AUDIO_PAUSE_HIST_FRAMES;
+}
+
+/* The stereo frame 'age' frames back from the most recently played one; age
+ * 1 is that frame itself. The caller checks the age against
+ * pause_hist_fill. */
+static const float *audio_driver_pause_hist_at(
+      audio_driver_state_t *audio_st, unsigned age)
+{
+   return &audio_st->pause_hist[audio_driver_pause_hist_idx(audio_st, age) * 2];
+}
+
+/* Steps a pause_hist index one frame older, wrapping without a modulo. */
+static INLINE unsigned audio_driver_pause_hist_prev(unsigned idx)
+{
+   return idx ? (idx - 1) : (AUDIO_PAUSE_HIST_FRAMES - 1);
+}
+
+/* Period, in output frames, that the pause tail should repeat: the lag whose
+ * copy of the last AUDIO_PAUSE_TAIL_CORR_FRAMES frames matches them best.
+ *
+ * Fading the last sample as a constant is a decaying DC offset rather than a
+ * decaying sound, and is heard as a thump. Repeating one period keeps the
+ * spectrum of what was playing and only takes its level away - the same
+ * concealment a packet-loss hider does.
+ *
+ * Returns 0 when there is not enough history to search, leaving the caller on
+ * the DC ramp. */
+static unsigned audio_driver_pause_tail_period(
+      audio_driver_state_t *audio_st)
+{
+   unsigned p;
+   unsigned best      = 0;
+   float    best_diff = -1.0f;
+   unsigned max_p     = AUDIO_PAUSE_TAIL_MAX_PERIOD;
+   float    e_ref     = 0.0f;
+   unsigned k;
+   unsigned idx;
+
+   if (audio_st->pause_hist_fill
+         < AUDIO_PAUSE_TAIL_MIN_PERIOD + AUDIO_PAUSE_TAIL_CORR_FRAMES)
+      return 0;
+   /* Search only as far back as there is history for. */
+   if (audio_st->pause_hist_fill < max_p + AUDIO_PAUSE_TAIL_CORR_FRAMES)
+      max_p = audio_st->pause_hist_fill - AUDIO_PAUSE_TAIL_CORR_FRAMES;
+
+   /* Matched on the channel sum: the two channels share a fundamental, and
+    * scoring them together stops a quiet channel's noise choosing the period
+    * for a loud one. The energy only decides whether there is anything here
+    * worth matching. */
+   idx = audio_driver_pause_hist_idx(audio_st, 1);
+   for (k = 0; k < AUDIO_PAUSE_TAIL_CORR_FRAMES; k++)
+   {
+      const float *f = &audio_st->pause_hist[idx * 2];
+      float        v = f[0] + f[1];
+      e_ref         += v * v;
+      idx            = audio_driver_pause_hist_prev(idx);
+   }
+   if (e_ref <= 0.0f)
+      return 0;
+
+   for (p = AUDIO_PAUSE_TAIL_MIN_PERIOD; p <= max_p; p++)
+   {
+      float    diff = 0.0f;
+      unsigned ia   = audio_driver_pause_hist_idx(audio_st, 1);
+      unsigned ib   = audio_driver_pause_hist_idx(audio_st, 1 + p);
+      for (k = 0; k < AUDIO_PAUSE_TAIL_CORR_FRAMES; k++)
+      {
+         const float *a = &audio_st->pause_hist[ia * 2];
+         const float *b = &audio_st->pause_hist[ib * 2];
+         float        d = (a[0] + a[1]) - (b[0] + b[1]);
+         diff          += d * d;
+         ia             = audio_driver_pause_hist_prev(ia);
+         ib             = audio_driver_pause_hist_prev(ib);
+      }
+      /* Scored by distance rather than correlation: a normalised
+       * correlation is blind to level, so the same phrase at half or twice
+       * the volume scores a perfect 1.0 and repeating it steps the
+       * waveform. */
+      if (best_diff < 0.0f || diff < best_diff)
+      {
+         best_diff = diff;
+         best      = p;
+      }
+   }
+
+   /* No threshold on the score: content with no periodicity has no right
+    * answer, and repeating the closest recent stretch of it still hands back
+    * the right spectrum at the right level. The DC ramp is only for having no
+    * history. */
+   return best;
+}
+
+/* Answered on the ramp, not on RUNLOOP_FLAG_PAUSED: menu_pause_libretro
+ * stops core_run() without setting it, so a core with its own audio thread
+ * carries on after the tail, and a state load is not paused at all. Only
+ * the core's own audio is gated; the menu filler and mixer share the flush. */
+bool audio_driver_core_silenced(void)
+{
+   return retro_atomic_load_acquire_int(
+         &audio_driver_st.core_silenced) != 0;
+}
+
+void audio_driver_pause_fade(bool paused)
+{
+   audio_driver_state_t *audio_st = &audio_driver_st;
+   const audio_driver_t *audio    = audio_st->current_audio;
+   bool was_silenced;
+   unsigned i;
+
+   if (     !audio
+         || !audio->write
+         || !audio_st->context_audio_data
+         || !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_ACTIVE))
+      return;
+
+   /* Whether the stream is already down decides what a resume has to do, so
+    * read it before the store below overwrites it. */
+   was_silenced = audio_driver_core_silenced();
+
+   /* Published before the lock is taken, so a core delivering on a thread of
+    * its own stops handing audio over while this waits for the flush already
+    * in flight. See audio_driver_core_silenced(). */
+   retro_atomic_store_release_int(&audio_st->core_silenced, paused ? 1 : 0);
+
+   /* Everything below writes to the device or touches state audio_driver_
+    * flush() owns, and flush runs on whichever thread the core delivers on.
+    * Without the lock the tail lands in the middle of a core thread's own
+    * write and that thread's buffer arrives behind it at full level. */
+   audio_driver_state_lock();
+
+   if (!paused)
+   {
+      /* Ramp the first frames of whatever comes back, in audio_driver_flush;
+       * nothing to write here, the core has not produced it yet.
+       *
+       * Only when the stream was actually taken down: a resume can arrive
+       * without its pause (menu_pause_libretro turned off from inside the
+       * menu it paused), and ramping audio that never stopped is a dip in the
+       * middle of it. */
+      if (was_silenced)
+      {
+         audio_st->fade_in_pending = true;
+         /* And refill the device ahead of that first frame; see
+          * audio_driver_resume_topup(). */
+         audio_st->resume_topup_pending = true;
+      }
+      /* Whatever the pipeline was holding at the pause is long gone; do not
+       * take the resumed audio for it. */
+      audio_st->pause_mute_frames = 0;
+      audio_driver_state_unlock();
+      return;
+   }
+
+   audio_st->fade_in_frames  = 0;
+   audio_st->fade_in_pending = false;
+#ifdef HAVE_THREADS
+   /* Nothing published so far reaches the device: the tail below ends
+    * the stream, and the consumer takes the ring out up to here. */
+   retro_atomic_store_release_size(&audio_st->pipe_discard_to,
+         retro_atomic_load_acquire_size(&audio_st->pipe_ring.head));
+   retro_atomic_fetch_add_int(&audio_st->pipe_discard_gen, 1);
+   retro_atomic_store_release_int(&audio_st->pipe_fade_in_set, 0);
+#endif
+
+   /* Only when something was playing is there a step to smooth. */
+   if (     audio_st->last_out[0] != 0.0f
+         || audio_st->last_out[1] != 0.0f)
+   {
+      float    ramp[AUDIO_PAUSE_TAIL_FRAMES * 2];
+      unsigned period = audio_driver_pause_tail_period(audio_st);
+      unsigned n      = AUDIO_PAUSE_TAIL_FRAMES;
+      float    join[2];
+
+      /* While fast-forward keeps a non-blocking device pinned full only a
+       * fraction of the tail fits; fit the ramp to the room so it still
+       * reaches silence. */
+      if (     (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_NONBLOCK)
+            && audio->write_avail)
+      {
+         size_t fb   = audio_driver_dev_frame_bytes(audio_st);
+         size_t room = audio->write_avail(audio_st->context_audio_data) / fb;
+         if (room < n)
+            n = (unsigned)room;
+      }
+
+      /* However good the match, the repeat starts at its own value rather
+       * than the one the stream stopped on, and that difference is a step at
+       * the head of the ramp where the gain is still 1. Start the tail where
+       * the audio actually stopped and let the correction decay away. The
+       * same difference recurs at every wrap, so it is applied against the
+       * position within the period rather than within the ramp. */
+      if (period)
+      {
+         /* Age period+1, not period: the frame matching the last one played
+          * is a whole period before it, and age period is already its
+          * successor - the frame the tail opens on. */
+         const float *f = audio_driver_pause_hist_at(audio_st, period + 1);
+         join[0] = audio_st->last_out[0] - f[0];
+         join[1] = audio_st->last_out[1] - f[1];
+      }
+      else
+         join[0] = join[1] = 0.0f;
+
+      for (i = 0; i < n; i++)
+      {
+         /* Raised cosine: a linear ramp still corners at both ends. */
+         float g = 0.5f * (1.0f + cosf((float)M_PI * (float)(i + 1)
+               / (float)n));
+         if (period)
+         {
+            /* Age 'period' continues the waveform from where it stopped;
+             * wrapping back to it repeats that cycle for as long as the
+             * envelope lasts. */
+            unsigned     u = (unsigned)(i % period);
+            const float *f = audio_driver_pause_hist_at(audio_st, period - u);
+            /* Over whichever is shorter, the join window or the period. The
+             * correction must be spent by the time the repeat wraps: the
+             * waveform steps by -join there and j returning to 1 is what
+             * cancels it, so an undecayed remainder would recur every wrap as
+             * a sawtooth at the period's own rate. */
+            unsigned    jn = (AUDIO_PAUSE_TAIL_JOIN_FRAMES < period)
+                  ? AUDIO_PAUSE_TAIL_JOIN_FRAMES : period - 1;
+            float        j = (u < jn)
+                  ? (1.0f - (float)u / (float)jn)
+                  : 0.0f;
+            ramp[(i * 2) + 0] = (f[0] + join[0] * j) * g;
+            ramp[(i * 2) + 1] = (f[1] + join[1] * j) * g;
+         }
+         else
+         {
+            ramp[(i * 2) + 0] = audio_st->last_out[0] * g;
+            ramp[(i * 2) + 1] = audio_st->last_out[1] * g;
+         }
+      }
+      audio_driver_write_float(audio_st, audio, ramp, n);
+   }
+
+   audio_st->last_out[0]       = 0.0f;
+   audio_st->last_out[1]       = 0.0f;
+   audio_st->pause_mute_frames = AUDIO_PAUSE_MUTE_FRAMES;
+   /* The stretch holds its lookahead of stale audio at full level, and the
+    * silence the menu feeds would push it out behind the ramp that just
+    * ended the sound. Safe to discard here and nowhere else: the output is
+    * going to silence either way. */
+   audio_driver_inline_reset(audio_st);
+   audio_driver_state_unlock();
+}
+
+bool audio_driver_jump_fade_begin(void)
+{
+   if (audio_driver_core_silenced())
+      return false;
+   audio_driver_pause_fade(true);
+   return true;
+}
+
+void audio_driver_jump_fade_end(bool ramped)
+{
+   if (ramped)
+      audio_driver_pause_fade(false);
+}
+
+/* Arms the resume ramp owed since the last resume. Under the state lock,
+ * on the flush that carries the core's first audio. */
+static void audio_driver_arm_resume(audio_driver_state_t *audio_st)
+{
+   if (audio_st->fade_in_pending)
+   {
+      audio_st->fade_in_frames  = AUDIO_PAUSE_TAIL_FRAMES;
+      audio_st->fade_in_pending = false;
+   }
 }
 
 void audio_driver_pipeline_wake(void)
@@ -4111,12 +5222,44 @@ static size_t audio_driver_pipe_chunk_bytes(audio_driver_state_t *audio_st)
  * shorter than a video frame at the low latency settings. That is a
  * gap at the frame rate, and it is what the threaded pipeline was
  * doing on CoreAudio at 8 ms while the inline path was clean. */
+/* How long the producer may wait for the consumer to complete a pass.
+ * That pass is paced by the device draining the source the ring holds,
+ * so the bound is the ring's own playing time at the speed it is being
+ * pulled at - shorter in fast-forward, where the pull is faster and
+ * where this wait is now reached at all. Flat, it was a second, and a
+ * device that had stopped draining cost the frontend every bit of it
+ * before the stall was latched. */
+static retro_time_t audio_driver_pipe_wait_us(audio_driver_state_t *audio_st)
+{
+   double us, mult = 1.0;
+   size_t frames;
+   if (!audio_st->pipe_frame_bytes || !(audio_st->input > 0.0f))
+      return AUDIO_PIPE_WAIT_MAX_US;
+   if (retro_atomic_load_acquire_int(&audio_st->runloop_snapshot)
+         & AUDIO_SNAP_FASTMOTION)
+   {
+      mult = (double)retro_atomic_load_acquire_int(&audio_st->pipe_ff_mult_q16)
+         / 65536.0;
+      if (!(mult > 0.0) || mult > 1.0)
+         mult = 1.0;
+   }
+   frames = audio_st->pipe_ring.capacity / audio_st->pipe_frame_bytes;
+   us     = (double)frames * mult * AUDIO_PIPE_WAIT_FILLS * 1000000.0
+      / (double)audio_st->input;
+   if (us < AUDIO_PIPE_WAIT_MIN_US)
+      return AUDIO_PIPE_WAIT_MIN_US;
+   if (us > AUDIO_PIPE_WAIT_MAX_US)
+      return AUDIO_PIPE_WAIT_MAX_US;
+   return (retro_time_t)us;
+}
+
 static size_t audio_driver_pipe_target_frames(audio_driver_state_t *audio_st)
 {
    size_t frame_bytes, target, ring_max;
+   int snap = retro_atomic_load_acquire_int(&audio_st->runloop_snapshot);
    if (!audio_st->buffer_size)
       return 0;
-   if (config_get_ptr()->bools.audio_sync)
+   if (snap & AUDIO_SNAP_SYNC)
       target      = 0;
    else
    {
@@ -4182,7 +5325,8 @@ static INLINE void audio_driver_pipe_widen_stereo(void *output, const void *inpu
  * the threaded pipeline it publishes the block into pipe_ring for the
  * audio thread; otherwise it runs the pipeline inline, exactly as
  * before. When the ring is full the producer waits unless the driver
- * is in its non-blocking state (fast-forward, audio_sync off), in
+ * is in its non-blocking state (audio_sync off, or a fast-forward the
+ * consumer does not pull at a limited speed), in
  * which case the remainder is dropped - the same choice a full device
  * buffer forces on a non-blocking write. This is the only place the
  * main thread ever waits on audio, and it waits on the device draining,
@@ -4190,79 +5334,146 @@ static INLINE void audio_driver_pipe_widen_stereo(void *output, const void *inpu
  **/
 static void audio_driver_submit_width(audio_driver_state_t *audio_st,
       float slowmotion_ratio, const void *data, size_t samples, bool is_float,
-      bool is_slowmotion, bool is_fastforward, unsigned canon_width);
+      bool is_slowmotion, bool is_fastforward, bool from_core,
+      unsigned canon_width);
 
 /* A publish of stereo frames, samples = frames * 2, from the classic
- * entries and the accumulator. */
+ * entries and the accumulator. from_core says the audio is the core's
+ * own rather than the menu's filler; see audio_driver_arm_resume(). */
 static void audio_driver_submit(audio_driver_state_t *audio_st,
       float slowmotion_ratio, const void *data, size_t samples, bool is_float,
-      bool is_slowmotion, bool is_fastforward)
+      bool is_slowmotion, bool is_fastforward, bool from_core)
 {
+   if (audio_st->pipe_channels > 2)
+      audio_st->pipe_layout = AUDIO_LAYOUT_STEREO;
    audio_driver_submit_width(audio_st, slowmotion_ratio, data, samples, is_float,
-         is_slowmotion, is_fastforward, 2);
+         is_slowmotion, is_fastforward, from_core, 2);
 }
 
-/* A publish of frames canon_width samples wide: the ring's width,
- * or stereo to be widened onto a wide ring. */
+#ifdef HAVE_THREADS
+/* layout == 0 means already canonical. No input/output alias is permitted. */
+static void audio_driver_pipe_map(void *dst, const void *src, size_t frames,
+      unsigned channels, unsigned pc, unsigned layout, const unsigned *slots,
+      bool input_float, bool output_float)
+{
+   size_t f;
+   unsigned c;
+   size_t sample = output_float ? sizeof(float) : sizeof(int16_t);
+   if (!layout)
+   {
+      if (input_float == output_float)
+         memcpy(dst, src, frames * channels * sample);
+      else if (input_float)
+         convert_float_to_s16((int16_t*)dst, (const float*)src, frames * channels);
+      else
+         convert_s16_to_float((float*)dst, (const int16_t*)src, frames * channels, 1.0f);
+      return;
+   }
+   if (channels == 2 && layout == AUDIO_LAYOUT_STEREO)
+   {
+      audio_driver_pipe_widen_stereo(dst, src, frames, pc, input_float, output_float);
+      return;
+   }
+   if (input_float == output_float && audio_driver_pipe_widen_prefix(dst,
+            src, frames, channels, layout, input_float))
+      return;
+   memset(dst, 0, frames * pc * sample);
+   for (f = 0; f < frames; f++)
+      for (c = 0; c < channels; c++)
+      {
+         size_t in = f * channels + c, out = f * pc + slots[c];
+         if (output_float)
+            ((float*)dst)[out] = input_float ? ((const float*)src)[in]
+               : ((const int16_t*)src)[in] * (1.0f / 32768.0f);
+         else if (input_float)
+            ((int16_t*)dst)[out] = (int16_t)audio_float_to_s16_sat(((const float*)src)[in]);
+         else
+            ((int16_t*)dst)[out] = ((const int16_t*)src)[in];
+      }
+}
+
+static size_t audio_driver_pipe_write_mapped(audio_driver_state_t *audio_st,
+      const void *data, size_t frames, unsigned channels, unsigned layout,
+      const unsigned *slots, bool floating)
+{
+   const unsigned pc = audio_st->pipe_channels ? audio_st->pipe_channels : 2;
+   const size_t fb = audio_st->pipe_frame_bytes;
+   const size_t input_fb = channels * (floating ? sizeof(float) : sizeof(int16_t));
+   size_t done = 0;
+   while (done < frames)
+   {
+      void *dst;
+      size_t span = retro_spsc_write_begin(&audio_st->pipe_ring, &dst);
+      size_t n = span / fb;
+      const uint8_t *src = (const uint8_t*)data + done * input_fb;
+      if (n > frames - done) n = frames - done;
+      if (n && !((uintptr_t)dst % (audio_st->pipe_float ? sizeof(float) : sizeof(int16_t))))
+      {
+         if (layout && floating != audio_st->pipe_float)
+         {
+            /* Keep the bulk SIMD converters on mixed-format sources. Only
+             * packed active channels enter scratch; canonical silence is
+             * written directly into the reservation, never converted. */
+            size_t cap = (AUDIO_PIPE_SLICE_INT16S / 2) * 2 / channels;
+            if (n > cap) n = cap;
+            if (floating)
+               convert_float_to_s16((int16_t*)audio_st->pipe_conv,
+                     (const float*)src, n * channels);
+            else
+               convert_s16_to_float((float*)audio_st->pipe_conv,
+                     (const int16_t*)src, n * channels, 1.0f);
+            audio_driver_pipe_map(dst, audio_st->pipe_conv, n, channels, pc,
+                  layout, slots, audio_st->pipe_float, audio_st->pipe_float);
+         }
+         else
+            audio_driver_pipe_map(dst, src, n, channels, pc, layout, slots,
+                  floating, audio_st->pipe_float);
+         retro_spsc_write_end(&audio_st->pipe_ring, n * fb);
+      }
+      else
+      {
+         union { float f[AUDIO_PIPE_CANON_CHANNELS]; int16_t i[AUDIO_PIPE_CANON_CHANNELS]; } frame;
+         retro_spsc_write_end(&audio_st->pipe_ring, 0);
+         if (retro_spsc_write_avail(&audio_st->pipe_ring) < fb) break;
+         /* A physical wrap can split a logical frame. Publish it atomically
+          * through the frame writer; never expose a partial frame. */
+         audio_driver_pipe_map(&frame, src, 1, channels, pc, layout, slots,
+               floating, audio_st->pipe_float);
+         n = retro_spsc_write_frames(&audio_st->pipe_ring, &frame, 1, fb);
+         if (!n) break;
+      }
+      done += n;
+   }
+   return done * fb;
+}
+#endif
+
+/* Publish native frames. A packed width smaller than the wide ring maps
+ * the producer layout into canonical slots; stereo always uses FL/FR. */
 static void audio_driver_submit_width(audio_driver_state_t *audio_st,
       float slowmotion_ratio, const void *data, size_t samples, bool is_float,
-      bool is_slowmotion, bool is_fastforward, unsigned canon_width)
+      bool is_slowmotion, bool is_fastforward, bool from_core,
+      unsigned canon_width)
 {
 #ifdef HAVE_THREADS
    if (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_PIPELINE_THREADED)
    {
       const uint8_t *p = (const uint8_t*)data;
       const unsigned pc = audio_st->pipe_channels ? audio_st->pipe_channels : 2;
-      size_t frames    = samples / pc;
+      size_t frames    = samples / canon_width;
       size_t len       = frames * audio_st->pipe_frame_bytes;
-
-      /* Stereo from the classic entries on a wide ring: widened into
-       * the canonical frame, the other slots zero, a pass at a time.
-       * The fronts are the frame's first two slots either way. */
-      if (canon_width == 2 && pc > 2)
+      size_t input_fb  = canon_width * (is_float ? sizeof(float) : sizeof(int16_t));
+      unsigned slots[AUDIO_PIPE_CANON_CHANNELS], bit, count = 0;
+      unsigned source_layout = canon_width != pc && pc > 2 ? audio_st->pipe_layout : 0;
+      bool mapped;
+      if (source_layout)
       {
-         size_t pass = (AUDIO_PIPE_SLICE_INT16S / 2) * 2 / pc;
-         size_t sample = is_float ? sizeof(float) : sizeof(int16_t);
-         size_t stereo_frames = samples >> 1;
-         audio_st->pipe_layout = AUDIO_LAYOUT_STEREO;
-         while (stereo_frames)
-         {
-            size_t n = stereo_frames > pass ? pass : stereo_frames;
-            uint8_t *dst = audio_st->pipe_conv;
-            audio_driver_pipe_widen_stereo(dst, data, n, pc, is_float, audio_st->pipe_float);
-            audio_driver_submit_width(audio_st, slowmotion_ratio, dst, n * pc, audio_st->pipe_float,
-                  is_slowmotion, is_fastforward, pc);
-            stereo_frames -= n;
-            data = (const uint8_t*)data + n * 2 * sample;
-         }
-         return;
+         for (bit = 0; bit < pc; bit++)
+            if (source_layout & (1u << bit)) slots[count++] = bit;
+         if (count != canon_width) return;
+         audio_st->pipe_layout = source_layout;
       }
-
-      /* Publishes in the ring's format go in as they are; the other
-       * format is converted into the staging area, a pass at a time,
-       * and published from there - a float core's publish never
-       * touches int16 on a float ring. */
-      if (is_float != audio_st->pipe_float)
-      {
-         size_t pass = (AUDIO_PIPE_SLICE_INT16S / 2) * 2 / pc;   /* the staging holds a pass of stereo float */
-         while (frames)
-         {
-            size_t n = frames > pass ? pass : frames;
-            if (is_float)
-               convert_float_to_s16((int16_t*)audio_st->pipe_conv,
-                     (const float*)data, n * pc);
-            else
-               convert_s16_to_float((float*)audio_st->pipe_conv,
-                     (const int16_t*)data, n * pc, 1.0f);
-            audio_driver_submit_width(audio_st, slowmotion_ratio,
-                  audio_st->pipe_conv, n * pc, audio_st->pipe_float,
-                  is_slowmotion, is_fastforward, pc);
-            frames -= n;
-            data    = is_float ? (const void*)((const float*)data + n * pc)
-                               : (const void*)((const int16_t*)data + n * pc);
-         }
-         return;
-      }
+      mapped = source_layout || is_float != audio_st->pipe_float;
 
       /* Rate control's fill, before this frame goes in; see
        * pipe_ctrl_avail. */
@@ -4310,22 +5521,50 @@ static void audio_driver_submit_width(audio_driver_state_t *audio_st,
       }
       /* Count before the ring write so dropped source still contributes.
        * Measure once at frame end, independently of publish granularity. */
-      if (is_fastforward && config_get_ptr()->bools.audio_fastforward_speedup)
+      if (is_fastforward && audio_driver_ff_follows(audio_st,
+               (retro_atomic_load_acquire_int(&audio_st->runloop_snapshot)
+                & AUDIO_SNAP_FF_SPEEDUP) != 0))
+      {
+         /* The first frame of a hold publishes the seed, so the tempo
+          * lands with this frame's source rather than a frame later. */
+         if (!audio_st->last_flush_time && !audio_st->pipe_ff_frames)
+         {
+            double ratio = audio_driver_snapshot_ffratio(audio_st);
+            if (ratio > 1.0)
+               retro_atomic_store_release_int(&audio_st->pipe_ff_mult_q16,
+                     (int)(65536.0 / ratio));
+         }
          audio_st->pipe_ff_frames = frames > SIZE_MAX - audio_st->pipe_ff_frames
             ? SIZE_MAX : audio_st->pipe_ff_frames + frames;
+      }
       else
          audio_driver_ff_mult_reset(audio_st);
+      if (len && (audio_st->pipe_transport_follow & AUDIO_TRANSPORT_UPDATE)
+            && !audio_driver_transport_update_runloop(audio_st))
+         len = 0;
       /* Never publish samples without their preceding layout boundary. */
       if (pc > 2 && len && !audio_pipeline_layout_publish(&audio_st->pipe_layouts,
                retro_atomic_load_relaxed_size(&audio_st->pipe_ring.head),
                audio_st->pipe_layout))
          len = 0;
 
+      /* The resume ramp belongs to the core's first audio, not to
+       * whatever the consumer flushes next: mark where that starts. */
+      if (from_core && audio_st->fade_in_pending)
+      {
+         retro_atomic_store_release_size(&audio_st->pipe_fade_in_at,
+               retro_atomic_load_relaxed_size(&audio_st->pipe_ring.head));
+         retro_atomic_store_release_int(&audio_st->pipe_fade_in_set, 1);
+         audio_st->fade_in_pending = false;
+      }
+
       while (len)
       {
          int gen;
-         size_t n = pc > 2
-            ? retro_spsc_write_frames(&audio_st->pipe_ring, p,
+         size_t n = mapped
+            ? audio_driver_pipe_write_mapped(audio_st, p,
+                  len / audio_st->pipe_frame_bytes, canon_width, source_layout, slots, is_float)
+            : pc > 2 ? retro_spsc_write_frames(&audio_st->pipe_ring, p,
                   len / audio_st->pipe_frame_bytes, audio_st->pipe_frame_bytes)
                   * audio_st->pipe_frame_bytes
             : retro_spsc_write(&audio_st->pipe_ring, p, len);
@@ -4335,12 +5574,13 @@ static void audio_driver_submit_width(audio_driver_state_t *audio_st,
           * neither the ring nor what it refused is in the measure. */
          audio_st->sink_offered += (double)(n / audio_st->pipe_frame_bytes)
                * audio_st->src_ratio_orig;
-         p       += n;
+         p       += (n / audio_st->pipe_frame_bytes) * input_fb;
          len     -= n;
          if (!len)
             break;
          /* Only wait on a consumer that can make progress: the driver
-          * is started and blocking. A driver reinit from inside
+          * is started, and blocking or, in fast-forward, pulling at the
+          * core's speed. A driver reinit from inside
           * retro_run() (SET_SYSTEM_AV_INFO) creates the wrapper thread
           * parked until the runloop starts it, and the runloop is us;
           * a wrapper whose device write failed exits its loop and will
@@ -4348,10 +5588,13 @@ static void audio_driver_submit_width(audio_driver_state_t *audio_st,
           * Not through the driver's alive(): the wrapper implements
           * that by parking and resuming its thread, which stops and
           * restarts the device every call. */
-         if (     is_fastforward
-               || (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_NONBLOCK)
-               || !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_STARTED)
-               || audio_st->pipe_consumer_gone)
+         if (is_fastforward
+               ? !audio_driver_pipe_ff_waits(audio_st)
+               : (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_NONBLOCK) != 0)
+            break;
+         if (     !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_STARTED)
+               || retro_atomic_load_acquire_int(
+                     &audio_st->pipe_consumer_gone))
             break;
          /* Sleep until the consumer has completed a pass. The
           * generation is taken first, then the wait window is opened
@@ -4377,7 +5620,7 @@ static void audio_driver_submit_width(audio_driver_state_t *audio_st,
              * would be a bound on nothing: enough of them and the
              * frontend sits here for multiples of it. */
             retro_time_t deadline = cpu_features_get_time_usec()
-                  + AUDIO_PIPE_WAIT_MAX_US;
+                  + audio_driver_pipe_wait_us(audio_st);
             /* The frame-end signal cannot arrive while its producer waits
              * here. Wake a consumer parked for data before waiting for space. */
             audio_driver_pipeline_signal(audio_st);
@@ -4423,8 +5666,13 @@ static void audio_driver_submit_width(audio_driver_state_t *audio_st,
    }
 #endif
    audio_driver_state_lock();
-   audio_driver_flush(audio_st, slowmotion_ratio, data, samples, is_float,
-         is_slowmotion, is_fastforward);
+   if (from_core)
+      audio_driver_arm_resume(audio_st);
+   if (!audio_st->inline_transport
+         || !audio_driver_inline_flush(audio_st, slowmotion_ratio, data, samples,
+            is_float, is_slowmotion, is_fastforward))
+      audio_driver_flush(audio_st, slowmotion_ratio, data, samples, is_float,
+            is_slowmotion, is_fastforward);
    audio_driver_state_unlock();
 }
 
@@ -4442,7 +5690,7 @@ static void audio_driver_pipeline_retry(audio_driver_state_t *audio_st)
    snap = retro_atomic_load_acquire_int(&audio_st->runloop_snapshot);
    if ((snap & AUDIO_SNAP_PAUSED)
          || !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_ACTIVE)
-         || (audio->underruns && !config_get_ptr()->bools.audio_sync
+         || (audio->underruns && !(snap & AUDIO_SNAP_SYNC)
             && audio->underruns(audio_st->context_audio_data) != audio_st->pipe_underruns_seen))
    {
       audio_st->pipe_pending = NULL;
@@ -4498,9 +5746,23 @@ static INLINE void audio_driver_pipeline_render(audio_driver_state_t *audio_st,
 {
    const void *front = source;
    audio_driver_state_lock();
+   /* A pause that landed since this chunk was taken has already ended
+    * the stream; the chunk is stale behind its tail. */
+   if (retro_atomic_load_acquire_int(&audio_st->pipe_discard_gen)
+         != audio_st->pipe_discard_seen)
+   {
+      audio_st->pipe_arm_fade = false;
+      audio_driver_state_unlock();
+      return;
+   }
+   if (audio_st->pipe_arm_fade)
+   {
+      audio_st->fade_in_frames = AUDIO_PAUSE_TAIL_FRAMES;
+      audio_st->pipe_arm_fade  = false;
+   }
    if (audio_st->pipe_channels > 2)
    {
-      const unsigned pc = audio_st->pipe_channels;
+      const unsigned pc = audio_st->pipe_channels ? audio_st->pipe_channels : 2;
       uint32_t pos      = layout & ~AUDIO_LAYOUT_STEREO;
       unsigned ex       = audio_layout_channels(pos);
       unsigned slot[AUDIO_PIPE_CANON_CHANNELS];
@@ -4558,7 +5820,7 @@ static INLINE void audio_driver_pipeline_render(audio_driver_state_t *audio_st,
       front = audio_st->pipe_scratch;
    }
    audio_driver_flush(audio_st,
-         config_get_ptr()->floats.slowmotion_ratio,
+         audio_driver_snapshot_slowmotion(audio_st),
          front, have * 2, audio_st->pipe_float,
          (snap & AUDIO_SNAP_SLOWMOTION) ? true : false,
          (snap & AUDIO_SNAP_FASTMOTION) ? true : false);
@@ -4584,8 +5846,14 @@ static bool audio_driver_transport_runloop_tempo(uint32_t *tempo)
    {
       if (flags & RUNLOOP_FLAG_SLOWMOTION)
          duration *= settings->floats.slowmotion_ratio;
+      /* Same rule as audio_driver_publish_runloop(): fast-forward
+       * does not touch a callback core's device-paced audio unless
+       * the person opted in. */
       if ((flags & RUNLOOP_FLAG_FASTMOTION)
-            && settings->bools.audio_fastforward_speedup)
+            && (   !audio_driver_st.callback.callback
+                || settings->bools.audio_fastforward_callback)
+            && audio_driver_ff_follows(&audio_driver_st,
+               settings->bools.audio_fastforward_speedup))
          duration *= retro_atomic_load_acquire_int(
                &audio_driver_st.pipe_ff_mult_q16) / 65536.0;
    }
@@ -4598,30 +5866,101 @@ static bool audio_driver_transport_runloop_tempo(uint32_t *tempo)
    return true;
 }
 
+/* The submit path's variant: the tempo from the published snapshot,
+ * so a callback core's audio thread never reads the runloop or
+ * settings. Configure-time callers keep the live derivation above. */
+static bool audio_driver_transport_snapshot_tempo(uint32_t *tempo)
+{
+   audio_driver_state_t *audio_st = &audio_driver_st;
+   int snap = retro_atomic_load_acquire_int(&audio_st->runloop_snapshot);
+   uint64_t bits;
+   double duration = 1.0;
+   if (!(snap & AUDIO_SNAP_PAUSED))
+   {
+      if (snap & AUDIO_SNAP_SLOWMOTION)
+         duration *= audio_driver_snapshot_slowmotion(audio_st);
+      if ((snap & AUDIO_SNAP_FASTMOTION) && audio_driver_ff_follows(audio_st,
+               (snap & AUDIO_SNAP_FF_SPEEDUP) != 0))
+         duration *= retro_atomic_load_acquire_int(
+               &audio_st->pipe_ff_mult_q16) / 65536.0;
+   }
+   memcpy(&bits, &duration, sizeof(bits));
+   if (bits >= UINT64_C(0x7ff0000000000000)
+         || !(duration >= 1.0 / 32.0 && duration <= 4.0)) return false;
+   *tempo = (uint32_t)(65536.0 / duration + 0.5);
+   return true;
+}
+
 bool audio_driver_pipeline_transport_request_runloop(bool reset, bool lowpass)
 {
    uint32_t tempo;
    if (!audio_driver_transport_runloop_tempo(&tempo)) return false;
    return audio_driver_pipeline_transport_request_speed(tempo,
-         tempo != 65536, reset, lowpass);
+         !audio_driver_st.transport_lpf_only && tempo != 65536, reset, lowpass);
+}
+
+static bool audio_driver_transport_update_runloop(audio_driver_state_t *audio_st)
+{
+   uint32_t tempo;
+   if (!audio_driver_transport_snapshot_tempo(&tempo))
+   {
+      if (audio_st->pipe_transport && !audio_driver_transport_recover(false, 65536))
+         return false;
+      audio_st->pipe_transport_follow &= ~AUDIO_TRANSPORT_UPDATE;
+      return true;
+   }
+   if (audio_st->pipe_transport_suspended)
+   {
+      /* Keep publishing legacy source until both queues can hand over. */
+      if (retro_spsc_read_avail(&audio_st->pipe_ring)
+            || !audio_driver_transport_recover(true, tempo))
+      {
+         audio_st->pipe_transport_follow &= ~AUDIO_TRANSPORT_UPDATE;
+         return true;
+      }
+   }
+   if (!audio_driver_pipeline_transport_publish(tempo,
+            !audio_st->transport_lpf_only && tempo != 65536, false,
+            (audio_st->pipe_transport_follow & AUDIO_TRANSPORT_LOWPASS)
+            ? audio_speed_lpf_cutoff(audio_st->pipe_transport_rate, tempo) : 0,
+            true))
+      return false;
+   audio_st->pipe_transport_follow &= ~AUDIO_TRANSPORT_UPDATE;
+   return true;
+}
+
+static bool audio_driver_pipeline_transport_publish(uint32_t tempo_q16,
+      bool active, bool reset, uint32_t cutoff, bool engage_ahead)
+{
+   audio_driver_state_t *audio_st = &audio_driver_st;
+   audio_pipeline_layout_t *metadata = &audio_st->pipe_layouts;
+   size_t head, position;
+   bool result;
+   if (!audio_st->pipe_threaded || !audio_st->pipe_transport)
+      return false;
+   head     = retro_atomic_load_relaxed_size(&metadata->head);
+   position = retro_atomic_load_relaxed_size(&audio_st->pipe_ring.head);
+   /* Entering fast-forward the ring holds a few frames of 1x source.
+    * Positioned behind it, the tempo would only take effect once that
+    * played out at 1x, with the core running ahead into a full ring
+    * meanwhile; put it at the consumer's position instead, when no
+    * earlier event is pending so the queue stays in order. */
+   if (     engage_ahead && active && tempo_q16 > 65536
+         && !(metadata->published_control & AUDIO_PIPELINE_STRETCH)
+         && head == retro_atomic_load_acquire_size(&metadata->tail))
+      position = retro_atomic_load_acquire_size(&audio_st->pipe_ring.tail);
+   result = audio_pipeline_layout_publish_processing(metadata, position,
+         metadata->published_layout, tempo_q16, active, reset, cutoff);
+   if (retro_atomic_load_relaxed_size(&metadata->head) != head)
+      audio_driver_pipeline_signal(audio_st);
+   return result;
 }
 
 bool audio_driver_pipeline_transport_request(uint32_t tempo_q16,
       bool active, bool reset, uint32_t cutoff)
 {
-   audio_driver_state_t *audio_st = &audio_driver_st;
-   audio_pipeline_layout_t *metadata = &audio_st->pipe_layouts;
-   size_t head;
-   bool result;
-   if (!audio_st->pipe_threaded || !audio_st->pipe_transport)
-      return false;
-   head = retro_atomic_load_relaxed_size(&metadata->head);
-   result = audio_pipeline_layout_publish_processing(metadata,
-         retro_atomic_load_relaxed_size(&audio_st->pipe_ring.head),
-         metadata->published_layout, tempo_q16, active, reset, cutoff);
-   if (retro_atomic_load_relaxed_size(&metadata->head) != head)
-      audio_driver_pipeline_signal(audio_st);
-   return result;
+   return audio_driver_pipeline_transport_publish(tempo_q16, active, reset,
+         cutoff, false);
 }
 
 static bool audio_driver_transport_discard(size_t frames, bool draining)
@@ -4651,12 +5990,12 @@ static bool audio_driver_pipeline_transport_run(struct audio_pipeline_stretch *s
       uint32_t *serial, size_t input_budget, size_t output_budget,
       bool finishing, bool *complete, bool *progress)
 {
-   audio_driver_state_t *audio_st = &audio_driver_st;
-   const audio_driver_t *audio = audio_st->current_audio;
-   struct audio_pipeline_stretch_block block;
-   size_t frame_bytes, cap, released;
-   double ratio;
    int snap;
+   double ratio;
+   size_t frame_bytes, cap, released;
+   struct audio_pipeline_stretch_block block;
+   audio_driver_state_t *audio_st = &audio_driver_st;
+   const audio_driver_t *audio    = audio_st->current_audio;
    *progress = false;
    if (!stage || !serial || !complete || !audio_st->pipe_threaded
          || !audio || !audio->wait_writable || !audio_st->context_audio_data)
@@ -4667,7 +6006,7 @@ static bool audio_driver_pipeline_transport_run(struct audio_pipeline_stretch *s
    if ((snap & AUDIO_SNAP_PAUSED)
          || !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_ACTIVE)
          || !audio_st->output_samples_buf
-         || (audio->underruns && !config_get_ptr()->bools.audio_sync
+         || (audio->underruns && !(snap & AUDIO_SNAP_SYNC)
             && audio->underruns(audio_st->context_audio_data) != audio_st->pipe_underruns_seen))
       return false;
    if (audio_st->pipe_pending_bytes)
@@ -4676,8 +6015,20 @@ static bool audio_driver_pipeline_transport_run(struct audio_pipeline_stretch *s
       *progress = true;
       return true;
    }
-   /* Transport already owns duration; SRC retains only its rate/clock trim. */
-   ratio = audio_driver_effective_ratio(audio_st, false, 1.0f, 1.0);
+   /* WSOLA owns duration only when pitch preservation is selected. A
+    * filter-only pass keeps the ordinary SRC ratio and device-space bound. */
+   if (!audio_st->transport_lpf_only)
+   {
+      snap &= ~(AUDIO_SNAP_SLOWMOTION | AUDIO_SNAP_FASTMOTION);
+      ratio = audio_driver_effective_ratio(audio_st, false, 1.0f, 1.0);
+   }
+   else
+      ratio = audio_driver_effective_ratio(audio_st,
+            (snap & AUDIO_SNAP_SLOWMOTION) != 0,
+            audio_driver_snapshot_slowmotion(audio_st),
+            ((snap & AUDIO_SNAP_FASTMOTION)
+             && (snap & AUDIO_SNAP_FF_SPEEDUP))
+               ? audio_driver_ff_mult(audio_st, input_budget) : 1.0);
    frame_bytes = audio_driver_dev_frame_bytes(audio_st);
    if (output_budget > audio_st->pipe_pass_frames)
       output_budget = audio_st->pipe_pass_frames;
@@ -4711,7 +6062,7 @@ static bool audio_driver_pipeline_transport_run(struct audio_pipeline_stretch *s
    if (block.frames)
    {
       audio_driver_pipeline_render(audio_st, block.data, block.frames,
-            block.layout, snap & ~(AUDIO_SNAP_SLOWMOTION | AUDIO_SNAP_FASTMOTION));
+            block.layout, snap);
       if (!audio_pipeline_stretch_consume(stage, block.frames)) return false;
       if (block.passthrough) released += block.frames;
    }
@@ -4774,10 +6125,11 @@ static bool audio_driver_transport_wait(audio_driver_state_t *st, size_t need,
 
 static void audio_driver_transport_consume(audio_driver_state_t *st)
 {
-   const audio_driver_t *audio = st->current_audio;
-   size_t held = retro_spsc_read_avail(&st->pipe_ring) / st->pipe_frame_bytes;
-   int snap = retro_atomic_load_acquire_int(&st->runloop_snapshot);
    bool complete, progress;
+   const audio_driver_t *audio = st->current_audio;
+   size_t input_budget         = st->pipe_pass_frames;
+   size_t held = retro_spsc_read_avail(&st->pipe_ring) / st->pipe_frame_bytes;
+   int snap    = retro_atomic_load_acquire_int(&st->runloop_snapshot);
    if ((snap & AUDIO_SNAP_PAUSED) || !(AUDIO_FLAGS_GET(st) & AUDIO_FLAG_ACTIVE)
          || !st->output_samples_buf)
    {
@@ -4786,7 +6138,8 @@ static void audio_driver_transport_consume(audio_driver_state_t *st)
       if (!held) audio_driver_transport_wait(st, st->pipe_frame_bytes, 0);
       return;
    }
-   if (audio->underruns && !config_get_ptr()->bools.audio_sync)
+
+   if (audio->underruns && !(snap & AUDIO_SNAP_SYNC))
    {
       size_t seen = audio->underruns(st->context_audio_data);
       if (seen != st->pipe_underruns_seen)
@@ -4820,8 +6173,50 @@ static void audio_driver_transport_consume(audio_driver_state_t *st)
          && audio_pipeline_stretch_needs_input(st->pipe_transport)
          && !audio_driver_transport_wait(st, st->pipe_frame_bytes, 1))
       return;
+   /* What a pause left in the ring is stale behind its tail, and so is
+    * what the stage holds: taken out unplayed, up to where the pause was
+    * published. */
+   {
+      size_t tail = retro_atomic_load_relaxed_size(&st->pipe_ring.tail);
+      int    gen  = retro_atomic_load_acquire_int(&st->pipe_discard_gen);
+      if (gen != st->pipe_discard_seen)
+      {
+         size_t to = retro_atomic_load_acquire_size(&st->pipe_discard_to);
+         if (audio_driver_pipe_ahead(st, tail, to))
+         {
+            size_t frames = (to - tail) / st->pipe_frame_bytes;
+            if (frames > held)
+               frames = held;
+            if (frames > st->pipe_pass_frames)
+               frames = st->pipe_pass_frames;
+            audio_driver_transport_discard(frames, false);
+            return;
+         }
+         audio_driver_transport_discard(0, false);
+         st->pipe_discard_seen = gen;
+      }
+      /* Never across the point the core's audio resumes at: there the
+       * stage drops the silence it holds and the ramp is armed for what
+       * it renders next. */
+      if (retro_atomic_load_acquire_int(&st->pipe_fade_in_set))
+      {
+         size_t at = retro_atomic_load_acquire_size(&st->pipe_fade_in_at);
+         if (audio_driver_pipe_ahead(st, tail, at))
+         {
+            size_t upto = (at - tail) / st->pipe_frame_bytes;
+            if (input_budget > upto)
+               input_budget = upto;
+         }
+         else
+         {
+            audio_driver_transport_discard(0, false);
+            st->pipe_arm_fade = true;
+            retro_atomic_store_release_int(&st->pipe_fade_in_set, 0);
+         }
+      }
+   }
    if (!audio_driver_pipeline_transport_run(st->pipe_transport,
-            &st->pipe_transport_serial, st->pipe_pass_frames,
+            &st->pipe_transport_serial, input_budget,
             st->pipe_pass_frames, false, &complete, &progress))
       return;
    /* Drain retained synthesis before sleeping for more source. */
@@ -4850,10 +6245,10 @@ static void audio_driver_transport_consume(audio_driver_state_t *st)
  **/
 static void audio_driver_pipeline_consume(audio_driver_state_t *audio_st)
 {
+   void    *source;
    int      snap;
    double   out_ratio;
    size_t   frame_bytes, out_bytes, have;
-   void    *source;
    const audio_driver_t *audio = audio_st->current_audio;
 
    if (audio_st->pipe_pending_bytes)
@@ -4966,9 +6361,9 @@ static void audio_driver_pipeline_consume(audio_driver_state_t *audio_st)
    snap        = retro_atomic_load_acquire_int(&audio_st->runloop_snapshot);
    out_ratio   = audio_driver_effective_ratio(audio_st,
          (snap & AUDIO_SNAP_SLOWMOTION) ? true : false,
-         config_get_ptr()->floats.slowmotion_ratio,
+         audio_driver_snapshot_slowmotion(audio_st),
          (   (snap & AUDIO_SNAP_FASTMOTION)
-          && config_get_ptr()->bools.audio_fastforward_speedup)
+          && (snap & AUDIO_SNAP_FF_SPEEDUP))
             ? audio_driver_ff_mult(audio_st, have) : 1.0);
    if (audio_st->buffer_size)
    {
@@ -5006,7 +6401,7 @@ static void audio_driver_pipeline_consume(audio_driver_state_t *audio_st)
     * core's publish and this pass, and a threshold on it alone dropped
     * healthy audio at some phases and none at others. */
    if (     audio->underruns && audio_st->context_audio_data
-         && !config_get_ptr()->bools.audio_sync)
+         && !(snap & AUDIO_SNAP_SYNC))
    {
       size_t seen = audio->underruns(audio_st->context_audio_data);
       if (seen != audio_st->pipe_underruns_seen)
@@ -5052,6 +6447,46 @@ static void audio_driver_pipeline_consume(audio_driver_state_t *audio_st)
       {
          audio_driver_pipeline_pass_done(audio_st, true);
          return;
+      }
+   }
+
+   /* What a pause left in the ring is stale behind its tail: taken out
+    * unplayed, up to where the pause was published. */
+   {
+      size_t tail = retro_atomic_load_relaxed_size(&audio_st->pipe_ring.tail);
+      int    gen  = retro_atomic_load_acquire_int(&audio_st->pipe_discard_gen);
+      if (gen != audio_st->pipe_discard_seen)
+      {
+         size_t to = retro_atomic_load_acquire_size(&audio_st->pipe_discard_to);
+         if (audio_driver_pipe_ahead(audio_st, tail, to))
+         {
+            size_t stale = to - tail;
+            size_t avail = retro_spsc_read_avail(&audio_st->pipe_ring);
+            retro_spsc_skip(&audio_st->pipe_ring, stale < avail ? stale : avail);
+            audio_driver_state_lock();
+            audio_driver_reset_resamplers(audio_st);
+            audio_driver_state_unlock();
+            audio_driver_pipeline_pass_done(audio_st, false);
+            return;
+         }
+         audio_st->pipe_discard_seen = gen;
+      }
+      /* Never across the point the core's audio resumes at: the ramp is
+       * armed for the chunk that starts there. */
+      if (retro_atomic_load_acquire_int(&audio_st->pipe_fade_in_set))
+      {
+         size_t at = retro_atomic_load_acquire_size(&audio_st->pipe_fade_in_at);
+         if (audio_driver_pipe_ahead(audio_st, tail, at))
+         {
+            size_t upto = (at - tail) / audio_st->pipe_frame_bytes;
+            if (have > upto)
+               have = upto;
+         }
+         else
+         {
+            audio_st->pipe_arm_fade = true;
+            retro_atomic_store_release_int(&audio_st->pipe_fade_in_set, 0);
+         }
       }
    }
 
@@ -5176,14 +6611,15 @@ static void audio_driver_sample_accum_flush(audio_driver_state_t *audio_st)
          audio_st->data_ptr / 2, 2, AUDIO_LAYOUT_STEREO, false);
 
    if (!(    (snap & AUDIO_SNAP_PAUSED)
+         ||  audio_driver_core_silenced()
          || !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_ACTIVE)
          || !(audio_st->output_samples_buf)))
       audio_driver_submit(audio_st,
-            config_get_ptr()->floats.slowmotion_ratio,
+            audio_driver_snapshot_slowmotion(audio_st),
             audio_st->sample_accum,
             audio_st->data_ptr, false,
             (snap & AUDIO_SNAP_SLOWMOTION) ? true : false,
-            (snap & AUDIO_SNAP_FASTMOTION) ? true : false);
+            (snap & AUDIO_SNAP_FASTMOTION) ? true : false, true);
 
    audio_st->data_ptr = 0;
 }
@@ -5214,9 +6650,14 @@ void audio_driver_frame_end(void)
 
    /* A core audio callback fills the accumulator on the audio thread and
     * audio_driver_callback() flushes it there; touching it here would
-    * race that thread. */
+    * race that thread. The frame boundary itself is still this thread's
+    * to measure - it is the only cadence fast-forward changes for a
+    * callback core. */
    if (audio_st->callback.callback)
+   {
+      audio_driver_ff_callback_frame_end(audio_st);
       return;
+   }
 
    /* A suspended frame (run-ahead, preemptive frames) produced nothing
     * and flushes nothing, so arming here would leave the flag to be
@@ -5235,9 +6676,7 @@ void audio_driver_frame_end(void)
    if (audio_st->data_ptr)
       audio_driver_sample_accum_flush(audio_st);
 
-#ifdef HAVE_THREADS
    audio_driver_ff_frame_end(audio_st);
-#endif
    audio_driver_pipeline_signal(audio_st);
 }
 
@@ -5249,13 +6688,15 @@ size_t audio_driver_sample_batch(const int16_t *data, size_t frames)
    size_t frames_remaining        = frames;
    recording_state_t *record_st   = recording_state_get_ptr();
    audio_driver_state_t *audio_st = &audio_driver_st;
-   float slowmotion_ratio         = config_get_ptr()->floats.slowmotion_ratio;
+   float slowmotion_ratio         = audio_driver_snapshot_slowmotion(&audio_driver_st);
 
    if ((AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_SUSPENDED) || (frames < 1))
       return frames;
 
-   runloop_flags                  = runloop_get_flags();
-   flush_audio                    = !((runloop_flags & RUNLOOP_FLAG_PAUSED)
+   runloop_flags                  = (uint32_t)retro_atomic_load_acquire_int(
+         &audio_st->runloop_snapshot);
+   flush_audio                    = !((runloop_flags & AUDIO_SNAP_PAUSED)
+            ||  audio_driver_core_silenced()
             || !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_ACTIVE)
             || !(audio_st->output_samples_buf));
    recording_push_audio           = record_st->data
@@ -5282,8 +6723,9 @@ size_t audio_driver_sample_batch(const int16_t *data, size_t frames)
       if (flush_audio)
          audio_driver_submit(audio_st, slowmotion_ratio, data,
                frames_to_write << 1, false,
-               (runloop_flags & RUNLOOP_FLAG_SLOWMOTION) ? true : false,
-               (runloop_flags & RUNLOOP_FLAG_FASTMOTION) ? true : false);
+               (runloop_flags & AUDIO_SNAP_SLOWMOTION) ? true : false,
+               (runloop_flags & AUDIO_SNAP_FASTMOTION) ? true : false,
+               true);
 
       frames_remaining -= frames_to_write;
       data             += frames_to_write << 1;
@@ -5339,8 +6781,7 @@ static bool audio_driver_multi_discrete(audio_driver_state_t *audio_st, unsigned
  * built into it - a slot per speaker bit, FL and FR first, the rest
  * zero - and published, with its layout beside it for the consumer.
  * Returns true when the batch was taken; false to fold it instead. */
-/* Common layouts occupy a canonical prefix. Write each destination sample
- * once: copying the source prefix and clearing only absent positions. */
+/* Common layouts share the first six canonical positions. */
 static INLINE bool audio_driver_pipe_widen_prefix(void *output, const void *input,
       size_t frames, unsigned channels, unsigned layout, bool floating)
 {
@@ -5360,8 +6801,9 @@ static INLINE bool audio_driver_pipe_widen_prefix(void *output, const void *inpu
       else
          for (f = 0; f < frames; f++)
          {
-            memcpy(dst + f * AUDIO_PIPE_CANON_CHANNELS * sizeof(float), src + f * 8 * sizeof(float), 8 * sizeof(float));
-            memset(dst + f * AUDIO_PIPE_CANON_CHANNELS * sizeof(float) + 8 * sizeof(float), 0, 3 * sizeof(float));
+            memcpy(dst + f * AUDIO_PIPE_CANON_CHANNELS * sizeof(float), src + f * 8 * sizeof(float), 6 * sizeof(float));
+            memset(dst + f * AUDIO_PIPE_CANON_CHANNELS * sizeof(float) + 6 * sizeof(float), 0, 3 * sizeof(float));
+            memcpy(dst + (f * AUDIO_PIPE_CANON_CHANNELS + 9) * sizeof(float), src + (f * 8 + 6) * sizeof(float), 2 * sizeof(float));
          }
    }
    else
@@ -5375,8 +6817,9 @@ static INLINE bool audio_driver_pipe_widen_prefix(void *output, const void *inpu
       else
          for (f = 0; f < frames; f++)
          {
-            memcpy(dst + f * AUDIO_PIPE_CANON_CHANNELS * sizeof(int16_t), src + f * 8 * sizeof(int16_t), 8 * sizeof(int16_t));
-            memset(dst + f * AUDIO_PIPE_CANON_CHANNELS * sizeof(int16_t) + 8 * sizeof(int16_t), 0, 3 * sizeof(int16_t));
+            memcpy(dst + f * AUDIO_PIPE_CANON_CHANNELS * sizeof(int16_t), src + f * 8 * sizeof(int16_t), 6 * sizeof(int16_t));
+            memset(dst + f * AUDIO_PIPE_CANON_CHANNELS * sizeof(int16_t) + 6 * sizeof(int16_t), 0, 3 * sizeof(int16_t));
+            memcpy(dst + (f * AUDIO_PIPE_CANON_CHANNELS + 9) * sizeof(int16_t), src + (f * 8 + 6) * sizeof(int16_t), 2 * sizeof(int16_t));
          }
    }
    return true;
@@ -5386,13 +6829,7 @@ static bool audio_driver_multi_pipe(audio_driver_state_t *audio_st,
       const void *data, size_t frames, unsigned channels, unsigned layout, bool is_float)
 {
    uint32_t runloop_flags;
-   const unsigned pc = AUDIO_PIPE_CANON_CHANNELS;
-   size_t sample = is_float ? sizeof(float) : sizeof(int16_t);
-   unsigned slot[AUDIO_PIPE_CANON_CHANNELS], bit, n = 0, c;
-   size_t f, done = 0;
-   size_t capacity = frames > (AUDIO_CHUNK_SIZE_NONBLOCKING >> 1)
-      ? (AUDIO_CHUNK_SIZE_NONBLOCKING >> 1) : frames;
-   if (!audio_st->pipe_threaded || audio_st->pipe_channels != pc)
+   if (!audio_st->pipe_threaded || audio_st->pipe_channels != AUDIO_PIPE_CANON_CHANNELS)
       return false;
 #ifdef HAVE_REWIND
    /* played in reverse, the frames go to the rewind buffer through
@@ -5400,50 +6837,25 @@ static bool audio_driver_multi_pipe(audio_driver_state_t *audio_st,
    if (state_manager_frame_is_reversed())
       return false;
 #endif
-   /* Discarded publishes must not grow staging storage. */
+   /* Discard before recording or publishing source samples. */
    if (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_SUSPENDED)
       return true;
    if (audio_st->float_gate && audio_st->float_gate())
       return true;
-   if (capacity > audio_st->pipe_canon_frames)
-   {
-      uint8_t *nb = (uint8_t*)realloc(audio_st->pipe_canon, capacity * pc * sizeof(float));
-      if (!nb)
-         return false;
-      audio_st->pipe_canon        = nb;
-      audio_st->pipe_canon_frames = capacity;
-   }
-   runloop_flags = runloop_get_flags();
+   runloop_flags = (uint32_t)retro_atomic_load_acquire_int(
+         &audio_st->runloop_snapshot);
    audio_driver_record_push(audio_st, data, frames, channels, layout, is_float);
-   if (      (runloop_flags & RUNLOOP_FLAG_PAUSED)
+   if (      (runloop_flags & AUDIO_SNAP_PAUSED)
+         ||  audio_driver_core_silenced()
          || !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_ACTIVE)
          || !audio_st->output_samples_buf)
       return true;
-   /* the canonical frame: each channel of the batch to its slot */
-   for (bit = 0; bit < pc; bit++)
-      if (layout & (1u << bit))
-         slot[n++] = bit;
    audio_st->pipe_layout = layout;
-   while (done < frames)
-   {
-      size_t take = frames - done;
-      if (take > capacity) take = capacity;
-      if (!audio_driver_pipe_widen_prefix(audio_st->pipe_canon,
-               (const uint8_t*)data + done * channels * sample,
-               take, channels, layout, is_float))
-      {
-         memset(audio_st->pipe_canon, 0, take * pc * sample);
-         for (f = 0; f < take; f++)
-            for (c = 0; c < channels && c < n; c++)
-               memcpy(audio_st->pipe_canon + (f * pc + slot[c]) * sample,
-                     (const uint8_t*)data + ((done + f) * channels + c) * sample, sample);
-      }
-      audio_driver_submit_width(audio_st, config_get_ptr()->floats.slowmotion_ratio,
-            audio_st->pipe_canon, take * pc, is_float,
-            (runloop_flags & RUNLOOP_FLAG_SLOWMOTION) ? true : false,
-            (runloop_flags & RUNLOOP_FLAG_FASTMOTION) ? true : false, pc);
-      done += take;
-   }
+   audio_driver_submit_width(audio_st, audio_driver_snapshot_slowmotion(audio_st),
+         data, frames * channels, is_float,
+         (runloop_flags & AUDIO_SNAP_SLOWMOTION) ? true : false,
+         (runloop_flags & AUDIO_SNAP_FASTMOTION) ? true : false, true,
+         channels);
    return true;
 }
 
@@ -5497,6 +6909,81 @@ static bool audio_driver_multi_split_s16(audio_driver_state_t *audio_st,
    return true;
 }
 
+static bool audio_driver_inline_multi(audio_driver_state_t *audio_st,
+      const void *data, size_t frames, unsigned channels, unsigned layout, bool floating)
+{
+   struct audio_inline_transport *t = audio_st->inline_transport;
+   uint32_t flags;
+   size_t done = 0, frame = channels * (floating ? sizeof(float) : sizeof(int16_t));
+   float ratio = audio_driver_snapshot_slowmotion(audio_st);
+   if (audio_st->pipe_threaded || !t || t->channels <= 2 || floating != t->floating
+         || (layout & AUDIO_LAYOUT_STEREO) != AUDIO_LAYOUT_STEREO)
+      return false;
+#ifdef HAVE_REWIND
+   if (state_manager_frame_is_reversed()) return false;
+#endif
+   if (audio_st->float_gate && audio_st->float_gate()) return true;
+   audio_driver_record_push(audio_st, data, frames, channels, layout, floating);
+   flags = (uint32_t)retro_atomic_load_acquire_int(&audio_st->runloop_snapshot);
+   if ((flags & AUDIO_SNAP_PAUSED) || audio_driver_core_silenced()
+         || !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_ACTIVE)
+         || !audio_st->output_samples_buf) return true;
+   audio_driver_state_lock();
+   audio_driver_arm_resume(audio_st);
+   while (done < frames)
+   {
+      size_t n = frames - done;
+      bool slow = (flags & AUDIO_SNAP_SLOWMOTION) != 0;
+      bool fast = (flags & AUDIO_SNAP_FASTMOTION) != 0;
+      if (n > (AUDIO_CHUNK_SIZE_NONBLOCKING >> 1)) n = AUDIO_CHUNK_SIZE_NONBLOCKING >> 1;
+      audio_driver_inline_pack(t, (const uint8_t*)data + done * frame, n, channels, layout);
+      if (!audio_driver_inline_process(audio_st, ratio, t->source, n, floating, slow, fast, layout))
+         audio_driver_inline_render(audio_st, t->source, n, layout, ratio, slow, fast);
+      done += n;
+   }
+   audio_driver_state_unlock();
+   return true;
+}
+
+#ifdef HAVE_REWIND
+/* Cached multichannel callbacks cannot be swapped by the state manager. */
+static size_t audio_driver_multi_rewind(audio_driver_state_t *audio_st,
+      const void *data, size_t frames, unsigned channels, unsigned layout,
+      bool floating)
+{
+   size_t done = 0;
+   size_t sample = floating ? sizeof(float) : sizeof(int16_t);
+   if ((AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_SUSPENDED)
+         || (audio_st->float_gate && audio_st->float_gate()))
+      return frames;
+   if (layout == AUDIO_LAYOUT_STEREO)
+      return floating ? audio_driver_sample_batch_float((const float*)data, frames)
+         : audio_driver_sample_batch_rewind((const int16_t*)data, frames);
+   while (done < frames && audio_st->rewind_ptr >= 2)
+   {
+      size_t n = frames - done;
+      if (n > audio_st->rewind_ptr / 2) n = audio_st->rewind_ptr / 2;
+      if (n > (AUDIO_CHUNK_SIZE_NONBLOCKING >> 1)) n = AUDIO_CHUNK_SIZE_NONBLOCKING >> 1;
+      if (!audio_driver_multi_fold_room(audio_st, n, sample))
+         return done;
+      if (floating)
+      {
+         audio_downmix_f32((float*)audio_st->multi_fold,
+               (const float*)data + done * channels, n, layout, channels);
+         audio_driver_sample_batch_float((const float*)audio_st->multi_fold, n);
+      }
+      else
+      {
+         audio_downmix_s16((int16_t*)audio_st->multi_fold,
+               (const int16_t*)data + done * channels, n, layout, channels);
+         audio_driver_sample_batch_rewind((const int16_t*)audio_st->multi_fold, n);
+      }
+      done += n;
+   }
+   return frames;
+}
+#endif
+
 size_t audio_driver_sample_batch_multi_int16(const int16_t *data, size_t frames,
       unsigned channels, unsigned layout)
 {
@@ -5504,11 +6991,18 @@ size_t audio_driver_sample_batch_multi_int16(const int16_t *data, size_t frames,
    if (!data || !audio_driver_multi_layout_ok(channels, layout))
       return 0;
    audio_st->core_layout = layout;
+#ifdef HAVE_REWIND
+   if (state_manager_frame_is_reversed())
+      return audio_driver_multi_rewind(audio_st, data, frames, channels, layout, false);
+#endif
    if (layout == AUDIO_LAYOUT_STEREO)
       return audio_driver_sample_batch(data, frames);
    if (!frames)
       return 0;
    if (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_SUSPENDED)
+      return frames;
+   if (audio_st->inline_transport
+         && audio_driver_inline_multi(audio_st, data, frames, channels, layout, false))
       return frames;
    if (audio_driver_multi_discrete(audio_st, layout))
    {
@@ -5563,11 +7057,18 @@ size_t audio_driver_sample_batch_multi_float(const float *data, size_t frames,
    if (!data || !audio_driver_multi_layout_ok(channels, layout))
       return 0;
    audio_st->core_layout = layout;
+#ifdef HAVE_REWIND
+   if (state_manager_frame_is_reversed())
+      return audio_driver_multi_rewind(audio_st, data, frames, channels, layout, true);
+#endif
    if (layout == AUDIO_LAYOUT_STEREO)
       return audio_driver_sample_batch_float(data, frames);
    if (!frames)
       return 0;
    if (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_SUSPENDED)
+      return frames;
+   if (audio_st->inline_transport
+         && audio_driver_inline_multi(audio_st, data, frames, channels, layout, true))
       return frames;
    if (audio_driver_multi_discrete(audio_st, layout))
    {
@@ -5631,7 +7132,7 @@ size_t audio_driver_sample_batch_float(const float *data, size_t frames)
    size_t frames_remaining        = frames;
    recording_state_t *record_st   = recording_state_get_ptr();
    audio_driver_state_t *audio_st = &audio_driver_st;
-   float slowmotion_ratio         = config_get_ptr()->floats.slowmotion_ratio;
+   float slowmotion_ratio         = audio_driver_snapshot_slowmotion(&audio_driver_st);
 
    if ((AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_SUSPENDED) || (frames < 1))
       return frames;
@@ -5642,28 +7143,23 @@ size_t audio_driver_sample_batch_float(const float *data, size_t frames)
 #ifdef HAVE_REWIND
    /* While frames are being played in reverse, the int16 path swaps the
     * core callback to audio_driver_sample_batch_rewind(). A float core
-    * keeps the cached float pointer, so replicate that routing here:
-    * convert to int16 and store into the reverse buffer. */
+    * keeps the cached float pointer, so route it to the reverse buffer. */
    if (state_manager_frame_is_reversed())
    {
       size_t i;
-      size_t samples = frames << 1;
       /* A float core's reverse buffer is float: no conversion in, none
        * out when it plays back. */
       if (audio_st->core_float && audio_st->rewind_buf_f)
       {
-         for (i = 0; i < samples; i++)
+         for (i = 0; i < frames && audio_st->rewind_ptr >= 2; i++)
          {
-            if (audio_st->rewind_ptr < 1)
-               break;
-            audio_st->rewind_buf_f[--audio_st->rewind_ptr] = data[i];
+            audio_st->rewind_buf_f[--audio_st->rewind_ptr] = data[2*i+1];
+            audio_st->rewind_buf_f[--audio_st->rewind_ptr] = data[2*i];
          }
          return frames;
       }
-      for (i = 0; i < samples; i++)
+      for (i = 0; i < frames && audio_st->rewind_ptr >= 2; i++)
       {
-         if (audio_st->rewind_ptr < 1)
-            break;
          /* Inline saturating float->s16 to avoid an extra scratch copy.
           * Must round the same way convert_float_to_s16() does - half
           * away from zero - not truncate: the recording bridge lower in
@@ -5671,14 +7167,18 @@ size_t audio_driver_sample_batch_float(const float *data, size_t frames)
           * truncating variant here would quantise the rewind audio with
           * twice the error and a one-LSB dead band around silence. */
          audio_st->rewind_buf[--audio_st->rewind_ptr] =
-               (int16_t)audio_float_to_s16_sat(data[i]);
+               (int16_t)audio_float_to_s16_sat(data[2*i+1]);
+         audio_st->rewind_buf[--audio_st->rewind_ptr] =
+               (int16_t)audio_float_to_s16_sat(data[2*i]);
       }
       return frames;
    }
 #endif
 
-   runloop_flags                  = runloop_get_flags();
-   flush_audio                    = !((runloop_flags & RUNLOOP_FLAG_PAUSED)
+   runloop_flags                  = (uint32_t)retro_atomic_load_acquire_int(
+         &audio_st->runloop_snapshot);
+   flush_audio                    = !((runloop_flags & AUDIO_SNAP_PAUSED)
+            ||  audio_driver_core_silenced()
             || !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_ACTIVE)
             || !(audio_st->output_samples_buf));
    recording_push_audio           = record_st->data
@@ -5706,8 +7206,9 @@ size_t audio_driver_sample_batch_float(const float *data, size_t frames)
          if (flush_audio)
             audio_driver_submit(audio_st, slowmotion_ratio,
                   data, frames_to_write << 1, true,
-                  (runloop_flags & RUNLOOP_FLAG_SLOWMOTION) ? true : false,
-                  (runloop_flags & RUNLOOP_FLAG_FASTMOTION) ? true : false);
+                  (runloop_flags & AUDIO_SNAP_SLOWMOTION) ? true : false,
+                  (runloop_flags & AUDIO_SNAP_FASTMOTION) ? true : false,
+                  true);
          frames_remaining -= frames_to_write;
          data             += frames_to_write << 1;
          continue;
@@ -5719,10 +7220,16 @@ size_t audio_driver_sample_batch_float(const float *data, size_t frames)
       if (flush_audio)
       {
          audio_driver_state_lock();
-         audio_driver_flush(audio_st, slowmotion_ratio, data,
+         audio_driver_arm_resume(audio_st);
+         if (!audio_st->inline_transport
+               || !audio_driver_inline_flush(audio_st, slowmotion_ratio, data,
+                  frames_to_write << 1, true,
+                  (runloop_flags & AUDIO_SNAP_SLOWMOTION) ? true : false,
+                  (runloop_flags & AUDIO_SNAP_FASTMOTION) ? true : false))
+            audio_driver_flush(audio_st, slowmotion_ratio, data,
                frames_to_write << 1, true,
-               (runloop_flags & RUNLOOP_FLAG_SLOWMOTION) ? true : false,
-               (runloop_flags & RUNLOOP_FLAG_FASTMOTION) ? true : false);
+               (runloop_flags & AUDIO_SNAP_SLOWMOTION) ? true : false,
+               (runloop_flags & AUDIO_SNAP_FASTMOTION) ? true : false);
          audio_driver_state_unlock();
       }
 
@@ -5737,9 +7244,16 @@ size_t audio_driver_sample_batch_float(const float *data, size_t frames)
 void audio_driver_sample_rewind(int16_t left, int16_t right)
 {
    audio_driver_state_t *audio_st  = &audio_driver_st;
-   if (audio_st->rewind_ptr == 0)
+   if (audio_st->rewind_ptr < 2
+         || (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_SUSPENDED))
       return;
 
+   if (audio_st->core_float && audio_st->rewind_buf_f)
+   {
+      audio_st->rewind_buf_f[--audio_st->rewind_ptr] = right * (1.0f / 32768.0f);
+      audio_st->rewind_buf_f[--audio_st->rewind_ptr] = left  * (1.0f / 32768.0f);
+      return;
+   }
    audio_st->rewind_buf[--audio_st->rewind_ptr] = right;
    audio_st->rewind_buf[--audio_st->rewind_ptr] = left;
 }
@@ -5749,13 +7263,24 @@ size_t audio_driver_sample_batch_rewind(
 {
    size_t i;
    audio_driver_state_t *audio_st  = &audio_driver_st;
-   size_t              samples     = frames << 1;
 
-   for (i = 0; i < samples; i++)
+   if (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_SUSPENDED)
+      return frames;
+
+   /* Match the arena selected by reverse playback, even for mixed callbacks. */
+   if (audio_st->core_float && audio_st->rewind_buf_f)
    {
-      if (audio_st->rewind_ptr < 1)
-         break;
-      audio_st->rewind_buf[--audio_st->rewind_ptr] = data[i];
+      for (i = 0; i < frames && audio_st->rewind_ptr >= 2; i++)
+      {
+         audio_st->rewind_buf_f[--audio_st->rewind_ptr] = data[2*i+1] * (1.0f / 32768.0f);
+         audio_st->rewind_buf_f[--audio_st->rewind_ptr] = data[2*i]   * (1.0f / 32768.0f);
+      }
+      return frames;
+   }
+   for (i = 0; i < frames && audio_st->rewind_ptr >= 2; i++)
+   {
+      audio_st->rewind_buf[--audio_st->rewind_ptr] = data[2*i+1];
+      audio_st->rewind_buf[--audio_st->rewind_ptr] = data[2*i];
    }
 
    return frames;
@@ -6061,6 +7586,19 @@ bool audio_driver_mixer_add_stream(audio_mixer_stream_params_t *params)
     * outcome: each failure return releases it. */
    if (params->out_slot)
       *params->out_slot = -1;
+   /* Outside the mixer's init..done window - a mixer load task
+    * retiring after audio teardown at shutdown, or any stream pushed
+    * during a session whose audio driver failed to initialize -
+    * claiming a voice would write into a subsystem whose voice locks
+    * audio_mixer_done() already freed. Refuse; ownership is released
+    * as on every other failure path. */
+   if (!(AUDIO_FLAGS_GET(&audio_driver_st) & AUDIO_FLAG_MIXER_INITED))
+   {
+      if (params->buf_owner)
+         params->buf_owner_free(params->buf_owner);
+      audio_driver_state_unlock();
+      return false;
+   }
    if (params->stream_type == AUDIO_STREAM_TYPE_NONE)
    {
       if (params->buf_owner)
@@ -6671,10 +8209,22 @@ bool audio_driver_disable_callback(void)
 bool audio_driver_callback(void)
 {
    /* Runs on the audio thread: read the main thread's published
-    * snapshot, not the runloop, menu or settings themselves. */
+    * snapshot, not the runloop, menu or settings themselves.
+    *
+    * The snapshot alone is not enough here: it is republished around
+    * retro_run and driver start and stop, and a pause is exactly when
+    * retro_run stops being called, so the pause it announces is the
+    * one state the snapshot cannot be trusted to carry. core_silenced
+    * is stored by audio_driver_pause_fade() on every pause, resume and
+    * menu transition, so it is current when the snapshot is not.
+    * Without it this loop kept invoking the core's callback behind the
+    * menu, rendering audio for the delivery gates to drop against the
+    * same core_silenced word, and asked again at the idle interval for
+    * as long as the menu stayed open. */
    int  snap        = retro_atomic_load_acquire_int(
          &audio_driver_st.runloop_snapshot);
-   bool core_paused = (snap & AUDIO_SNAP_PAUSED)
+   bool core_paused = audio_driver_core_silenced()
+      || (snap & AUDIO_SNAP_PAUSED)
       || (   (snap & AUDIO_SNAP_MENU_PAUSES)
           && (snap & AUDIO_SNAP_MENU_ALIVE)
           && (snap & AUDIO_SNAP_ALLOW_PAUSE));
@@ -6694,16 +8244,33 @@ bool audio_driver_callback(void)
    if (!audio_driver_st.callback.callback)
       return false;
 
-   if (!core_paused && audio_driver_st.callback.callback)
+   /* This callback owns inline source timing; the main frame must not reset it. */
+   if (core_paused || !(snap & AUDIO_SNAP_FASTMOTION))
+      audio_driver_ff_mult_reset(&audio_driver_st);
+
+   if (!core_paused)
    {
+      /* Counted at every device write this thread makes, whichever
+       * route the core's samples take to it. */
+      uint64_t offered = audio_driver_st.sink_offered_raw;
+      if (audio_driver_st.inline_transport)
+         audio_driver_st.inline_transport->source_progress = false;
+
       audio_driver_st.callback.callback();
       /* The core rendered on this (audio) thread; deliver it now rather
        * than holding a partial chunk across callbacks. */
       if (audio_driver_st.data_ptr)
          audio_driver_sample_accum_flush(&audio_driver_st);
+
+      /* Bounded stretch lookahead may consume several batches before a write. */
+      if (audio_driver_st.sink_offered_raw != offered
+            || (audio_driver_st.inline_transport
+               && audio_driver_st.inline_transport->source_progress))
+         return true;
    }
 
-   return true;
+   /* No device write or bounded transport input: park before asking again. */
+   return false;
 }
 
 bool audio_driver_has_callback(void)
@@ -6800,14 +8367,43 @@ void audio_driver_set_float_gate(audio_driver_float_gate_t gate)
    audio_driver_st.float_gate = gate;
 }
 
+/* Negotiation runs on the source owner, between audio callbacks. */
+static void audio_driver_inline_set_format(audio_driver_state_t *audio_st,
+      bool floating, bool multi)
+{
+   struct audio_inline_transport *t = audio_st->inline_transport;
+   unsigned channels;
+   if (audio_st->pipe_threaded || !t)
+      return;
+   /* Keep the canonical arena when returning to stereo. */
+   channels = multi ? AUDIO_PIPE_CANON_CHANNELS : t->channels;
+   if (t->floating == floating && t->channels == channels)
+      return;
+   if (audio_st->data_ptr)
+      audio_driver_sample_accum_flush(audio_st);
+   audio_driver_state_lock();
+   audio_driver_inline_free(audio_st);
+   audio_driver_reset_resamplers(audio_st);
+   audio_st->last_flush_time = 0;
+   audio_st->avg_flush_delta = 0;
+   audio_st->avg_expected_delta = 0;
+   /* A format boundary discards the old tail. Allocation failure leaves
+    * ordinary native playback available until audio reinitialization. */
+   audio_driver_inline_prepare(audio_st, floating, channels);
+   audio_driver_state_unlock();
+}
+
 void audio_driver_set_core_multi(bool core_multi)
 {
+   audio_driver_inline_set_format(&audio_driver_st,
+         audio_driver_st.core_float, core_multi);
    audio_driver_st.core_multi = core_multi;
 }
 
 #ifdef HAVE_THREADS
 static void audio_driver_transport_clear(audio_driver_state_t *audio_st)
 {
+   audio_st->pipe_transport_follow = 0;
    audio_st->pipe_pending = NULL;
    audio_st->pipe_pending_bytes = 0;
    audio_driver_state_lock();
@@ -6815,6 +8411,8 @@ static void audio_driver_transport_clear(audio_driver_state_t *audio_st)
    audio_driver_state_unlock();
    audio_pipeline_stretch_free(audio_st->pipe_transport);
    audio_st->pipe_transport = NULL;
+   audio_pipeline_stretch_free(audio_st->pipe_transport_suspended);
+   audio_st->pipe_transport_suspended = NULL;
    if (audio_st->pipe_transport_output)
       memalign_free(audio_st->pipe_transport_output);
    audio_st->pipe_transport_output = NULL;
@@ -6827,6 +8425,7 @@ static bool audio_driver_transport_bind(audio_driver_state_t *audio_st,
 {
    audio_pipeline_stretch_t *stage;
    void *output;
+   uint8_t follow = audio_st->pipe_transport_follow;
    size_t frame = audio_st->pipe_channels * (floating ? sizeof(float) : sizeof(int16_t));
    size_t frames = audio_st->pipe_pass_frames;
    if (rate < 8000 || rate > 192000 || !audio_st->pipe_channels
@@ -6851,32 +8450,53 @@ static bool audio_driver_transport_bind(audio_driver_state_t *audio_st,
       uint32_t cutoff = metadata->published_cutoff;
       unsigned layout = metadata->published_layout;
       retro_spsc_clear(&audio_st->pipe_ring);
+      audio_driver_pipe_marks_clear(audio_st);
       audio_pipeline_layout_init(metadata, layout);
       metadata->published_control = metadata->current_control = control;
       metadata->published_cutoff = metadata->current_cutoff = cutoff;
    }
    audio_st->pipe_transport = stage;
+   audio_st->pipe_transport_follow = follow;
    audio_st->pipe_transport_output = output;
    audio_st->pipe_transport_rate = rate;
    audio_st->pipe_transport_search = search_channels;
    return true;
 }
 
+enum audio_transport_action
+{
+   AUDIO_TRANSPORT_PREPARE,
+   AUDIO_TRANSPORT_RELEASE,
+   AUDIO_TRANSPORT_SUSPEND,
+   AUDIO_TRANSPORT_RESUME
+};
+
 struct audio_transport_prepare
 {
    unsigned rate;
    uint32_t search, control, cutoff;
-   bool release, result;
+   enum audio_transport_action action;
+   bool result;
 };
 
 static void audio_driver_transport_control(void *userdata)
 {
    struct audio_transport_prepare *request = (struct audio_transport_prepare*)userdata;
    audio_driver_state_t *audio_st = &audio_driver_st;
-   if (request->release)
+   if (request->action == AUDIO_TRANSPORT_RELEASE)
    {
-      if (audio_st->pipe_transport) audio_driver_transport_clear(audio_st);
+      if (audio_st->pipe_transport || audio_st->pipe_transport_suspended)
+         audio_driver_transport_clear(audio_st);
       request->result = true;
+   }
+   else if (request->action == AUDIO_TRANSPORT_SUSPEND)
+   {
+      request->result = audio_driver_transport_discard(0, false);
+      if (request->result)
+      {
+         audio_st->pipe_transport_suspended = audio_st->pipe_transport;
+         audio_st->pipe_transport = NULL;
+      }
    }
    else if (audio_st->pipe_threaded
          && audio_st->current_audio && audio_st->current_audio->wait_writable
@@ -6884,8 +8504,26 @@ static void audio_driver_transport_control(void *userdata)
          && !retro_spsc_read_avail(&audio_st->pipe_ring)
          && !audio_st->pipe_pending_bytes)
    {
-      request->result = audio_driver_transport_bind(audio_st,
-            request->rate, request->search, audio_st->pipe_float);
+      if (request->action == AUDIO_TRANSPORT_RESUME)
+      {
+         request->result = audio_st->pipe_transport_suspended != NULL;
+         if (request->result)
+         {
+            audio_pipeline_layout_t *q = &audio_st->pipe_layouts;
+            retro_spsc_clear(&audio_st->pipe_ring);
+            audio_driver_pipe_marks_clear(audio_st);
+            audio_pipeline_layout_init(q, q->published_layout);
+            audio_st->pipe_transport = audio_st->pipe_transport_suspended;
+            audio_st->pipe_transport_suspended = NULL;
+            audio_pipeline_stretch_discard(audio_st->pipe_transport, 0);
+         }
+      }
+      else
+      {
+         request->result = audio_driver_transport_bind(audio_st,
+               request->rate, request->search, audio_st->pipe_float);
+         if (request->result) audio_st->pipe_transport_follow = 0;
+      }
       if (request->result && request->control)
       {
          audio_pipeline_layout_t *q = &audio_st->pipe_layouts;
@@ -6906,12 +8544,27 @@ static void audio_driver_transport_transaction(struct audio_transport_prepare *r
       audio_driver_transport_control(request);
 }
 
+static bool audio_driver_transport_recover(bool resume, uint32_t tempo)
+{
+   struct audio_transport_prepare request;
+   audio_driver_state_t *audio_st = &audio_driver_st;
+   request.rate = 0; request.search = 0;
+   request.control = (tempo == 65536 || audio_st->transport_lpf_only)
+      ? tempo : tempo | AUDIO_PIPELINE_STRETCH;
+   request.cutoff = (audio_st->pipe_transport_follow & AUDIO_TRANSPORT_LOWPASS)
+      ? audio_speed_lpf_cutoff(audio_st->pipe_transport_rate, tempo) : 0;
+   request.action = resume ? AUDIO_TRANSPORT_RESUME : AUDIO_TRANSPORT_SUSPEND;
+   request.result = false;
+   audio_driver_transport_transaction(&request);
+   return request.result;
+}
+
 bool audio_driver_pipeline_transport_prepare(unsigned rate, uint32_t search_channels)
 {
    struct audio_transport_prepare request;
    request.rate = rate; request.search = search_channels;
    request.control = request.cutoff = 0;
-   request.release = request.result = false;
+   request.action = AUDIO_TRANSPORT_PREPARE; request.result = false;
    audio_driver_transport_transaction(&request);
    return request.result;
 }
@@ -6923,11 +8576,22 @@ bool audio_driver_pipeline_transport_prepare_runloop(unsigned rate,
    uint32_t tempo;
    if (!audio_driver_transport_runloop_tempo(&tempo)) return false;
    request.rate = rate; request.search = search_channels;
-   request.control = tempo == 65536 ? tempo : tempo | AUDIO_PIPELINE_STRETCH;
+   request.control = (tempo == 65536 || audio_driver_st.transport_lpf_only)
+      ? tempo : tempo | AUDIO_PIPELINE_STRETCH;
    request.cutoff = lowpass ? audio_speed_lpf_cutoff(rate, tempo) : 0;
-   request.release = request.result = false;
+   request.action = AUDIO_TRANSPORT_PREPARE; request.result = false;
    audio_driver_transport_transaction(&request);
    return request.result;
+}
+
+bool audio_driver_pipeline_transport_start_runloop(unsigned rate,
+      uint32_t search_channels, bool lowpass)
+{
+   if (!audio_driver_pipeline_transport_prepare_runloop(rate, search_channels, lowpass))
+      return false;
+   audio_driver_st.pipe_transport_follow = AUDIO_TRANSPORT_FOLLOW | AUDIO_TRANSPORT_UPDATE
+      | (lowpass ? AUDIO_TRANSPORT_LOWPASS : 0);
+   return true;
 }
 
 void audio_driver_pipeline_transport_release(void)
@@ -6935,7 +8599,7 @@ void audio_driver_pipeline_transport_release(void)
    struct audio_transport_prepare request;
    request.rate = 0; request.search = 0;
    request.control = request.cutoff = 0;
-   request.release = true; request.result = false;
+   request.action = AUDIO_TRANSPORT_RELEASE; request.result = false;
    audio_driver_transport_transaction(&request);
 }
 
@@ -6945,11 +8609,17 @@ static void audio_driver_pipe_set_format(void *userdata)
    /* Empty source alone is not quiescence: the wrapper must also be parked. */
    if (!retro_spsc_read_avail(&audio_st->pipe_ring))
    {
-      if (audio_st->pipe_transport
+      bool suspended = audio_st->pipe_transport_suspended != NULL;
+      if ((audio_st->pipe_transport || suspended)
             && !audio_driver_transport_bind(audio_st, audio_st->pipe_transport_rate,
                audio_st->pipe_transport_search, audio_st->core_float))
          /* Keep the new source native even if optional state cannot be rebuilt. */
          audio_driver_transport_clear(audio_st);
+      if (suspended && audio_st->pipe_transport)
+      {
+         audio_st->pipe_transport_suspended = audio_st->pipe_transport;
+         audio_st->pipe_transport = NULL;
+      }
       audio_st->pipe_float = audio_st->core_float;
       audio_st->pipe_frame_bytes = (size_t)audio_st->pipe_channels
             * (audio_st->pipe_float ? sizeof(float) : sizeof(int16_t));
@@ -6960,6 +8630,12 @@ static void audio_driver_pipe_set_format(void *userdata)
 void audio_driver_set_core_float(bool core_float)
 {
    audio_driver_state_t *audio_st = &audio_driver_st;
+   audio_driver_inline_set_format(audio_st, core_float, audio_st->core_multi);
+#ifdef HAVE_REWIND
+   /* Captured samples belong to the previous native arena. */
+   if (audio_st->core_float != core_float)
+      audio_st->rewind_ptr = audio_st->rewind_size;
+#endif
    audio_st->core_float = core_float;
 #ifdef HAVE_THREADS
    if (audio_st->pipe_threaded && audio_st->pipe_float != core_float)
@@ -7048,6 +8724,11 @@ bool audio_driver_stop(void)
 
    if (stopped)
    {
+      /* The stopped interval is not part of the source cadence. */
+      audio_driver_ff_mult_reset(audio_st);
+#ifdef HAVE_THREADS
+      retro_atomic_store_release_int(&audio_st->pipe_ff_mult_q16, 65536);
+#endif
       /* The wrapper has parked the consumer before returning from stop. */
 #ifdef HAVE_THREADS
       if (!audio_driver_pipeline_transport_discard(0))
@@ -7056,6 +8737,7 @@ bool audio_driver_stop(void)
          audio_st->pipe_pending = NULL;
          audio_st->pipe_pending_bytes = 0;
          audio_driver_state_lock();
+         audio_driver_inline_reset(audio_st);
          audio_driver_reset_resamplers(audio_st);
          audio_driver_state_unlock();
       }
@@ -7070,31 +8752,35 @@ bool audio_driver_stop(void)
 void audio_driver_frame_is_reverse(void)
 {
    audio_driver_state_t *audio_st  = &audio_driver_st;
-   uint32_t runloop_flags          = runloop_get_flags();
+   uint32_t runloop_flags          = (uint32_t)retro_atomic_load_acquire_int(
+         &audio_st->runloop_snapshot);
 
    bool  rewind_float = audio_st->core_float && audio_st->rewind_buf_f;
 
-   if (audio_st->rewind_size > audio_st->rewind_ptr
-         && (rewind_float || audio_st->rewind_buf))
-      audio_driver_record_push(audio_st,
-            rewind_float ? (const void*)(audio_st->rewind_buf_f + audio_st->rewind_ptr)
-                         : (const void*)(audio_st->rewind_buf + audio_st->rewind_ptr),
-            (audio_st->rewind_size - audio_st->rewind_ptr) / 2,
-            2, AUDIO_LAYOUT_STEREO, rewind_float);
+   if (audio_st->rewind_ptr >= audio_st->rewind_size
+         || (!rewind_float && !audio_st->rewind_buf))
+      return;
+
+   audio_driver_record_push(audio_st,
+         rewind_float ? (const void*)(audio_st->rewind_buf_f + audio_st->rewind_ptr)
+                      : (const void*)(audio_st->rewind_buf + audio_st->rewind_ptr),
+         (audio_st->rewind_size - audio_st->rewind_ptr) / 2,
+         2, AUDIO_LAYOUT_STEREO, rewind_float);
 
    if (!(
-             (runloop_flags & RUNLOOP_FLAG_PAUSED)
+             (runloop_flags & AUDIO_SNAP_PAUSED)
          || !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_ACTIVE)
          || !(audio_st->output_samples_buf)))
       if (!(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_SUSPENDED))
          audio_driver_submit(audio_st,
-               config_get_ptr()->floats.slowmotion_ratio,
+               audio_driver_snapshot_slowmotion(audio_st),
                rewind_float
                   ? (const void*)(audio_st->rewind_buf_f + audio_st->rewind_ptr)
                   : (const void*)(audio_st->rewind_buf   + audio_st->rewind_ptr),
                audio_st->rewind_size - audio_st->rewind_ptr, rewind_float,
-               (runloop_flags & RUNLOOP_FLAG_SLOWMOTION) ? true : false,
-               (runloop_flags & RUNLOOP_FLAG_FASTMOTION) ? true : false);
+               (runloop_flags & AUDIO_SNAP_SLOWMOTION) ? true : false,
+               (runloop_flags & AUDIO_SNAP_FASTMOTION) ? true : false,
+               true);
 
    /* A reversed frame is published here, before the frame end that
     * follows it, which will wake the consumer for it. */
@@ -7236,11 +8922,25 @@ void audio_driver_menu_sample(void)
    struct retro_system_av_info *av_info   = &video_st->av_info;
    const struct retro_system_timing *info =
       (const struct retro_system_timing*)&av_info->timing;
-   unsigned sample_count                  = floor(info->sample_rate / info->fps) * 2;
+   unsigned sample_count;
+   double frames;
+   uint64_t rate_bits, fps_bits;
    audio_driver_state_t *audio_st         = &audio_driver_st;
    bool check_flush                       = !(
             !(AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_ACTIVE)
          || !audio_st->output_samples_buf);
+
+   memcpy(&rate_bits, &info->sample_rate, sizeof(rate_bits));
+   memcpy(&fps_bits, &info->fps, sizeof(fps_bits));
+   if (rate_bits >= UINT64_C(0x7ff0000000000000)
+         || fps_bits >= UINT64_C(0x7ff0000000000000)
+         || info->sample_rate <= 0.0 || info->fps <= 0.0)
+      return;
+   frames = floor(info->sample_rate / info->fps);
+   /* Validate before conversion and the stereo sample-count multiply. */
+   if (!(frames >= 0.0 && frames <= UINT_MAX / 2))
+      return;
+   sample_count = (unsigned)frames * 2;
 
    if ((AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_SUSPENDED))
       check_flush                         = false;
@@ -7264,8 +8964,9 @@ void audio_driver_menu_sample(void)
                slowmotion_ratio,
                samples_buf,
                1024, false,
-               (runloop_flags & RUNLOOP_FLAG_SLOWMOTION) ? true : false,
-               (runloop_flags & RUNLOOP_FLAG_FASTMOTION) ? true : false);
+               (runloop_flags & AUDIO_SNAP_SLOWMOTION) ? true : false,
+               (runloop_flags & AUDIO_SNAP_FASTMOTION) ? true : false,
+               false);
       sample_count -= 1024;
    }
 
@@ -7284,13 +8985,12 @@ void audio_driver_menu_sample(void)
 
    if (check_flush)
       audio_driver_submit(audio_st, slowmotion_ratio, samples_buf, sample_count, false,
-            (runloop_flags & RUNLOOP_FLAG_SLOWMOTION) ? true : false,
-            (runloop_flags & RUNLOOP_FLAG_FASTMOTION) ? true : false);
+            (runloop_flags & AUDIO_SNAP_SLOWMOTION) ? true : false,
+            (runloop_flags & AUDIO_SNAP_FASTMOTION) ? true : false,
+            false);
 
    /* This is the menu's frame; no frame end follows it. */
-#ifdef HAVE_THREADS
    audio_driver_ff_frame_end(audio_st);
-#endif
    audio_driver_pipeline_signal(audio_st);
 }
 #endif
@@ -8132,9 +9832,23 @@ static void microphone_driver_capture_thread(void *data)
          continue;
       }
 
-      if (!mic_st->driver->wait_readable(mic_st->driver_context,
-               microphone->microphone_context, slice * sample_size))
-         continue;
+      /* What the device has now, which can be less than was asked for:
+       * a driver returns short whenever its bounded wait expires with
+       * something in hand, and alsa returns a period even when the
+       * slice spans several. read() blocks until it has everything it
+       * was asked for, so reading the whole slice on a short count
+       * parks the worker inside the driver - and teardown joins this
+       * thread unconditionally. Read what is there. */
+      {
+         size_t want = slice * sample_size;
+         size_t got  = mic_st->driver->wait_readable(mic_st->driver_context,
+               microphone->microphone_context, want);
+
+         if (got < sample_size)
+            continue;
+         if (got < want)
+            slice = got / sample_size;
+      }
 
       /* The flush - device read, up-channel, resample, ring write -
        * runs without the lock: SPSC, this thread is the producer.  The
@@ -8484,3 +10198,43 @@ bool microphone_driver_get_devices_list(void **data)
    return true;
 }
 #endif
+
+/* Keep optional startup work out of the common initialization body. */
+#if defined(__GNUC__)
+__attribute__((noinline))
+#elif defined(_MSC_VER)
+__declspec(noinline)
+#endif
+static bool audio_driver_transport_configure(const settings_t *settings)
+{
+#ifdef HAVE_THREADS
+   uint32_t tempo;
+#endif
+   uint32_t rate_bits;
+   audio_driver_state_t *audio_st = &audio_driver_st;
+   audio_st->transport_lpf_only   = !settings->bools.audio_time_stretch
+      && settings->bools.audio_time_stretch_lowpass;
+   if (!settings->bools.audio_time_stretch && !audio_st->transport_lpf_only)
+      return true;
+   memcpy(&rate_bits, &audio_st->input, sizeof(rate_bits));
+   if (rate_bits >= UINT32_C(0x7f800000)
+         || audio_st->input < 8000.0f || audio_st->input > 192000.0f)
+      return false;
+   if (!audio_st->pipe_threaded)
+      return (audio_st->core_multi || audio_st->core_layout == AUDIO_LAYOUT_STEREO)
+         && audio_driver_inline_prepare(audio_st, audio_st->core_float,
+               audio_st->core_multi ? AUDIO_PIPE_CANON_CHANNELS : 2);
+#ifdef HAVE_THREADS
+   /* The front pair drives one shared search for every native channel. */
+   if (audio_driver_transport_runloop_tempo(&tempo))
+      return audio_driver_pipeline_transport_start_runloop(
+            (unsigned)audio_st->input, 3, settings->bools.audio_time_stretch_lowpass);
+   if (audio_driver_pipeline_transport_prepare((unsigned)audio_st->input, 3))
+   {
+      audio_st->pipe_transport_follow = AUDIO_TRANSPORT_FOLLOW | AUDIO_TRANSPORT_UPDATE
+         | (settings->bools.audio_time_stretch_lowpass ? AUDIO_TRANSPORT_LOWPASS : 0);
+      return audio_driver_transport_recover(false, 65536);
+   }
+#endif
+   return false;
+}

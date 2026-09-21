@@ -126,6 +126,7 @@ static uint32_t source_layout = AUDIO_LAYOUT_STEREO;
 static bool live_layouts;
 static bool speed_lowpass;
 static bool runloop_policy;
+static bool auto_runloop;
 #define LATENCY_MS    32
 #define MAX_SAMPLES   65536
 
@@ -160,7 +161,10 @@ static retro_atomic_size_t cnt_writes;     /* calls that reached write()  */
  * reader that sees the new sequence sees the timestamp that went with
  * it. Zero means "already answered", so a pass that writes twice for
  * one signal only records the first. */
-static retro_time_t        sig_us;
+static retro_atomic_size_t sig_us;   /* retro_time_t as size_t: the
+                                      * overwrite for the next signal
+                                      * must not race the read of the
+                                      * last one */
 static retro_atomic_size_t sig_seq;
 static size_t              sig_seen;       /* consumer thread only        */
 
@@ -184,6 +188,10 @@ static bool                notify_per_publish;
  * are run: the first is the configuration people use, the second is the
  * one that can see the handshake at all. */
 static bool                dev_backpressure = true;
+/* Set to make the device refuse every further write, which is how the
+ * wrapper is made to leave its loop on its own rather than because the
+ * main thread tore it down. */
+static retro_atomic_int_t  dev_fail_now = RETRO_ATOMIC_INT_INITIALIZER(0);
 
 /* Whether the frame's publishes arrive in a burst or spread across the
  * frame. A core's retro_run emits the whole frame's audio inside one
@@ -293,7 +301,7 @@ static void note_write(void)
    retro_atomic_fetch_add_size(&cnt_writes, 1);
    if (seq != sig_seen)
    {
-      retro_time_t at = sig_us;
+      retro_time_t at = (retro_time_t)retro_atomic_load_relaxed_size(&sig_us);
       size_t       n  = retro_atomic_load_relaxed_size(&lat_count);
       sig_seen        = seq;
       if (at && n < MAX_SAMPLES)
@@ -305,14 +313,61 @@ static void note_write(void)
    }
 }
 
+/* Content tap for the pause-boundary fixture: what actually reaches the
+ * device, as magnitudes. tap_stale counts samples at the stale content's
+ * level arriving after the pause; tap_head keeps the first samples after
+ * the resume, where the ramp must be. */
+#define TAP_HEAD_MAX 512
+static retro_atomic_int_t  tap_on;
+static retro_atomic_int_t  tap_record;
+static retro_atomic_int_t  tap_stale;
+static float               tap_head[TAP_HEAD_MAX];
+static retro_atomic_size_t tap_head_n;
+
+static void tap_samples(const void *buf, size_t samples)
+{
+   int on  = retro_atomic_load_acquire_int(&tap_on);
+   int rec = retro_atomic_load_acquire_int(&tap_record);
+   size_t i;
+   if (!on && !rec)
+      return;
+   for (i = 0; i < samples; i++)
+   {
+      float m = (device_sample_bytes == sizeof(int16_t))
+            ? (float)((const int16_t*)buf)[i] / 32768.0f
+            : ((const float*)buf)[i];
+      if (m < 0.0f) m = -m;
+      if (on && m > 0.6f)
+         retro_atomic_fetch_add_int(&tap_stale, 1);
+      if (rec)
+      {
+         size_t n = retro_atomic_load_relaxed_size(&tap_head_n);
+         /* The resume top-up writes the device full of silence first;
+          * the ramp is on the stream behind it, so the window opens at
+          * the first audible sample. */
+         if (!n && m < 0.005f)
+            continue;
+         if (n < TAP_HEAD_MAX)
+         {
+            tap_head[n] = m;
+            retro_atomic_store_release_size(&tap_head_n, n + 1);
+         }
+      }
+   }
+}
+
 static ssize_t cdev_write(void *data, const void *buf, size_t len)
 {
    size_t samples = len / device_sample_bytes;
    size_t written = 0;
    int    laps    = 8;
-   (void)data; (void)buf;
+   (void)data;
+
+   if (retro_atomic_load_acquire_int(&dev_fail_now))
+      return -1;
 
    note_write();
+   tap_samples(buf, samples);
 
    /* No backpressure: take it all, keep what the ring has room for and
     * drop the rest. A driver that never makes the caller wait. */
@@ -409,11 +464,21 @@ static double source_tempo = 1.0;
 static uint32_t tempo_q16 = 65536;
 static retro_atomic_int_t in_callback = RETRO_ATOMIC_INT_INITIALIZER(0);
 
+/* The consumer must take everything it consults from the published
+ * snapshot; a settings read inside the callback is a read of main-owned
+ * state from the audio thread. The config_get_ptr() stub counts calls
+ * made while this flag is up, whichever thread runs the callback, and
+ * the count is a fixture failure. */
+extern __thread int   consumer_context;
+extern retro_atomic_size_t consumer_settings_reads;
+
 bool audio_driver_callback(void)
 {
    bool result;
    if (use_wrapper) retro_atomic_store_release_int(&in_callback, 1);
+   consumer_context = 1;
    result = pipeline_callback_impl();
+   consumer_context = 0;
    retro_atomic_fetch_add_size(&cnt_wakes, 1);
    if (use_wrapper) retro_atomic_store_release_int(&in_callback, 0);
    return result;
@@ -440,6 +505,12 @@ static float frame_audio_float[32768 * 8];
 
 static bool prepare_transport(bool reset)
 {
+   if (auto_runloop)
+   {
+      config_get_ptr()->bools.audio_time_stretch = true;
+      config_get_ptr()->bools.audio_time_stretch_lowpass = speed_lowpass;
+      return audio_driver_transport_configure(config_get_ptr());
+   }
    if (runloop_policy)
       return audio_driver_pipeline_transport_prepare_runloop(CORE_RATE, 3, speed_lowpass);
    return audio_driver_pipeline_transport_prepare(CORE_RATE, 3)
@@ -475,7 +546,7 @@ static bool pipeline_up(unsigned latency_ms)
    retro_atomic_size_init(&cnt_writes, 0);
    retro_atomic_size_init(&sig_seq, 0);
    retro_atomic_size_init(&lat_count, 0);
-   sig_us              = 0;
+   retro_atomic_size_init(&sig_us, 0);
    sig_seen            = 0;
    prod_total_us       = 0;
    prod_blocked_frames = 0;
@@ -536,9 +607,12 @@ static bool pipeline_up(unsigned latency_ms)
    st->rate_control_delta   = 0.005f;
    st->drc_threshold_int16s = 1600;
    st->sink_bias            = 1.0;
+   st->out_rate             = OUT_RATE;
    config_get_ptr()->bools.audio_sink_rate_estimation = true;
    config_get_ptr()->uints.audio_output_sample_rate   = OUT_RATE;
    config_get_ptr()->bools.audio_sync                 = true;
+   config_get_ptr()->floats.slowmotion_ratio          = 1;
+   audio_driver_publish_runloop();
 
    ring_bytes = per_frame * 3 * st->pipe_frame_bytes;
    if (!retro_spsc_init(&st->pipe_ring, ring_bytes))
@@ -584,7 +658,6 @@ static void pipeline_down(void)
    free(st->synth_buf);
    free(st->output_samples_int16);
    free(st->pipe_wide);
-   free(st->pipe_canon);
    free(st->upmix_buf);
    free(st->upmix_i16);
    free(dev_ring);
@@ -597,12 +670,16 @@ static void discard_parked(void *userdata)
    audio_driver_state_t *st = &audio_driver_st;
    (void)userdata;
    if (retro_atomic_load_acquire_int(&in_callback)) fixture_failures++;
-   if (transport_mode && !audio_driver_pipeline_transport_discard(
+   if (st->pipe_transport && !audio_driver_pipeline_transport_discard(
             retro_spsc_read_avail(&st->pipe_ring) / st->pipe_frame_bytes))
       fixture_failures++;
 }
 
 static void submit_frame(size_t per_frame, unsigned publishes);
+static void pause_boundary_run(void);
+static bool pause_boundary_mode;
+static void consumer_exit_run(void);
+static bool consumer_exit_mode;
 
 struct live_control_check
 {
@@ -617,7 +694,13 @@ static void check_live_control(void *userdata)
    if (retro_atomic_load_acquire_int(&in_callback)) fixture_failures++;
    if (check->initial) check->serial = q->reset_serial;
    else if (q->reset_serial != check->serial || q->current_control != check->control
-         || q->current_cutoff != check->cutoff) fixture_failures++;
+         || q->current_cutoff != check->cutoff)
+   {
+      fprintf(stderr, "control mismatch: reset %u/%u, control %u/%u, cutoff %u/%u\n",
+            q->reset_serial, check->serial, q->current_control, check->control,
+            q->current_cutoff, check->cutoff);
+      fixture_failures++;
+   }
    if (!check->initial && live_layouts)
    {
       unsigned extras = audio_layout_channels(check->layout & ~AUDIO_LAYOUT_STEREO);
@@ -626,6 +709,13 @@ static void check_live_control(void *userdata)
                   || audio_driver_st.extra.positions != (check->layout & ~AUDIO_LAYOUT_STEREO))))
          fixture_failures++;
    }
+}
+
+static void check_fallback_drained(void *userdata)
+{
+   audio_driver_state_t *st = &audio_driver_st;
+   if (retro_atomic_load_acquire_int(&in_callback)) fixture_failures++;
+   *(bool*)userdata = !retro_spsc_read_avail(&st->pipe_ring) && !st->pipe_pending_bytes;
 }
 
 static void wrapper_live_controls(unsigned publishes)
@@ -637,6 +727,8 @@ static void wrapper_live_controls(unsigned publishes)
       AUDIO_LAYOUT_STEREO, AUDIO_LAYOUT_5POINT1, AUDIO_LAYOUT_7POINT1 };
    audio_driver_state_t *st = &audio_driver_st;
    struct live_control_check check;
+   audio_pipeline_stretch_t *retained = st->pipe_transport;
+   void *retained_output = st->pipe_transport_output;
    unsigned step;
    check.initial = true;
    audio_thread_apply_control(st->context_audio_data, check_live_control, &check);
@@ -663,19 +755,25 @@ static void wrapper_live_controls(unsigned publishes)
          config_get_ptr()->bools.audio_fastforward_speedup = true;
          retro_atomic_store_release_int(&st->pipe_ff_mult_q16,
                (int)(65536.0 / tempos[step]));
+         audio_driver_publish_runloop();
       }
-      if (!(runloop_policy
+      if (!(auto_runloop || (runloop_policy
                ? audio_driver_pipeline_transport_request_runloop(false, true)
                : speed_lowpass
                ? audio_driver_pipeline_transport_request_speed(tempo, active, false, true)
-               : audio_driver_pipeline_transport_request(tempo, active, false, check.cutoff)))
+               : audio_driver_pipeline_transport_request(tempo, active, false, check.cutoff))))
       {
          fixture_failures++;
          return;
       }
       for (retry = 0; retry < 3; retry++)
+      {
+         if (auto_runloop)
+            retro_atomic_store_release_int(&st->pipe_ff_mult_q16,
+                  (int)(65536.0 / tempos[step]));
          submit_frame((size_t)(CORE_RATE / FPS *
                   (tempos[step] < 1 ? 1 : tempos[step])), publishes);
+      }
       boundary = retro_atomic_load_relaxed_size(&st->pipe_layouts.head);
       for (retry = 0; retry < 2000; retry++)
       {
@@ -684,15 +782,47 @@ static void wrapper_live_controls(unsigned publishes)
                && retro_atomic_load_acquire_size(&cnt_writes) != before) break;
          usleep(1000);
       }
-      if (retry == 2000) fixture_failures++;
+      if (retry == 2000)
+      { fprintf(stderr, "control drain timed out at step %u\n", step); fixture_failures++; }
       /* Observe consumer-owned metadata only while the real worker is parked. */
       audio_thread_apply_control(st->context_audio_data, check_live_control, &check);
    }
    if (runloop_policy)
    {
+      if (auto_runloop)
+      {
+         runloop_state_get_ptr()->flags = RUNLOOP_FLAG_SLOWMOTION;
+         config_get_ptr()->floats.slowmotion_ratio = 8;
+         audio_driver_publish_runloop();
+         submit_frame((size_t)(CORE_RATE / FPS), publishes);
+         if (st->pipe_transport || !st->pipe_transport_follow
+               || st->pipe_transport_suspended != retained) fixture_failures++;
+      }
       runloop_state_get_ptr()->flags = 0;
       config_get_ptr()->floats.slowmotion_ratio = 1;
       config_get_ptr()->bools.audio_fastforward_speedup = false;
+      audio_driver_publish_runloop();
+      if (auto_runloop)
+      {
+         bool drained = false;
+         audio_driver_frame_end();
+         for (step = 0; step < 2000; step++)
+         {
+            if (!retro_spsc_read_avail(&st->pipe_ring))
+               audio_thread_apply_control(st->context_audio_data, check_fallback_drained, &drained);
+            if (drained) break;
+            usleep(1000);
+         }
+         if (!drained)
+         { fprintf(stderr, "legacy fallback did not drain source/device output\n"); fixture_failures++; }
+         audio_driver_frame_end();
+         submit_frame((size_t)(CORE_RATE / FPS), publishes);
+         if (st->pipe_transport != retained || st->pipe_transport_suspended
+               || st->pipe_transport_output != retained_output
+               || st->pipe_layouts.published_control != 65536
+               || st->pipe_layouts.published_cutoff != 0)
+         { fprintf(stderr, "automatic recovery did not reuse native storage\n"); fixture_failures++; }
+      }
    }
 }
 
@@ -705,18 +835,28 @@ static void wrapper_restart(void)
       size_t before;
       unsigned retry;
       audio_thread_apply_control(st->context_audio_data, discard_parked, NULL);
-      if (!st->current_audio->stop(st->context_audio_data)) fixture_failures++;
+      if (cycle & 1)
+      {
+         if (!audio_driver_stop() || st->last_flush_time || st->pipe_ff_frames
+               || retro_atomic_load_acquire_int(&st->pipe_ff_mult_q16) != 65536)
+         { fprintf(stderr, "frontend stop retained source cadence\n"); fixture_failures++; }
+      }
+      else if (!st->current_audio->stop(st->context_audio_data)) fixture_failures++;
       before = retro_atomic_load_acquire_size(&cnt_wakes);
       audio_thread_apply_control(st->context_audio_data, discard_parked, NULL);
       if (transport_mode)
       {
          audio_driver_pipeline_transport_release();
          if (!prepare_transport(true))
-            fixture_failures++;
+         { fprintf(stderr, "restart preparation failed\n"); fixture_failures++; }
       }
       if (before != retro_atomic_load_acquire_size(&cnt_wakes)) fixture_failures++;
       before = retro_atomic_load_acquire_size(&cnt_writes);
-      if (!st->current_audio->start(st->context_audio_data, false)) fixture_failures++;
+      if (cycle & 1)
+      {
+         if (!audio_driver_start(false)) fixture_failures++;
+      }
+      else if (!st->current_audio->start(st->context_audio_data, false)) fixture_failures++;
       for (retry = 0; retry < 3; retry++)
          /* Prime the fixed-size source ring even below nominal tempo. */
          submit_frame((size_t)(CORE_RATE / FPS *
@@ -769,7 +909,7 @@ static void submit_frame(size_t per_frame, unsigned publishes)
       else audio_driver_submit(&audio_driver_st, 1.0f,
             source_float ? (const void*)(frame_audio_float + done * 2)
                          : (const void*)(frame_audio + done * 2), n * 2,
-            source_float, false, false);
+            source_float, false, false, true);
       done += n;
       if (spread_publishes && publishes > 1 && k + 1 < publishes)
       {
@@ -799,10 +939,11 @@ static void submit_frame(size_t per_frame, unsigned publishes)
 
    /* Publish the signal's timestamp before the sequence that advertises
     * it, so a consumer that sees the sequence sees the time with it. */
-   sig_us = t1;
+   retro_atomic_store_release_size(&sig_us, (size_t)t1);
    retro_atomic_store_release_size(&sig_seq,
          retro_atomic_load_relaxed_size(&sig_seq) + 1);
-   audio_driver_pipeline_signal(&audio_driver_st);
+   if (auto_runloop) audio_driver_frame_end();
+   else audio_driver_pipeline_signal(&audio_driver_st);
 
    if (t1 > t0 + slept)
    {
@@ -851,6 +992,16 @@ static void run_one(unsigned publishes, double seconds, bool backpressure)
    }
    else pthread_create(&cons, NULL, consumer, NULL);
 
+   if (pause_boundary_mode)
+   {
+      pause_boundary_run();
+      frames = 0;
+   }
+   if (consumer_exit_mode)
+   {
+      consumer_exit_run();
+      frames = 0;
+   }
    clock_gettime(CLOCK_MONOTONIC, &next);
    for (i = 0; i < frames; i++)
    {
@@ -880,8 +1031,8 @@ static void run_one(unsigned publishes, double seconds, bool backpressure)
    if (use_wrapper)
    {
       audio_driver_state_t *st = &audio_driver_st;
-      if (live_controls) wrapper_live_controls(publishes);
-      wrapper_restart();
+      if (live_controls && !pause_boundary_mode) wrapper_live_controls(publishes);
+      if (!pause_boundary_mode) wrapper_restart();
       if (!st->current_audio->stop(st->context_audio_data)) fixture_failures++;
       if (channels > 2 && (st->extra.channels != channels - 2
                || st->extra.positions != (source_layout & ~AUDIO_LAYOUT_STEREO)
@@ -907,12 +1058,15 @@ static void run_one(unsigned publishes, double seconds, bool backpressure)
    under  = retro_atomic_load_acquire_size(&dev_underruns) - warm_under;
    pulls  = retro_atomic_load_acquire_size(&dev_pulls) - warm_pulls;
    if (use_wrapper && (!writes || !wakes)) fixture_failures++;
-   if (use_wrapper)
+   if (use_wrapper && !pause_boundary_mode)
    {
       size_t f = retro_atomic_load_acquire_size(&to_float);
       size_t n = retro_atomic_load_acquire_size(&to_int16);
       size_t native_frames = retro_atomic_load_acquire_size(&int16_src_frames);
-      /* Matching lanes stay native; mixed lanes convert only toward the sink. */
+      /* Matching lanes stay native; mixed lanes convert only toward the
+       * sink. A conversion-volume invariant of the load sweep: the
+       * boundary scenario's few frames mostly leave through the discard
+       * and prove nothing about lane purity either way. */
       if (source_float == !device_int16)
       {
          if (f || n) fixture_failures++;
@@ -948,6 +1102,173 @@ static void run_one(unsigned publishes, double seconds, bool backpressure)
    pipeline_down();
 }
 
+
+/* --- the pause boundary on the ring -------------------------------- */
+
+/* What audio_driver_pause_fade() promises the threaded pipeline: the
+ * frames the ring held at a pause are stale behind the tail and are
+ * never played, and the core's first audio after the resume comes up
+ * under the ramp. Sequenced through the wrapper's parked control
+ * transactions, so the pause lands with the consumer provably not
+ * mid-callback and the ring provably holding unplayed source. */
+
+static void pause_boundary_fill(float amp)
+{
+   size_t i;
+   for (i = 0; i < 32768u * channels; i++)
+   {
+      frame_audio[i]       = (int16_t)(amp * 32767.0f);
+      frame_audio_float[i] = amp;
+   }
+}
+
+static void pause_boundary_pause_parked(void *userdata)
+{
+   (void)userdata;
+   /* Content the consumer has provably not touched: the submit lands
+    * with the callback parked, or drops against a ring already full of
+    * the same stale level - unplayed source either way. */
+   submit_frame((size_t)(CORE_RATE / FPS), 1);
+   audio_driver_pause_fade(true);
+   /* The tail just written is the stream's own; everything at the
+    * stale level from here on is a protocol failure. */
+   retro_atomic_store_release_int(&tap_stale, 0);
+   retro_atomic_store_release_int(&tap_on, 1);
+}
+
+static void pause_boundary_resume_parked(void *userdata)
+{
+   (void)userdata;
+   retro_atomic_store_release_int(&tap_on, 0);
+   audio_driver_pause_fade(false);
+   retro_atomic_store_release_size(&tap_head_n, 0);
+   retro_atomic_store_release_int(&tap_record, 1);
+}
+
+static void pause_boundary_case(void)
+{
+   audio_driver_state_t *st = &audio_driver_st;
+   size_t per_frame = (size_t)(CORE_RATE / FPS);
+   unsigned frame, waited;
+   double head_mean = 0.0, tail_mean = 0.0;
+   size_t n, i;
+
+   /* Played audio at the stale level, so the history and the device are
+    * primed the way a session's would be. */
+   pause_boundary_fill(0.9f);
+   for (frame = 0; frame < 8; frame++)
+      submit_frame(per_frame, 1);
+
+   audio_thread_apply_control(st->context_audio_data,
+         pause_boundary_pause_parked, NULL);
+
+   /* The consumer takes the stale frames out unplayed. */
+   for (waited = 0; waited < 2000; waited++)
+   {
+      if (!retro_spsc_read_avail(&st->pipe_ring))
+         break;
+      audio_driver_pipeline_wake();
+      usleep(1000);
+   }
+   if (retro_spsc_read_avail(&st->pipe_ring))
+      fixture_failures++;
+   if (retro_atomic_load_acquire_int(&tap_stale))
+      fixture_failures++;
+
+   audio_thread_apply_control(st->context_audio_data,
+         pause_boundary_resume_parked, NULL);
+
+   /* The core's first audio after the resume. */
+   for (frame = 0; frame < 8 && retro_atomic_load_relaxed_size(&tap_head_n)
+         < TAP_HEAD_MAX; frame++)
+      submit_frame(per_frame, 1);
+   for (waited = 0; waited < 2000
+         && retro_atomic_load_relaxed_size(&tap_head_n) < TAP_HEAD_MAX;
+         waited++)
+      usleep(1000);
+   retro_atomic_store_release_int(&tap_record, 0);
+
+   /* Acquire pairs with the release that published each element. */
+   n = retro_atomic_load_acquire_size(&tap_head_n);
+   if (n < TAP_HEAD_MAX)
+   {
+      fixture_failures++;
+      return;
+   }
+   for (i = 0; i < 64; i++)
+   {
+      head_mean += tap_head[i];
+      tail_mean += tap_head[n - 64 + i];
+   }
+   head_mean /= 64.0;
+   tail_mean /= 64.0;
+   /* The ramp: the resumed stream opens well below its level and is
+    * climbing by the end of the window. */
+   if (!(head_mean < 0.12))
+      fixture_failures++;
+   if (!(tail_mean > head_mean * 3.0 + 0.02))
+      fixture_failures++;
+}
+
+/* The consumer leaving its loop while the producer is parked in the
+ * wait for it. audio_thread_write() clears alive under thr->lock when
+ * the device refuses, and the loop reads alive under the same lock -
+ * but what the wrapper publishes on its way out, pipe_consumer_gone,
+ * is under no lock, and the parked producer reads it under none
+ * either. Nothing joins between the two, because the producer is
+ * waiting rather than tearing the driver down, so there is no edge to
+ * order them. That pair is what this lane exists to put in front of
+ * ThreadSanitizer. */
+static void consumer_exit_case(void)
+{
+   size_t   per_frame = (size_t)(CORE_RATE / FPS);
+   unsigned frame;
+   int64_t  began, spent;
+
+   /* Enough in flight that the producer has to wait on the consumer
+    * rather than sail through. */
+   for (frame = 0; frame < 16; frame++)
+      submit_frame(per_frame, 1);
+
+   /* From here the device refuses, so the wrapper clears alive and
+    * leaves its loop under its own steam. */
+   retro_atomic_store_release_int(&dev_fail_now, 1);
+
+   began = (int64_t)cpu_features_get_time_usec();
+   for (frame = 0; frame < 64; frame++)
+      submit_frame(per_frame, 1);
+   spent = (int64_t)cpu_features_get_time_usec() - began;
+
+   /* A consumer that has gone is one the producer must stop waiting
+    * for. Each wait is lap bounded, so sitting through even one full
+    * set of laps for every frame here would take far longer than this;
+    * the bound is loose on purpose, since it is the race and not the
+    * timing this lane is for. */
+   if (spent > 4000000)
+   {
+      fprintf(stderr,
+            "the producer waited %lld us on a consumer that had gone\n",
+            (long long)spent);
+      fixture_failures++;
+   }
+}
+
+static void consumer_exit_run(void)
+{
+   unsigned f0 = fixture_failures;
+   consumer_exit_case();
+   printf("consumer exit: the producer stops waiting on a departed consumer, %u failures\n",
+         fixture_failures - f0);
+}
+
+static void pause_boundary_run(void)
+{
+   unsigned f0 = fixture_failures;
+   pause_boundary_case();
+   printf("pause boundary: stale ring discarded, resume under the ramp, %u failures\n",
+         fixture_failures - f0);
+}
+
 int main(int argc, char **argv)
 {
    /* 1 is a core that hands over a frame at a time. 262 is a scanline
@@ -969,6 +1290,14 @@ int main(int argc, char **argv)
    live_layouts = getenv("LIVE_LAYOUTS") != NULL;
    speed_lowpass = getenv("SPEED_LPF") != NULL;
    runloop_policy = getenv("RUNLOOP_POLICY") != NULL;
+   auto_runloop = getenv("AUTO_RUNLOOP") != NULL;
+   pause_boundary_mode = getenv("PAUSE_BOUNDARY") != NULL;
+   consumer_exit_mode  = getenv("CONSUMER_EXIT") != NULL;
+   if (pause_boundary_mode && (!use_wrapper || !transport))
+   {
+      fprintf(stderr, "PAUSE_BOUNDARY requires WRAPPER and a TRANSPORT\n");
+      return 1;
+   }
    if (layout)
    {
       if (!strcmp(layout, "5.1")) source_layout = AUDIO_LAYOUT_5POINT1;
@@ -1019,6 +1348,11 @@ int main(int argc, char **argv)
       fprintf(stderr, "RUNLOOP_POLICY requires SPEED_LPF\n");
       return 1;
    }
+   if (auto_runloop && !runloop_policy)
+   {
+      fprintf(stderr, "AUTO_RUNLOOP requires RUNLOOP_POLICY\n");
+      return 1;
+   }
 
    lat_us = (retro_time_t*)malloc(MAX_SAMPLES * sizeof(retro_time_t));
    if (!lat_us)
@@ -1055,8 +1389,11 @@ int main(int argc, char **argv)
    printf("  pubs     wakes/f  writes/f |   wake latency us     |  producer us/frame   | short  pulls\n");
    printf("                             |    p50     p99     max |   mean  blkd   worst |\n");
    }
-   for (i = 0; i < sizeof(sweep) / sizeof(sweep[0]); i++)
+   for (i = 0; i < (pause_boundary_mode
+            ? 1 : sizeof(sweep) / sizeof(sweep[0])); i++)
       run_one(sweep[i], seconds, true);
+   if (pause_boundary_mode)
+      goto report;
 
    printf("\n-- device applies none; the data handshake is the only pacer --\n");
    if (!use_wrapper)
@@ -1067,12 +1404,22 @@ int main(int argc, char **argv)
    for (i = 0; i < sizeof(sweep) / sizeof(sweep[0]); i++)
       run_one(sweep[i], seconds, false);
 
+report:
    free(lat_us);
+   {
+      size_t reads = retro_atomic_load_acquire_size(&consumer_settings_reads);
+      if (reads)
+      {
+         fprintf(stderr, "consumer read settings %u times\n", (unsigned)reads);
+         fixture_failures++;
+      }
+   }
    if (use_wrapper) printf("native wrapper: 16 runs, 128 restart transactions, %u failures\n", fixture_failures);
    if (live_controls) printf("live transport: 128 processing changes without metadata reset, %u failures\n", fixture_failures);
    if (live_layouts) printf("live layouts: 128 source layout changes on a fixed 7.1 device, %u failures\n", fixture_failures);
    if (speed_lowpass) printf("speed LPF: 128 coherent tempo/cutoff requests, %u failures\n", fixture_failures);
    if (runloop_policy) printf("runloop policy: 128 speed-state requests, %u failures\n", fixture_failures);
+   if (auto_runloop) printf("automatic transport: 128 producer updates, 16 fallbacks/recoveries, %u failures\n", fixture_failures);
    printf("pipeline wakeups: %u fixture failures\n", fixture_failures);
    return fixture_failures ? 1 : 0;
 }

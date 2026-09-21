@@ -817,7 +817,7 @@ static void gl_glsl_find_uniforms(glsl_shader_data_t *glsl,
    if (  uni->gyroscope >= 0
       || uni->accelerometer >= 0
       || uni->accelerometer_rest >= 0)
-      input_state_get_ptr()->shader_uses_sensors = true;
+      input_driver_set_shader_uses_sensors(true);
 
    for (i = 0; i < glsl->shader->luts; i++)
       uni->lut_texture[i] = glGetUniformLocation(prog, glsl->shader->lut[i].id);
@@ -928,7 +928,7 @@ static void gl_glsl_deinit(void *data)
       return;
 
    gl_glsl_destroy_resources(glsl);
-   input_state_get_ptr()->shader_uses_sensors = false;
+   input_driver_set_shader_uses_sensors(false);
 
    free(glsl->coord_scratch);
    free(glsl);
@@ -1463,7 +1463,7 @@ static void gl_glsl_set_params(void *dat, void *shader_data)
       glUniform1f(uni->original_fps, video_driver_get_original_fps());
 
   if (uni->rotation >= 0)
-      glUniform1i(uni->rotation, retroarch_get_rotation());
+      glUniform1i(uni->rotation, video_driver_get_rotation_snapshot());
 
   if (uni->core_aspect >= 0)
       glUniform1f(uni->core_aspect, video_driver_get_core_aspect());
@@ -1472,7 +1472,7 @@ static void gl_glsl_set_params(void *dat, void *shader_data)
   {
      /* OriginalAspectRotated: return 1/aspect for 90 and 270 rotated content */
      float core_aspect_rot = video_driver_get_core_aspect();
-     uint32_t rot = retroarch_get_rotation();
+     uint32_t rot = video_driver_get_rotation_snapshot();
      if (rot == 1 || rot == 3)
         core_aspect_rot = 1/core_aspect_rot;
      glUniform1f(uni->core_aspect_rot, core_aspect_rot);
@@ -1662,19 +1662,17 @@ static void gl_glsl_set_params(void *dat, void *shader_data)
    /* Sensor uniforms — values are 0.0 if sensors disabled or not available */
    {
       const struct shader_uniforms *uni = &glsl->uniforms[glsl->active_idx];
-      /* Per-frame snapshot cached by input_driver_poll()
-       * on the main thread */
-      input_driver_state_t *input_st   = input_state_get_ptr();
+      /* One coherent seqlock'd snapshot of the values
+       * input_driver_poll() published on the main thread. */
+      float gyro[3], accel[3], rest[3];
+      input_driver_read_sensor_snapshot(gyro, accel, rest);
 
       if (uni->gyroscope >= 0)
-         glUniform3fv(uni->gyroscope, 1,
-               input_st->sensor_gyroscope_cache);
+         glUniform3fv(uni->gyroscope, 1, gyro);
       if (uni->accelerometer >= 0)
-         glUniform3fv(uni->accelerometer, 1,
-               input_st->sensor_accelerometer_cache);
+         glUniform3fv(uni->accelerometer, 1, accel);
       if (uni->accelerometer_rest >= 0)
-         glUniform3fv(uni->accelerometer_rest, 1,
-               input_st->sensor_accelerometer_rest);
+         glUniform3fv(uni->accelerometer_rest, 1, rest);
    }
 }
 

@@ -23,6 +23,9 @@
 
 #include "../video_display_server.h"
 #include "edid_sysfs.h"
+#include "../common/wayland_drm_lease.h"
+
+#include "../../verbosity.h"
 
 typedef struct
 {
@@ -152,6 +155,7 @@ static void *wl_display_server_init(void)
    wl_display_roundtrip(serv->dpy);
    /* Second roundtrip: receive wl_output events (mode, geometry) */
    wl_display_roundtrip(serv->dpy);
+   wayland_drm_lease_report(serv->dpy);
 
    return serv;
 }
@@ -249,6 +253,16 @@ static int wl_display_server_get_edid(void *data, uint8_t *out, size_t max)
    return n;
 }
 
+/* No idle_wait yet, and not by oversight. This server holds its own
+ * wl_display connection; input travels on the video context's, a
+ * different connection with a different fd, so waiting here would
+ * wake on registry and output events and never on a key. The real
+ * wait needs the context's display and Wayland's prepare-read pairing
+ * (wl_display_prepare_read, poll, then read_events or cancel_read),
+ * which other threads dispatching that display must also honor; it
+ * wants a live compositor to verify against. Until then the caller
+ * sleeps. */
+
 const video_display_server_t dispserv_wl = {
    wl_display_server_init,
    wl_display_server_destroy,
@@ -279,5 +293,6 @@ const video_display_server_t dispserv_wl = {
    NULL, /* modeline_set */
    NULL, /* modeline_flush */
    wl_display_server_get_edid,
+   NULL /* idle_wait: see the note above */,
    "wayland"
 };

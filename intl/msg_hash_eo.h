@@ -2644,7 +2644,6 @@ static const struct
    char s_79b8ce4a[64];
    char s_a1a8257e[118];
    char s_282f7955[96];
-   char s_d5231783[98];
    char s_a68d6d11[65];
    char s_74022c02[78];
    char s_8abad013[77];
@@ -2789,8 +2788,6 @@ static const struct
    char s_d9153542[47];
    char s_8e48ec69[35];
    char s_cd43c108[88];
-   char s_cd46e260[116];
-   char s_cd482ffe[118];
    char s_49336383[44];
    char s_e92351d4[98];
    char s_8e22cdce[58];
@@ -3563,7 +3560,6 @@ static const struct
    char s_261210b3[75];
    char s_3a4b246c[113];
    char s_2ceab671[122];
-   char s_977f8e82[111];
    char s_3c679f0a[288];
    char s_5b059407[139];
    char s_36033606[159];
@@ -7083,8 +7079,6 @@ static const struct
    " menuoj kiam nenia enhavo estas \305\235argita.",
    "\305\234an\304\235u \304\211i tiun opcion por al\304\235ustigi la horizontalajn agordojn por "
    "\305\235an\304\235i la bildan grandon.",
-   "Nur por ekranoj de CRT. Provas uzi \304\235ustajn distingivon kaj ofteco de aktualigo de la kern"
-   "o/ludo.",
    "Inter\305\235an\304\235i inter indi\304\235enaj kaj ultralar\304\235aj superdistingivoj.",
    "Uzi propran oftecon de aktualigo specifitan en la konfigudosiero se bezonata.",
    "\305\234an\304\235u \304\211i tiun opcion se la bildo ne estas \304\235uste centrigita en la ekr"
@@ -7283,10 +7277,6 @@ static const struct
    "Kapti bildon de la kuranta enhavo.",
    "Tenas la kurante elektitan ombrigilon \305\235altita a\305\255 mal\305\235altita dum klavon esta"
    "s tenata.",
-   "\305\234argas kaj aplikas la sekvan anta\305\255agordan dosieron deo mbrigilo en la radiko de la"
-   " dosierujo \"Videaj ombrigiloj\".",
-   "\305\234argas kaj aplikas la anta\305\255an anta\305\255agordan dosieron de ombrigilo en la radi"
-   "ko de la dosierujo \"Videaj ombrigiloj\".",
    "Inter\305\235altas la kurante elektita ombrigilo.",
    "Ebligas malrapidpluigo kiam tenate. Enhavo rulas je normala rapido kiam la klavo estas maltenata"
    ".",
@@ -8400,8 +8390,6 @@ static const struct
    "la kuranta enhava dosierujo.",
    "Konservi ombrigilan anta\305\255agordon, kiu havas ligon al la originala anta\305\255agordo \305"
    "\235argita kaj inkluzivas nur la parametraj",
-   "Malfermi dosieresplorilon \304\211e la laste uzata dosierujo kiam \305\235argante ombrigilajn an"
-   "ta\305\255agordojn kaj aplikojn.",
    "AVERTO: Rapida flagro povus ka\305\255zi bildan da\305\255ron (\"image presistence\") en kelkaj "
    "ekranoj. Uzu \304\235in je via propra risko. // Imitas bazan rulantan skanlinion sur pluraj subf"
    "ilmeroj dividante la ekrano supren vertikale kaj bildigante \304\211iu parto de la ekrano la\305"
@@ -9067,7 +9055,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_eo_blob_check[
-      (sizeof(msg_hash_eo_blob) == (172462u
+      (sizeof(msg_hash_eo_blob) == (172019u
 #ifdef ANDROID
        + 312u
 #endif
@@ -12100,7 +12088,6 @@ static const uint32_t msg_hash_eo_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCHRES_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_HIRES_MENU,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_PORCH_ADJUST,
-   (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_SUPER,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_USE_CUSTOM_REFRESH_RATE,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_VERTICAL_ADJUST,
@@ -12245,8 +12232,6 @@ static const uint32_t msg_hash_eo_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SAVE_STATE_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SCREENSHOT,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_HOLD,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_NEXT,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_PREV,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_TOGGLE,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_HOLD_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_KEY,
@@ -13019,7 +13004,6 @@ static const uint32_t msg_hash_eo_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_GLOBAL,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_PARENT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_REFERENCE,
-   (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_REMEMBER_LAST_DIR,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_SUBFRAMES,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHARED_CONTEXT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SMOOTH,

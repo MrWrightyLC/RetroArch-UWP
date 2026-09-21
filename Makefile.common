@@ -325,11 +325,14 @@ OBJ += \
        audio/audio_pipeline_stretch.o \
        audio/audio_binaural.o \
        input/input_driver.o \
+       input/input_overlay_textures.o \
        input/common/input_hid_common.o \
        led/led_driver.o \
        gfx/video_driver.o \
        gfx/gfx_display.o \
        gfx/gfx_animation.o \
+       gfx/gfx_instrument.o \
+       gfx/gfx_surface.o \
        gfx/gfx_thumbnail.o \
        gfx/gfx_anim_preview.o \
        configuration.o \
@@ -1214,7 +1217,10 @@ endif
 
 ifeq ($(HAVE_THREADS), 1)
    OBJ += $(LIBRETRO_COMM_DIR)/rthreads/rthreads.o \
+          $(LIBRETRO_COMM_DIR)/rthreads/tpool.o \
           $(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.o \
+          $(LIBRETRO_COMM_DIR)/rthreads/retro_procbarrier.o \
+          $(LIBRETRO_COMM_DIR)/rthreads/retro_asym_eventcount.o \
           $(LIBRETRO_COMM_DIR)/queues/retro_waitable_spsc.o \
           gfx/video_thread_wrapper.o \
           gfx/video_thread_hw.o \
@@ -1259,13 +1265,13 @@ endif
 ifeq ($(TARGET), retroarch_orbis)
    OBJ +=  input/drivers/ps4_input.o \
 	   input/drivers_joypad/ps4_joypad.o \
-	   audio/drivers/psp_audio.o
+	   audio/drivers/ps4_audio.o
 endif
 
 ifeq ($(TARGET), retroarch_vita)
    OBJ +=  input/drivers/psp_input.o \
 			  input/drivers_joypad/psp_joypad.o \
-			  audio/drivers/psp_audio.o \
+			  audio/drivers/psp2_audio.o \
 			  frontend/drivers/platform_psp.o
 endif
 
@@ -1330,7 +1336,9 @@ ifeq ($(HAVE_WAYLAND), 1)
         gfx/common/wayland/tablet-unstable-v2.o \
         gfx/common/wayland/content-type-v1.o \
         gfx/common/wayland/single-pixel-buffer-v1.o \
-        gfx/common/wayland/tearing-control-v1.o
+        gfx/common/wayland/tearing-control-v1.o \
+        gfx/common/wayland/drm-lease-v1.o \
+        gfx/common/wayland_drm_lease.o
 
    ifeq ($(HAVE_VULKAN), 1)
       OBJ += gfx/drivers_context/wayland_vk_ctx.o
@@ -1402,7 +1410,7 @@ ifeq ($(HAVE_X11), 1)
    DEFINES += -DHAVE_X11
    DEF_FLAGS += $(X11_CFLAGS) $(XEXT_CFLAGS) $(XF86VM_CFLAGS) $(XINERAMA_CFLAGS)
    ifeq ($(HAVE_XCB),1)
-      LIBS += -lX11-xcb
+      LIBS += $(X11_XCB_LIBS)
    endif
    ifeq ($(HAVE_XI2),1)
       LIBS += -lXi
@@ -1415,7 +1423,10 @@ ifeq ($(HAVE_X11), 1)
       OBJ += gfx/drivers_context/x_ctx.o
    endif
    ifeq ($(HAVE_VULKAN), 1)
-      OBJ += gfx/drivers_context/x_vk_ctx.o
+      # The X11 Vulkan context creates an XCB surface.
+      ifeq ($(HAVE_XCB), 1)
+         OBJ += gfx/drivers_context/x_vk_ctx.o
+      endif
    endif
 endif
 
@@ -1686,9 +1697,11 @@ endif
 ifeq ($(HAVE_METAL), 1)
    DEFINES += -DHAVE_METAL
    LIBS += -framework Metal -framework MetalKit -framework QuartzCore
-   # Metal code (metal.m) relies on ARC. Enabled per-file via an override
-   # in the top-level Makefile, since applying -fobjc-arc globally would
-   # break the MRC-written Cocoa code (ui_cocoa.m et al.).
+   # metal.m builds under both ARC and MRC (see the M_OBJC_* ownership
+   # macros at the top of the file). The top-level Makefile still builds
+   # it with a per-file -fobjc-arc override — ARC is the preferred mode
+   # for the standalone object — but the griffin_objc.m unity TU may
+   # compile it either way depending on the Xcode configuration.
    OBJ += gfx/drivers/metal.o
 endif
 
@@ -1716,6 +1729,10 @@ endif
 ifeq ($(HAVE_SDL3), 1)
    SDL3_CFLAGS = $(shell pkg-config sdl3 --cflags)
 	SDL3_LIBS = $(shell pkg-config sdl3 --libs)
+ifeq ($(strip $(SDL3_LIBS)),)
+   $(warning SDL3_LIBS is not set, falling back to -lSDL3)
+   SDL3_LIBS = -lSDL3
+endif
    DEF_FLAGS += $(SDL3_CFLAGS)
    # RetroArch supplies its own entry point and sets SDL_MAIN_HANDLED
    # (see retroarch.c), so SDL's WinMain shim library (-lSDL3main /
@@ -1743,14 +1760,16 @@ else ifeq ($(HAVE_SDL2), 1)
    HAVE_SDL_COMMON = 1
    OBJ += gfx/drivers/sdl2_gfx.o \
 	  gfx/common/sdl2_common.o \
-	  gfx/display_servers/dispserv_sdl2.o
+	  gfx/display_servers/dispserv_sdl2.o \
+	  audio/drivers/sdl2_audio.o
    DEF_FLAGS += $(SDL2_CFLAGS)
    # See the SDL3 note above: drop SDL's WinMain shim lib, we set
    # SDL_MAIN_HANDLED and provide our own entry point.
    LIBS += $(filter-out -lSDL2main -lSDLmain -lSDL_main,$(SDL2_LIBS))
 else ifeq ($(HAVE_SDL), 1)
    HAVE_SDL_COMMON = 1
-   OBJ += gfx/drivers/sdl_gfx.o
+   OBJ += gfx/drivers/sdl_gfx.o \
+          audio/drivers/sdl1_audio.o
    DEF_FLAGS += $(SDL_CFLAGS)
    # See the SDL3 note above: drop SDL's WinMain shim lib.
    LIBS += $(filter-out -lSDLmain -lSDL_main,$(SDL_LIBS))
@@ -1767,18 +1786,27 @@ else ifeq ($(HAVE_SDL_DINGUX), 1)
    endif
 
    OBJ += input/drivers/sdl_dingux_input.o \
-          input/drivers_joypad/sdl_dingux_joypad.o
+          input/drivers_joypad/sdl_dingux_joypad.o \
+          audio/drivers/sdl1_audio.o
    DEF_FLAGS += $(SDL_DINGUX_CFLAGS)
    LIBS += $(SDL_DINGUX_LIBS)
 endif
 
 ifeq ($(HAVE_SDL_COMMON), 1)
-   OBJ += input/drivers/sdl_input.o \
-          input/drivers_joypad/sdl_joypad.o \
-          audio/drivers/sdl_audio.o
+   ifeq ($(HAVE_SDL2), 1)
+      OBJ += input/drivers/sdl2_input.o \
+             input/drivers_joypad/sdl2_joypad.o
+   else
+      OBJ += input/drivers/sdl1_input.o \
+             input/drivers_joypad/sdl1_joypad.o
+   endif
 
    ifeq ($(HAVE_GL_CONTEXT), 1)
-      OBJ += gfx/drivers_context/sdl_gl_ctx.o
+      ifeq ($(HAVE_SDL2), 1)
+         OBJ += gfx/drivers_context/sdl2_gl_ctx.o
+      else
+         OBJ += gfx/drivers_context/sdl1_gl_ctx.o
+      endif
    endif
 
    INCLUDE_DIRS += $(BSD_LOCAL_INC)
@@ -1859,6 +1887,10 @@ endif
 ifeq ($(HAVE_DISPMANX), 1)
    OBJ += gfx/drivers/dispmanx_gfx.o
    HAVE_VIDEOCORE = 1
+endif
+
+ifeq ($(HAVE_VIDEOCORE), 1)
+   OBJ += gfx/display_servers/dispserv_videocore.o
 endif
 
 ifeq ($(HAVE_SUNXI), 1)
@@ -2344,6 +2376,9 @@ ifeq ($(HAVE_RWEBM), 1)
    OBJ += $(LIBRETRO_COMM_DIR)/formats/webm/rwebm.o \
           $(LIBRETRO_COMM_DIR)/formats/webm/rwebm_video.o \
           $(LIBRETRO_COMM_DIR)/formats/webm/rwebm_audio.o
+   # The row-band splitter the video blits run through; the mp4 block
+   # adds it when building without webm.
+   OBJ += $(LIBRETRO_COMM_DIR)/formats/image/image_blit_bands.o
 ifneq ($(HAVE_RWEBP), 1)
    # rwebm_video decodes VP8 tracks with rvp8, normally built with RWEBP
    OBJ += $(LIBRETRO_COMM_DIR)/formats/vp8/rvp8.o
@@ -2361,6 +2396,9 @@ ifneq ($(HAVE_RVP9), 1)
    # rmp4_video's H.265 Main10 arm uses the shared 10-bit / HDR
    # I420->RGB blits; normally linked from the HAVE_RVP9 block below.
    OBJ += $(LIBRETRO_COMM_DIR)/formats/image/image_hdr_blit.o
+endif
+ifneq ($(HAVE_RWEBM), 1)
+   OBJ += $(LIBRETRO_COMM_DIR)/formats/image/image_blit_bands.o
 endif
 ifneq ($(HAVE_RWEBP), 1)
 ifneq ($(HAVE_RWEBM), 1)
@@ -2734,8 +2772,7 @@ endif
 
 ifeq ($(HAVE_FFMPEG), 1)
    OBJ += record/drivers/record_ffmpeg.o \
-          cores/libretro-ffmpeg/ffmpeg_core.o \
-          $(LIBRETRO_COMM_DIR)/rthreads/tpool.o
+          cores/libretro-ffmpeg/ffmpeg_core.o
 
    LIBS += $(AVCODEC_LIBS) $(AVFORMAT_LIBS) $(AVUTIL_LIBS) $(SWSCALE_LIBS) $(SWRESAMPLE_LIBS) $(FFMPEG_LIBS) $(AVDEVICE_LIBS)
    DEFINES += -DHAVE_FFMPEG
@@ -3123,6 +3160,14 @@ else
 $(warning Windows NT version macro (_WIN32_WINNT) is not defined.)
 endif
 
+endif
+
+# Cross builds with mingw-w64 (a Linux host, so the MSYS2 detection
+# above never fires): the toolchain ships the 2.8 import library.
+ifneq (,$(findstring mingw,$(CC)$(HOST_PREFIX)))
+ifeq ($(HAVE_XAUDIO), 1)
+   LIBS += -lxaudio2_8
+endif
 endif
 
 ##################################

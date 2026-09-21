@@ -63,7 +63,36 @@ typedef struct
     * lowers it at once. */
    retro_atomic_size_t writable_cached;
    retro_atomic_size_t sink_frames_cached;
+   /* Times the server ran out of audio for this stream, from its own
+    * underflow callback. One atomic add there, read by the frontend. */
+   retro_atomic_size_t underruns;
+   /* The sink's clock against the rate the stream was opened at,
+    * fitted from the timing info the server already hands over:
+    * read_index is what the sink has played, in bytes, and timestamp
+    * is when that was true. A fit over every sample rather than two
+    * points, because noise on a single anchor divides by the window
+    * and reads as drift.
+    *
+    * Accumulated in the latency-update callback, on the mainloop's
+    * thread, and published as one int in ppm. Nothing acts on it. */
+   unsigned frame_bytes;
+   uint64_t clk_anchor_pos;
+   int64_t  clk_anchor_us;
+   int      clk_have_anchor;
+   double   clk_sx, clk_sy, clk_sxx, clk_sxy, clk_n;
+   retro_atomic_int_t clk_ppm;
+   retro_atomic_int_t clk_valid;
 } pa_t;
+
+/* A note for the eventcount census: this driver stays off it, on
+ * purpose. Every wait and signal here is pa_threaded_mainloop's own
+ * rendezvous, which is not machinery this file chose but the
+ * library's contract - every pa_* call below must hold the mainloop
+ * lock, callbacks are dispatched under it, and
+ * pa_threaded_mainloop_signal is only meaningful from inside it.
+ * Parking on anything of ours would step outside that contract, and
+ * there is nothing else here to park on: no fifo of ours sits in
+ * front of pa_stream_write. Same column as ALSA's device waits. */
 
 /* Bounds on the waits below. A server that is answering signals in
  * milliseconds; these are for one that is not - stopped consuming, or
@@ -208,6 +237,65 @@ static void pulse_stream_request_cb(pa_stream *s, size_t len, void *data)
    pa_threaded_mainloop_signal(pa->mainloop, 0);
 }
 
+/* One (position, time) pair from the server's timing info into the
+ * fit. read_index is the sink's play position in bytes; it can step
+ * back on a rewind or a flush, which restarts the fit rather than
+ * reading as an enormous negative drift. */
+static void pulse_clock_sample(pa_t *pa, const pa_timing_info *ti)
+{
+   uint64_t pos;
+   int64_t  us;
+   double   x, y, denom;
+
+   if (!pa->frame_bytes || ti->read_index < 0)
+      return;
+
+   pos = (uint64_t)ti->read_index / pa->frame_bytes;
+   us  = (int64_t)ti->timestamp.tv_sec * 1000000
+       + (int64_t)ti->timestamp.tv_usec;
+
+   if (!pa->clk_have_anchor || pos < pa->clk_anchor_pos
+         || us <= pa->clk_anchor_us)
+   {
+      pa->clk_anchor_pos  = pos;
+      pa->clk_anchor_us   = us;
+      pa->clk_have_anchor = 1;
+      pa->clk_sx = pa->clk_sy = pa->clk_sxx = pa->clk_sxy = pa->clk_n = 0.0;
+      retro_atomic_store_release_int(&pa->clk_valid, 0);
+      return;
+   }
+
+   /* Seconds and frames from the anchor: a fit on the raw values
+    * loses its answer to cancellation. */
+   x = (double)(us - pa->clk_anchor_us) / 1000000.0;
+   y = (double)(pos - pa->clk_anchor_pos);
+
+   pa->clk_sx  += x;
+   pa->clk_sy  += y;
+   pa->clk_sxx += x * x;
+   pa->clk_sxy += x * y;
+   pa->clk_n   += 1.0;
+
+   /* A second of window at least, as the interface says. */
+   if (pa->clk_n < 4.0 || x < 1.0)
+      return;
+
+   denom = pa->clk_n * pa->clk_sxx - pa->clk_sx * pa->clk_sx;
+   if (denom <= 0.0)
+      return;
+
+   {
+      double slope = (pa->clk_n * pa->clk_sxy - pa->clk_sx * pa->clk_sy)
+            / denom;
+      double ppm   = (slope / (double)pa->rate - 1.0) * 1000000.0;
+      if (ppm > -100000.0 && ppm < 100000.0)
+      {
+         retro_atomic_store_release_int(&pa->clk_ppm, (int)ppm);
+         retro_atomic_store_release_int(&pa->clk_valid, 1);
+      }
+   }
+}
+
 static void pulse_stream_latency_update_cb(pa_stream *s, void *data)
 {
    pa_t *pa = (pa_t*)data;
@@ -216,22 +304,25 @@ static void pulse_stream_latency_update_cb(pa_stream *s, void *data)
     * the server's queue; NULL until timing data has arrived. */
    const pa_timing_info *ti = pa_stream_get_timing_info(s);
    if (ti && pa->rate)
+   {
       retro_atomic_store_release_size(&pa->sink_frames_cached,
             (size_t)((uint64_t)ti->sink_usec * pa->rate / 1000000));
+      pulse_clock_sample(pa, ti);
+   }
    pa_threaded_mainloop_signal(pa->mainloop, 0);
 }
 
+/* The server telling us this stream ran dry. Counted, not logged: it
+ * arrives on the mainloop's thread while audio is playing, which is
+ * the one place a log line costs what it is reporting on. */
 static void pulse_underrun_update_cb(pa_stream *s, void *data)
 {
-#if 0
    pa_t *pa = (pa_t*)data;
 
    (void)s;
 
-   RARCH_LOG("[PulseAudio] Underrun (Buffer: %u, Writable size: %u).\n",
-         (unsigned)pa->buffer_size,
-         (unsigned)pa_stream_writable_size(pa->stream));
-#endif
+   if (pa)
+      retro_atomic_fetch_add_size(&pa->underruns, 1);
 }
 
 static void pulse_buffer_attr_cb(pa_stream *s, void *data)
@@ -289,6 +380,9 @@ static void *pulse_init(const char *device, unsigned rate,
       return NULL;
    retro_atomic_size_init(&pa->writable_cached, 0);
    retro_atomic_size_init(&pa->sink_frames_cached, 0);
+   retro_atomic_size_init(&pa->underruns, 0);
+   retro_atomic_int_init(&pa->clk_ppm, 0);
+   retro_atomic_int_init(&pa->clk_valid, 0);
 
    memset(&spec, 0, sizeof(spec));
 
@@ -341,7 +435,8 @@ static void *pulse_init(const char *device, unsigned rate,
    spec.channels = (uint8_t)audio_layout_channels(pa->layout);
    spec.rate     = rate;
    pulse_channel_map(pa->layout, &map);
-   pa->rate      = rate;
+   pa->rate        = rate;
+   pa->frame_bytes = (unsigned)pa_frame_size(&spec);
 
    pa->stream    = pa_stream_new(pa->context, "audio", &spec, &map);
    if (!pa->stream)
@@ -768,6 +863,21 @@ static void pulse_device_list_free(void *data, void *array_list_data)
    string_list_free(s);
 }
 
+static size_t pulse_underruns(void *data)
+{
+   pa_t *pa = (pa_t*)data;
+   return pa ? retro_atomic_load_acquire_size(&pa->underruns) : 0;
+}
+
+static bool pulse_device_clock_ppm(void *data, double *ppm)
+{
+   pa_t *pa = (pa_t*)data;
+   if (!pa || !retro_atomic_load_acquire_int(&pa->clk_valid))
+      return false;
+   *ppm = (double)retro_atomic_load_acquire_int(&pa->clk_ppm);
+   return true;
+}
+
 audio_driver_t audio_pulse = {
    pulse_init,
    pulse_write,
@@ -785,6 +895,8 @@ audio_driver_t audio_pulse = {
    NULL, /* write_raw */
    pulse_wait_writable,
    pulse_frames_consumed,
-   NULL, /* underruns */
-   pulse_layout
+   pulse_underruns,
+   pulse_layout,
+   NULL, /* frames_consumed_fallback */
+   pulse_device_clock_ppm
 };

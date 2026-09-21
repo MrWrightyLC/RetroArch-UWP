@@ -413,6 +413,44 @@ static void runloop_game_ai_think_cb(void *userdata,
 
 static runloop_state_t runloop_state      = {0};
 
+/* Defined here, before its first user: the SET_MESSAGE_EXT STATUS
+ * path in the environment callback defers through this machinery,
+ * and it sits far above the message-queue code where the rest of
+ * the deferral lives. */
+struct runloop_deferred_msg
+{
+   mpsc_stack_node_t link; /* first: the stack's, from push to drain */
+   char *msg;
+   char *title;
+   size_t len;
+   unsigned prio;
+   unsigned duration;
+   enum message_queue_icon icon;
+   enum message_queue_category category;
+   bool flush;
+   /* A deferred RETRO_MESSAGE_TYPE_STATUS: drained into
+    * core_status_msg under its priority-overwrite rule rather than
+    * pushed onto the message queue. Raised only by a core calling
+    * SET_MESSAGE_EXT off the main thread, which the libretro API
+    * does not allow but rogue cores do. */
+   bool core_status;
+};
+
+/* True when the caller is not the thread the message queue belongs
+ * to; such a caller hands its message to the deferral stack and the
+ * main thread replays it at the top of the next iterate. */
+static bool runloop_msg_queue_off_main(runloop_state_t *runloop_st)
+{
+#ifdef HAVE_THREADS
+   return    runloop_st->msg_queue_main_id
+          && sthread_get_current_thread_id()
+                != runloop_st->msg_queue_main_id;
+#else
+   return false;
+#endif
+}
+
+
 /* GLOBAL POINTER GETTERS */
 runloop_state_t *runloop_state_get_ptr(void)
 {
@@ -427,7 +465,11 @@ bool runloop_is_content_closing(void)
 bool state_manager_frame_is_reversed(void)
 {
 #ifdef HAVE_REWIND
-   return !!(runloop_state.rewind_st.flags & STATE_MGR_REWIND_ST_FLAG_FRAME_IS_REVERSED);
+   /* Acquire on the atomic mirror, not the flags word: callers
+    * include the video thread's FrameDirection reads and the task
+    * worker, while check_rewind writes on main. */
+   return retro_atomic_load_acquire_int(
+         &runloop_state.rewind_st.frame_reversed_atomic) != 0;
 #else
    return false;
 #endif
@@ -1894,16 +1936,36 @@ bool runloop_environment_cb(unsigned cmd, void *data)
                /* Handle 'status' messages */
                case RETRO_MESSAGE_TYPE_STATUS:
 
-                  /* Note: We need to lock a mutex here. Strictly
-                   * speaking, 'core_status_msg' is not part
-                   * of the message queue, but:
-                   * - It may be implemented as a queue in the future
-                   * - It seems unnecessary to create a new slock_t
-                   *   object for this type of message when
-                   *   _runloop_msg_queue_lock is already available
-                   * We therefore just call runloop_msg_queue_lock()/
-                   * runloop_msg_queue_unlock() in this case */
-                  RUNLOOP_MSG_QUEUE_LOCK(runloop_st);
+                  /* core_status_msg belongs to the main thread, like
+                   * the message queue: every writer and reader runs
+                   * there. The libretro API has environment calls
+                   * come from retro_run's thread, but a rogue core
+                   * calling from its own worker is a thing that
+                   * happens, so that case rides the same deferral as
+                   * off-main message pushes and is applied by the
+                   * drain at the top of the next iterate. */
+#ifdef HAVE_THREADS
+                  if (runloop_msg_queue_off_main(runloop_st))
+                  {
+                     struct runloop_deferred_msg *node =
+                           (struct runloop_deferred_msg *)
+                           malloc(sizeof(*node));
+                     if (!node)
+                        break;
+                     node->core_status = true;
+                     node->msg      = msg->msg ? strdup(msg->msg) : NULL;
+                     node->title    = NULL;
+                     node->len      = 0;
+                     node->prio     = msg->priority;
+                     node->duration = msg->duration;
+                     node->icon     = MESSAGE_QUEUE_ICON_DEFAULT;
+                     node->category = MESSAGE_QUEUE_CATEGORY_INFO;
+                     node->flush    = false;
+                     mpsc_stack_push(&runloop_st->msg_queue_deferred,
+                           &node->link);
+                     break;
+                  }
+#endif
 
                   /* If a message is already set, only overwrite
                    * it if the new message has the same or higher
@@ -1916,6 +1978,13 @@ bool runloop_environment_cb(unsigned cmd, void *data)
                         strlcpy(runloop_st->core_status_msg.str, msg->msg,
                               sizeof(runloop_st->core_status_msg.str));
 
+                        /* Stored so the guard above bites: a status
+                         * holds its priority for its lifetime, and
+                         * lower-priority updates - clears included -
+                         * bounce until it expires or a same-or-higher
+                         * write lands. Every clear path zeroes this
+                         * again. */
+                        runloop_st->core_status_msg.priority = msg->priority;
                         runloop_st->core_status_msg.duration = (float)msg->duration;
                         runloop_st->core_status_msg.set      = true;
                      }
@@ -1929,8 +1998,6 @@ bool runloop_environment_cb(unsigned cmd, void *data)
                         runloop_st->core_status_msg.set      = false;
                      }
                   }
-
-                  RUNLOOP_MSG_QUEUE_UNLOCK(runloop_st);
                   break;
 
 #if defined(HAVE_GFX_WIDGETS)
@@ -2001,7 +2068,13 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          if (sys_info)
             sys_info->rotation = rotation;
 
-         if (!video_driver_set_rotation(rotation))
+         /* Compose with the user's configured rotation, as the menu
+          * path and retroarch_get_rotation() do - passing the core's
+          * raw value dropped the config offset until the user next
+          * touched the rotation setting, and left the driver's
+          * stored rotation out of step with retroarch_get_rotation. */
+         if (!video_driver_set_rotation(
+                  (rotation + settings->uints.video_rotation) % 4))
             return false;
 
          break;
@@ -2486,6 +2559,12 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          }
          else
             memcpy(hwr, cb, sizeof(*cb));
+
+         /* Publish the type for cross-thread
+          * video_driver_is_hw_context() readers, after the copy has
+          * landed; see hw_context_type in video_driver.h. */
+         retro_atomic_store_release_int(
+               &video_st->hw_context_type, (int)cb->context_type);
 #ifdef DEBUG
          RARCH_DBG("[Environ] Reached end of SET_HW_RENDER.\n");
 #endif
@@ -3524,8 +3603,9 @@ bool runloop_environment_cb(unsigned cmd, void *data)
           *
           * video_driver_get_refresh_rate() answers a different
           * question: what the display reports it is capable of.  On a
-          * fixed-mode desktop display the two coincide, which is why
-          * asking the display used to be harmless.  They diverge on an
+          * fixed-mode desktop display the two coincide, so asking
+          * the display happens to give the right answer.  They
+          * diverge on an
           * adaptive panel: an iOS ProMotion device reports 120 Hz from
           * [UIScreen maximumFramesPerSecond] while the CADisplayLink -
           * and therefore the runloop - is deliberately being driven at
@@ -3732,6 +3812,22 @@ bool runloop_environment_cb(unsigned cmd, void *data)
 #ifdef HAVE_VULKAN
             if (iface->interface_type == RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN)
                iface->interface_version = RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION;
+            else
+#endif
+#ifdef HAVE_D3D12
+            /* Version 1 of the D3D12 negotiation: the core names the
+             * highest hardware render interface version it can use
+             * (libretro_d3d12.h). The literal, not the header's macro:
+             * that header is Windows' d3d12.h and this file is not. */
+            if (iface->interface_type == RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_D3D12)
+               iface->interface_version = 1;
+            else
+#endif
+#ifdef HAVE_D3D11
+            /* Version 1 of the D3D11 negotiation, as for D3D12 above
+             * (libretro_d3d11.h). */
+            if (iface->interface_type == RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_D3D11)
+               iface->interface_version = 1;
             else
 #endif
             {
@@ -4020,7 +4116,6 @@ bool runloop_environment_cb(unsigned cmd, void *data)
                   /* The frontend driver supports power status queries,
                    * but it still gave us bad information for whatever reason. */
                   return false;
-                  break;
             }
          }
          break;
@@ -4880,11 +4975,11 @@ static bool event_init_content(
    {
       configuration_set_uint(settings, settings->uints.rewind_granularity, 1);
       /* The record task defers itself until any state load has been
-       * applied (task_moviectl_record_handler).  That guard used to
-       * be unreliable on the unthreaded scheduler - it asked a queue
-       * finder, and the unthreaded gather lifts every running task
-       * off the queue before invoking any handler, so a sibling load
-       * task was invisible to it and recording started first.  The
+       * applied (task_moviectl_record_handler).  That guard must not
+       * ask a queue finder: the unthreaded gather lifts every
+       * running task off the queue before invoking any handler, so a
+       * sibling load task is invisible to a finder and recording
+       * starts first.  The
        * guard now reads a main-thread flag instead, so no
        * whole-queue wait is needed here to force the ordering. */
       movie_start_record(input_st, input_st->bsv_movie_state.movie_start_path);
@@ -5430,8 +5525,8 @@ bool runloop_event_init_core(
       return false;
 
    runloop_set_frame_limit(&video_st->av_info, fastforward_ratio);
-   runloop_st->frame_limit_last_time    = cpu_features_get_time_usec();
-   runloop_st->frame_limit_anchor_ns    = (int64_t)runloop_st->frame_limit_last_time * 1000;
+   runloop_st->frame_limit_anchor_ns    = (int64_t)cpu_features_get_time_usec()
+      * 1000;
 
    /* Init runtime log and read current state slot */
    runloop_runtime_log_init(runloop_st);
@@ -5481,6 +5576,9 @@ void runloop_pause_checks(void)
          video_driver_cached_frame();
 
       midi_driver_set_all_sounds_off();
+      /* Same idea as the MIDI silence above, for the audio stream: end it on
+       * a ramp rather than wherever the waveform happened to be. */
+      audio_driver_pause_fade(true);
 
 #ifdef HAVE_PRESENCE
       userdata.status = PRESENCE_GAME_PAUSED;
@@ -5509,6 +5607,19 @@ void runloop_pause_checks(void)
 
       /* Restore frame limit. */
       runloop_set_frame_limit(&video_st->av_info, fastforward_ratio);
+
+      /* Ramp back up rather than restarting mid-waveform. Not while the
+       * menu still holds the core: nothing resumes until it closes, and
+       * that close ramps it. */
+#ifdef HAVE_MENU
+      if (!(   (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE)
+            && settings->bools.menu_pause_libretro
+#ifdef HAVE_NETWORKING
+            && netplay_driver_ctl(RARCH_NETPLAY_CTL_ALLOW_PAUSE, NULL)
+#endif
+         ))
+#endif
+         audio_driver_pause_fade(false);
    }
 
 #if defined(HAVE_TRANSLATE) && defined(HAVE_GFX_WIDGETS)
@@ -5908,6 +6019,101 @@ void core_options_reset(const char* label)
    }
 }
 
+/* Writes the current core option values to whichever
+ * options file is active (game-specific, folder-specific,
+ * or the per-core/global 'default' file), without freeing
+ * anything and without user-facing notifications.
+ * Returns false only if a write was attempted and failed.
+ * If @out_path is non-NULL, receives the file path used
+ * (or NULL when there are no core options). */
+static bool runloop_core_options_write(const char **out_path)
+{
+   runloop_state_t *runloop_st     = &runloop_state;
+   core_option_manager_t *coreopts = runloop_st->core_options;
+   const char *path_core_options   = path_get(RARCH_PATH_CORE_OPTIONS);
+   bool ret                        = false;
+
+   if (out_path)
+      *out_path = NULL;
+
+   /* If there are no core options, there
+    * is nothing to do */
+   if (!coreopts || (coreopts->size < 1))
+      return true;
+
+   /* Check whether game/folder-specific options file
+    * is being used */
+   if (path_core_options && *path_core_options)
+   {
+      config_file_t *conf_tmp = NULL;
+
+      /* Attempt to load existing file */
+      if (path_is_valid(path_core_options))
+         conf_tmp = config_file_new_from_path_to_string(path_core_options);
+
+      /* Create new file if required */
+      if (!conf_tmp)
+         conf_tmp = config_file_new_alloc();
+
+      if (conf_tmp)
+      {
+         core_option_manager_flush(coreopts, conf_tmp);
+
+         ret = config_file_write(conf_tmp, path_core_options, true);
+         config_file_free(conf_tmp);
+      }
+   }
+   else
+   {
+      /* We are using the 'default' core options file */
+      path_core_options = coreopts->conf_path;
+
+      if (path_core_options && *path_core_options)
+      {
+         core_option_manager_flush(coreopts, coreopts->conf);
+
+         /* We must *guarantee* that a file gets written
+          * to disk if any options differ from the current
+          * options file contents. Must therefore handle
+          * the case where the 'default' file does not
+          * exist (e.g. if it gets deleted manually while
+          * a core is running) */
+         if (!path_is_valid(path_core_options))
+            coreopts->conf->flags |= CONF_FILE_FLG_MODIFIED;
+
+         ret = config_file_write(coreopts->conf,
+               path_core_options, true);
+      }
+   }
+
+   if (out_path)
+      *out_path = path_core_options;
+
+   return ret;
+}
+
+/* Quietly persists core options to disk.
+ *
+ * The automatic save otherwise only happens in
+ * runloop_deinit_core_options(), at the very end of core
+ * teardown - after the auto save-state, retro_unload_game(),
+ * retro_deinit() and dylib_close(). A crash or process kill
+ * anywhere in that sequence, or before it (Android can reclaim
+ * the process at any point after onPause()), loses every option
+ * change made during the session. Calling this beforehand makes
+ * those changes durable; the late save is kept, and is a no-op
+ * unless the core changed an option during teardown, since
+ * config_file_write() only writes a modified config and clears
+ * the flag once it has. */
+void runloop_core_options_save(void)
+{
+   const char *path = NULL;
+
+   if (!runloop_core_options_write(&path))
+      RARCH_ERR("[Core] Failed to save core options to \"%s\".\n",
+            path ? path : "UNKNOWN");
+}
+
 void core_options_flush(void)
 {
    size_t _len;
@@ -5916,7 +6122,7 @@ void core_options_flush(void)
                                    = MESSAGE_QUEUE_CATEGORY_INFO;
    runloop_state_t *runloop_st     = &runloop_state;
    core_option_manager_t *coreopts = runloop_st->core_options;
-   const char *path_core_options   = path_get(RARCH_PATH_CORE_OPTIONS);
+   const char *path_core_options   = NULL;
    const char *core_options_file   = NULL;
    bool ret                        = false;
 
@@ -5927,53 +6133,7 @@ void core_options_flush(void)
    if (!coreopts || (coreopts->size < 1))
       return;
 
-   /* Check whether game/folder-specific options file
-    * is being used */
-   if (path_core_options && *path_core_options)
-   {
-      config_file_t *conf_tmp = NULL;
-      bool path_valid         = path_is_valid(path_core_options);
-
-      /* Attempt to load existing file */
-      if (path_valid)
-         conf_tmp = config_file_new_from_path_to_string(path_core_options);
-
-      /* Create new file if required */
-      if (!conf_tmp)
-         conf_tmp = config_file_new_alloc();
-
-      if (conf_tmp)
-      {
-         core_option_manager_flush(runloop_st->core_options, conf_tmp);
-
-         ret = config_file_write(conf_tmp, path_core_options, true);
-         config_file_free(conf_tmp);
-      }
-   }
-   else
-   {
-      /* We are using the 'default' core options file */
-      path_core_options = runloop_st->core_options->conf_path;
-
-      if (path_core_options && *path_core_options)
-      {
-         core_option_manager_flush(
-               runloop_st->core_options,
-               runloop_st->core_options->conf);
-
-         /* We must *guarantee* that a file gets written
-          * to disk if any options differ from the current
-          * options file contents. Must therefore handle
-          * the case where the 'default' file does not
-          * exist (e.g. if it gets deleted manually while
-          * a core is running) */
-         if (!path_is_valid(path_core_options))
-            runloop_st->core_options->conf->flags |= CONF_FILE_FLG_MODIFIED;
-
-         ret = config_file_write(runloop_st->core_options->conf,
-               path_core_options, true);
-      }
-   }
+   ret = runloop_core_options_write(&path_core_options);
 
    /* Get options file name for display purposes */
    if (path_core_options && *path_core_options)
@@ -6017,18 +6177,54 @@ void runloop_msg_queue_push(
       enum message_queue_category category)
 {
 #if defined(HAVE_GFX_WIDGETS)
-   dispgfx_widget_t *p_dispwidget = dispwidget_get_ptr();
-   bool widgets_active            = p_dispwidget->active;
+   dispgfx_widget_t *p_dispwidget;
+   bool widgets_active;
 #endif
 #ifdef HAVE_ACCESSIBILITY
-   settings_t *settings           = config_get_ptr();
-   bool accessibility_enable      = settings->bools.accessibility_enable;
-   unsigned accessibility_narrator_speech_speed = settings->uints.accessibility_narrator_speech_speed;
-   access_state_t *access_st      = access_state_get_ptr();
+   settings_t *settings;
+   bool accessibility_enable;
+   unsigned accessibility_narrator_speech_speed;
+   access_state_t *access_st;
 #endif
    runloop_state_t *runloop_st    = &runloop_state;
 
-   RUNLOOP_MSG_QUEUE_LOCK(runloop_st);
+#ifdef HAVE_THREADS
+   /* A worker's message crosses to the main thread here, whole,
+    * before anything below reads the settings or touches a widget:
+    * that work belongs to the main thread, and the drain at the top
+    * of the iterate replays the message there, a frame late at most
+    * - the cadence the message queue shows things at anyway. */
+   if (runloop_msg_queue_off_main(runloop_st))
+   {
+      struct runloop_deferred_msg *node = (struct runloop_deferred_msg *)
+            malloc(sizeof(*node));
+      if (!node)
+         return;
+      node->core_status = false;
+      node->msg      = strdup(msg);
+      node->title    = title ? strdup(title) : NULL;
+      node->len      = len;
+      node->prio     = prio;
+      node->duration = duration;
+      node->icon     = icon;
+      node->category = category;
+      node->flush    = flush;
+      mpsc_stack_push(&runloop_st->msg_queue_deferred, &node->link);
+      return;
+   }
+#endif
+
+#if defined(HAVE_GFX_WIDGETS)
+   p_dispwidget   = dispwidget_get_ptr();
+   widgets_active = p_dispwidget->active;
+#endif
+#ifdef HAVE_ACCESSIBILITY
+   settings       = config_get_ptr();
+   accessibility_enable = settings->bools.accessibility_enable;
+   accessibility_narrator_speech_speed = settings->uints.accessibility_narrator_speech_speed;
+   access_st      = access_state_get_ptr();
+#endif
+
 #ifdef HAVE_ACCESSIBILITY
    if (is_accessibility_enabled(
             accessibility_enable,
@@ -6076,7 +6272,6 @@ void runloop_msg_queue_push(
    ui_companion_driver_msg_queue_push(
          msg, prio, duration, flush);
 
-   RUNLOOP_MSG_QUEUE_UNLOCK(runloop_st);
 }
 
 #ifdef HAVE_MENU
@@ -6198,6 +6393,18 @@ void runloop_is_inited_clear(void)
 bool runloop_is_inited(void)
 {
    return retro_atomic_load_acquire_int(&runloop_inited) != 0;
+}
+
+/* The pause / unfocused wait: what it waits for is user input, so
+ * where the windowing system offers a waitable event transport the
+ * display server blocks on it, with ten milliseconds as the bound
+ * rather than the schedule; where it offers none the bound is the
+ * sleep it always was. Readiness only - nothing is dispatched here,
+ * the next input poll consumes as before. */
+static void runloop_idle_wait(void)
+{
+   if (!video_display_server_idle_wait(10))
+      retro_sleep(10);
 }
 
 static enum runloop_state_enum runloop_check_state(
@@ -6704,7 +6911,7 @@ static enum runloop_state_enum runloop_check_state(
 #if defined(HAVE_GFX_WIDGETS)
    if (widgets_active)
    {
-      bool rarch_force_fullscreen = (video_st->flags &
+      bool rarch_force_fullscreen = ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags) &
          VIDEO_FLAG_FORCE_FULLSCREEN) ? true : false;
       bool video_is_fullscreen    = settings->bools.video_fullscreen
                                  || rarch_force_fullscreen;
@@ -6712,8 +6919,13 @@ static enum runloop_state_enum runloop_check_state(
 #ifdef HAVE_THREADS
       /* Under the threaded video wrapper the worker animates and
        * iterates the widgets (gfx_widgets_worker_step()); the layout,
-       * which owns fonts, stays here */
+       * which owns fonts, stays here - and so do the badge loads
+       * the achievement widgets ask for from over there */
       if (p_dispwidget->worker)
+      {
+#ifdef HAVE_CHEEVOS
+         rcheevos_badge_cache_service();
+#endif
          gfx_widgets_iterate_layout(
                p_disp,
                settings,
@@ -6723,6 +6935,7 @@ static enum runloop_state_enum runloop_check_state(
                settings->paths.directory_assets,
                settings->paths.path_font,
                true);
+      }
       else
 #endif
          gfx_widgets_iterate(
@@ -6775,9 +6988,9 @@ static enum runloop_state_enum runloop_check_state(
 #endif
       {
          if (pause_nonactive)
-            focused = is_focused && (!(uico_st->flags & UICO_ST_FLAG_IS_ON_FOREGROUND));
+            focused = is_focused;
          else
-            focused = (!(uico_st->flags & UICO_ST_FLAG_IS_ON_FOREGROUND));
+            focused = true;
       }
 
       if (action == old_action)
@@ -7134,12 +7347,6 @@ static enum runloop_state_enum runloop_check_state(
                         menu->userdata,
                         menu->menu_state_msg);
 
-               if (uico_st->flags & UICO_ST_FLAG_IS_ON_FOREGROUND)
-               {
-                  if (     uico_st->drv
-                        && uico_st->drv->render_messagebox)
-                     uico_st->drv->render_messagebox(menu->menu_state_msg);
-               }
             }
 
             if (BIT64_GET(menu->state, MENU_STATE_BLIT))
@@ -7374,6 +7581,7 @@ static enum runloop_state_enum runloop_check_state(
             {
                runloop_st->flags               &= ~RUNLOOP_FLAG_PAUSED;
                runloop_st->run_frames_and_pause = 3;
+               audio_driver_pause_fade(false);
             }
             return RUNLOOP_STATE_ITERATE;
          }
@@ -8068,6 +8276,7 @@ end:
 int runloop_iterate(void)
 {
    retro_time_t pace_limit_min;
+   retro_time_t pace_now;
    int64_t      pace_limit_ns;
    runloop_pace_facts_t  pace_facts;
    input_driver_state_t         *input_st = input_state_get_ptr();
@@ -8106,7 +8315,28 @@ int runloop_iterate(void)
    bool savestate_automatic_enable        = settings->uints.savestate_automatic_interval > 0;
 #ifdef HAVE_DISCORD
    discord_state_t *discord_st            = discord_state_get_ptr();
+#endif
 
+   runloop_msg_queue_drain_deferred();
+
+   /* A video driver that lost its GPU device - a TDR on Windows, a GPU
+    * reset elsewhere - sets this from whichever thread saw it, and
+    * nothing it does on that device works from then on: every frame
+    * fails, and the window shows whatever the last good present left.
+    * Rebuilding the video driver here, on the thread that owns
+    * drivers, is the recovery: the context comes back on the
+    * recovered device, and a hardware core gets context_reset. */
+   if ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags)
+         & VIDEO_FLAG_GPU_DEVICE_LOST)
+   {
+      int reinit_flags = DRIVER_VIDEO_MASK | DRIVER_INPUT_MASK
+         | DRIVER_MENU_MASK;
+      video_driver_modify_disp_flags(0, VIDEO_FLAG_GPU_DEVICE_LOST);
+      RARCH_ERR("[Video] The GPU device was lost; reinitialising the video driver.\n");
+      command_event(CMD_EVENT_REINIT, &reinit_flags);
+   }
+
+#ifdef HAVE_DISCORD
    if (discord_st->inited)
    {
       Discord_RunCallbacks();
@@ -8123,6 +8353,10 @@ int runloop_iterate(void)
     * which a core enters from within retro_run(), so the save it asks for
     * is performed here instead of where the command arrives. */
    android_input_flush_pending_state();
+
+   /* Same poll, same reason: entering Java is only safe on the OS
+    * stack, and a libco core reaches the poll on its own. */
+   android_input_flush_pending_haptics();
 #endif
 
 #if defined(HAVE_DYNAMIC) && defined(HAVE_MENU)
@@ -8225,7 +8459,6 @@ int runloop_iterate(void)
             netplay_allow_timeskip))
    {
       case RUNLOOP_STATE_QUIT:
-         runloop_st->frame_limit_last_time = 0.0;
          runloop_st->frame_limit_anchor_ns = 0;
          runloop_st->flags                &= ~RUNLOOP_FLAG_CORE_RUNNING;
          command_event(CMD_EVENT_QUIT, NULL);
@@ -8250,18 +8483,17 @@ int runloop_iterate(void)
          netplay_driver_ctl(RARCH_NETPLAY_CTL_PAUSE, NULL);
 #endif
 #if defined(__EMSCRIPTEN__) && !defined(EMSCRIPTEN_ASYNCIFY) && !defined(PROXY_TO_PTHREAD)
+         /* A deferred main-loop timeout: the browser's yield, not a
+          * wait of ours. */
          platform_emscripten_deferred_sleep(10);
 #else
-#if defined(HAVE_COCOATOUCH)
-         if (!(uico_st->flags & UICO_ST_FLAG_IS_ON_FOREGROUND))
-#endif
 #if defined(ANDROID)
          /* When IDLE, android_input_poll() already blocked on the looper
-          * until the OS sent something; a sleep on top only delays the
-          * response to it. Unfocused-but-foreground still sleeps. */
+          * until the OS sent something; a wait on top only delays the
+          * response to it. Unfocused-but-foreground still waits. */
          if (!(runloop_st->flags & RUNLOOP_FLAG_IDLE))
 #endif
-            retro_sleep(10);
+            runloop_idle_wait();
 #endif
          return 1;
       case RUNLOOP_STATE_PAUSE:
@@ -8278,6 +8510,7 @@ int runloop_iterate(void)
          {
             runloop_st->flags &= ~RUNLOOP_FLAG_PAUSED;
             runloop_st->run_frames_and_pause = 2;
+            audio_driver_pause_fade(false);
          }
 #endif
          video_driver_cached_frame();
@@ -8475,39 +8708,38 @@ end:
     * the top of the iteration: the overlay reads it from inside
     * video_driver_frame(), which runs between the top and here, and a
     * reset there made it read NONE on every frame. Paths that return
-    * before this block set it themselves. */
-   /* Computed at the end of the iteration and read by the overlay during
-    * the next one - one frame stale by design; see runloop_state_t::pace.
-    * Paths that return before this block set it themselves, through the
-    * same function. */
+    * before this block set it themselves, through the same function. */
    /* How long the last iteration actually took, smoothed. One clock
     * read on a path that already takes several, and the only way to
     * tell a source that is holding the loop from one that merely says
     * it is - headless SDL2 with no vblank sets the vsync bit and
-    * blocks on nothing. */
+    * blocks on nothing.
+    *
+    * The reading stands for the whole block below: the pace gather and
+    * the decision between here and the limiter are flag tests, so the
+    * frame's end is this instant and the limiter schedules against it
+    * rather than taking the clock a second time. */
+   pace_now = cpu_features_get_time_usec();
+   if (runloop_st->pace_iter_last)
    {
-      retro_time_t now = cpu_features_get_time_usec();
-      if (runloop_st->pace_iter_last)
+      retro_time_t delta = pace_now - runloop_st->pace_iter_last;
+      /* Samples longer than a quarter second are not pacing, they
+       * are a stall - a state load, a shader rebuild, a menu that
+       * blocked - and one of them dragged an eight-sample average
+       * from 60 fps to 8 in testing, taking several frames to
+       * recover. Nothing that is really holding the loop runs
+       * slower than 4 fps, so they are dropped rather than
+       * smoothed. */
+      if (runloop_pace_sample_usable(delta))
       {
-         retro_time_t delta = now - runloop_st->pace_iter_last;
-         /* Samples longer than a quarter second are not pacing, they
-          * are a stall - a state load, a shader rebuild, a menu that
-          * blocked - and one of them dragged an eight-sample average
-          * from 60 fps to 8 in testing, taking several frames to
-          * recover. Nothing that is really holding the loop runs
-          * slower than 4 fps, so they are dropped rather than
-          * smoothed. */
-         if (runloop_pace_sample_usable(delta))
-         {
-            if (runloop_st->pace_period_usec)
-               runloop_st->pace_period_usec +=
-                     (delta - runloop_st->pace_period_usec) / 8;
-            else
-               runloop_st->pace_period_usec = delta;
-         }
+         if (runloop_st->pace_period_usec)
+            runloop_st->pace_period_usec +=
+                  (delta - runloop_st->pace_period_usec) / 8;
+         else
+            runloop_st->pace_period_usec = delta;
       }
-      runloop_st->pace_iter_last = now;
    }
+   runloop_st->pace_iter_last = pace_now;
    /* What the frame limiter below will pace to. Normally the
     * fast-forward limit; replaced by the content frame time when
     * nothing else is pacing at all (see below). */
@@ -8570,13 +8802,12 @@ end:
       retro_time_t frame_limit_min = pace_limit_min;
       if (runloop_st->pace & RUNLOOP_PACE_TIMER)
       {
-         const retro_time_t end_frame_time = cpu_features_get_time_usec();
+         const retro_time_t end_frame_time = pace_now;
 
          const retro_time_t to_sleep_us = runloop_pace_schedule(
                &runloop_st->frame_limit_anchor_ns,
                pace_limit_ns ? pace_limit_ns : (int64_t)frame_limit_min * 1000,
                end_frame_time);
-         runloop_st->frame_limit_last_time = runloop_st->frame_limit_anchor_ns / 1000;
          if (to_sleep_us > 0)
          {
 #if defined(__EMSCRIPTEN__) && !defined(EMSCRIPTEN_ASYNCIFY) && !defined(PROXY_TO_PTHREAD)
@@ -8585,25 +8816,26 @@ end:
              * act on a sub-millisecond remainder, nor spin. */
             platform_emscripten_deferred_sleep((int)(to_sleep_us / 1000));
 #else
-            /* Sleep short by the margin the sleep has been seen to
-             * overshoot, then spin the remainder to the deadline:
-             * the sleep decides how much is spun, the clock decides
-             * where the frame lands. */
+            /* Sleep short of the deadline by the measured margin,
+             * then spin the remainder: the sleep decides how much is
+             * spun, the clock decides where the frame lands. The
+             * sleep is absolute - retro_sleep_until_us re-arms
+             * against the deadline itself - so the time between
+             * reading the clock and entering the kernel, and any
+             * early or interrupted wake, no longer land in the
+             * margin; what the margin measures now is purely the
+             * kernel's own overshoot, which is what it was for. */
             const retro_time_t deadline = runloop_st->frame_limit_anchor_ns / 1000;
             retro_time_t now            = end_frame_time;
-#if defined(HAVE_COCOATOUCH)
-            /* In the background the loop is not paced at all. */
-            if (uico_state_get_ptr()->flags & UICO_ST_FLAG_IS_ON_FOREGROUND)
-               return 1;
-#endif
             if (to_sleep_us > runloop_st->frame_limit_margin)
             {
-               const retro_time_t asked = to_sleep_us - runloop_st->frame_limit_margin;
-               retro_sleep_us((unsigned)asked);
+               const retro_time_t asked_until =
+                     deadline - runloop_st->frame_limit_margin;
+               retro_sleep_until_us(asked_until);
                now = cpu_features_get_time_usec();
                runloop_st->frame_limit_margin = runloop_pace_margin_update(
                      runloop_st->frame_limit_margin,
-                     now - (end_frame_time + asked), frame_limit_min);
+                     now - asked_until, frame_limit_min);
             }
             while (now < deadline)
             {
@@ -8627,7 +8859,10 @@ end:
    {
       runloop_st->run_frames_and_pause--;
       if (!runloop_st->run_frames_and_pause)
+      {
          runloop_st->flags |= RUNLOOP_FLAG_PAUSED;
+         audio_driver_pause_fade(true);
+      }
    }
 
    return 0;
@@ -8636,17 +8871,80 @@ end:
 void runloop_msg_queue_deinit(void)
 {
    runloop_state_t *runloop_st = &runloop_state;
-   RUNLOOP_MSG_QUEUE_LOCK(runloop_st);
+
+#ifdef HAVE_THREADS
+   {
+      mpsc_stack_node_t *link =
+            mpsc_stack_drain(&runloop_st->msg_queue_deferred);
+      while (link)
+      {
+         struct runloop_deferred_msg *node =
+               (struct runloop_deferred_msg *)link;
+         link = link->next;
+         free(node->msg);
+         free(node->title);
+         free(node);
+      }
+   }
+#endif
 
    msg_queue_deinitialize(&runloop_st->msg_queue);
 
-   RUNLOOP_MSG_QUEUE_UNLOCK(runloop_st);
-#ifdef HAVE_THREADS
-   slock_free(runloop_st->msg_queue_lock);
-   runloop_st->msg_queue_lock = NULL;
-#endif
-
    runloop_st->msg_queue_size = 0;
+}
+
+void runloop_msg_queue_drain_deferred(void)
+{
+#ifdef HAVE_THREADS
+   runloop_state_t *runloop_st = &runloop_state;
+   mpsc_stack_node_t *link     = NULL;
+
+   if (mpsc_stack_empty(&runloop_st->msg_queue_deferred))
+      return;
+
+   /* The stack chains newest-first; replay oldest-first. */
+   link = mpsc_stack_reverse(
+         mpsc_stack_drain(&runloop_st->msg_queue_deferred));
+   while (link)
+   {
+      struct runloop_deferred_msg *node =
+            (struct runloop_deferred_msg *)link;
+      link = link->next;
+      if (node->core_status)
+      {
+         /* The STATUS slot's own rule, applied here on the main
+          * thread: overwrite only at the same or higher priority. */
+         if (   !runloop_st->core_status_msg.set
+             || (runloop_st->core_status_msg.priority <= node->prio))
+         {
+            if (node->msg && *node->msg)
+            {
+               /* The same store the direct path makes, for the same
+                * reason: the guard bites on the held priority. */
+               strlcpy(runloop_st->core_status_msg.str, node->msg,
+                     sizeof(runloop_st->core_status_msg.str));
+               runloop_st->core_status_msg.priority = node->prio;
+               runloop_st->core_status_msg.duration = (float)node->duration;
+               runloop_st->core_status_msg.set      = true;
+            }
+            else
+            {
+               runloop_st->core_status_msg.str[0]   = '\0';
+               runloop_st->core_status_msg.priority = 0;
+               runloop_st->core_status_msg.duration = 0.0f;
+               runloop_st->core_status_msg.set      = false;
+            }
+         }
+      }
+      else if (node->msg)
+         runloop_msg_queue_push(node->msg, node->len, node->prio,
+               node->duration, node->flush, node->title,
+               node->icon, node->category);
+      free(node->msg);
+      free(node->title);
+      free(node);
+   }
+#endif
 }
 
 void runloop_msg_queue_init(void)
@@ -8655,10 +8953,11 @@ void runloop_msg_queue_init(void)
 
    runloop_msg_queue_deinit();
    msg_queue_initialize(&runloop_st->msg_queue, 8);
-
 #ifdef HAVE_THREADS
-   runloop_st->msg_queue_lock   = slock_new();
+   mpsc_stack_init(&runloop_st->msg_queue_deferred);
+   runloop_st->msg_queue_main_id = sthread_get_current_thread_id();
 #endif
+
 }
 
 void runloop_task_msg_queue_push(retro_task_t *task, const char *msg,
@@ -8674,14 +8973,12 @@ void runloop_task_msg_queue_push(retro_task_t *task, const char *msg,
    bool accessibility_enable      = settings->bools.accessibility_enable;
    unsigned accessibility_narrator_speech_speed = settings->uints.accessibility_narrator_speech_speed;
 #endif
-   runloop_state_t *runloop_st    = &runloop_state;
    dispgfx_widget_t *p_dispwidget = dispwidget_get_ptr();
    bool widgets_active            = p_dispwidget->active;
 
    if (widgets_active && task->title && (!((task->flags & RETRO_TASK_FLG_MUTE) > 0)))
    {
-      RUNLOOP_MSG_QUEUE_LOCK(runloop_st);
-      ui_companion_driver_msg_queue_push(msg,
+         ui_companion_driver_msg_queue_push(msg,
             prio, task ? duration : duration * 60 / 1000, flush);
 #ifdef HAVE_ACCESSIBILITY
       if (is_accessibility_enabled(
@@ -8708,8 +9005,7 @@ void runloop_task_msg_queue_push(retro_task_t *task, const char *msg,
             false
 #endif
             );
-      RUNLOOP_MSG_QUEUE_UNLOCK(runloop_st);
-   }
+      }
    else
 #endif
       runloop_msg_queue_push(msg, strlen(msg), prio, duration, flush, NULL,
@@ -9208,6 +9504,9 @@ void core_run(void)
     * a NULL retro_run — that is an immediate SIGSEGV. */
    if (current_core->retro_run)
    {
+      /* The flags this iteration's checks flipped, fast-forward above
+       * all, reach the frame's own audio rather than the next frame's. */
+      audio_driver_publish_runloop();
       current_core->retro_run();
       audio_driver_frame_end();
    }

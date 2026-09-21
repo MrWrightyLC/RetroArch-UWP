@@ -176,21 +176,21 @@ static ssize_t dev_write(void *data, const void *buf, size_t size)
 static ssize_t dev_write_raw(void *data, const int16_t *samples,
       size_t frames, unsigned input_rate, double rate_adjust, float gain)
 {
-   double want, room, put;
+   double room, put;
+   size_t accepted;
    (void)data; (void)samples; (void)input_rate; (void)gain;
    pthread_mutex_lock(&dev_lock);
    dev_drain_locked();
-   want = (double)frames * rate_adjust;
    room = DEV_CAPACITY - dev_fill;
-   put  = (want < room) ? want : room;
-   if (put < 0.0)
-      put = 0.0;
+   accepted = room > 0.0 ? (size_t)(room / rate_adjust) : 0;
+   if (accepted > frames) accepted = frames;
+   put = (double)accepted * rate_adjust;
    dev_fill       += put;
    dev_took       += put;
    dev_adjust_sum += rate_adjust;
    dev_adjust_n++;
    pthread_mutex_unlock(&dev_lock);
-   return (ssize_t)put;
+   return (ssize_t)accepted;
 }
 
 static size_t dev_write_avail(void *d)
@@ -314,7 +314,9 @@ static bool pipeline_up(size_t ring_bytes)
    st->sink_bias            = 1.0;
    config_get_ptr()->bools.audio_sink_rate_estimation = true;
    config_get_ptr()->uints.audio_output_sample_rate   = 48000;
+   st->out_rate = 48000;
    config_get_ptr()->bools.audio_sync                 = sync_on;
+   audio_driver_publish_runloop();
    if (!retro_spsc_init(&st->pipe_ring, ring_bytes))
       return false;
    retro_eventcount_init(&st->pipe_space);
@@ -441,10 +443,10 @@ int main(int argc, char **argv)
       }
       if (dev_float)
          audio_driver_submit(&audio_driver_st, 3.0f, frame_audio_f,
-               sizeof(frame_audio_f) / sizeof(float), true, false, false);
+               sizeof(frame_audio_f) / sizeof(float), true, false, false, true);
       else
          audio_driver_submit(&audio_driver_st, 3.0f, frame_audio,
-               sizeof(frame_audio) / sizeof(int16_t), false, false, false);
+               sizeof(frame_audio) / sizeof(int16_t), false, false, false, true);
       audio_driver_pipeline_signal(&audio_driver_st);
    }
    if (dbg_n)
@@ -525,11 +527,13 @@ steady_skipped:
     * about nothing. Closed on the consumer it never settled - a window
     * held a fraction of a burst, thousands of ppm of phase noise - and
     * the bias stayed at zero for the session. */
-   printf("   sink estimate: applied %u time(s), bias %+.0f ppm, source shown at %+.0f ppm; %.0f s summed, settled %u, %u left out in a row\n",
+   /* No consecutive-discard count here any more: sink_discarded was
+    * removed from the audio state as write-only, and it was - this
+    * line printed it and nothing asserted on it. */
+   printf("   sink estimate: applied %u time(s), bias %+.0f ppm, source shown at %+.0f ppm; %.0f s summed, settled %u\n",
          audio_driver_st.sink_applied, (audio_driver_st.sink_bias - 1.0) * 1e6,
          (audio_driver_st.sink_source_hz / 48000.0 - 1.0) * 1e6,
-         (double)audio_driver_st.sink_kept.usec / 1e6, audio_driver_st.sink_settled,
-         audio_driver_st.sink_discarded);
+         (double)audio_driver_st.sink_kept.usec / 1e6, audio_driver_st.sink_settled);
    /* A dry spell discards audio and the estimate's sum starts over,
     * by design; whether it then reaches the baseline again before the
     * run ends is the run's length, not the estimate. Settling is

@@ -411,7 +411,6 @@ static void cheat_manager_free(void)
    cheat_st->num_memory_buffers        = 0;
    cheat_st->total_memory_size         = 0;
    cheat_st->memory_initialized        = false;
-   cheat_st->memory_search_initialized = false;
 }
 
 static void cheat_manager_new(unsigned size)
@@ -1067,8 +1066,6 @@ int cheat_manager_initialize_memory(rarch_setting_t *setting, size_t idx, bool w
          runloop_msg_queue_push(msg, _len, 1, 180, true, NULL,
                MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
       }
-
-      cheat_st->memory_search_initialized = true;
    }
 
    cheat_st->memory_initialized = true;
@@ -1600,10 +1597,10 @@ int cheat_manager_add_matches(const char *path,
    return 0;
 }
 
-void cheat_manager_apply_rumble(struct item_cheat *cheat, unsigned int curr_value)
+static void cheat_manager_apply_rumble(struct item_cheat *cheat,
+      unsigned int curr_value, retro_time_t current_time)
 {
-   bool rumble               = false;
-   retro_time_t current_time = cpu_features_get_time_usec();
+   bool rumble = false;
 
    switch (cheat->rumble_type)
    {
@@ -1697,9 +1694,16 @@ void cheat_manager_apply_retro_cheats(void)
    bool cheat_applied          = false;
 #endif
    cheat_manager_t   *cheat_st = &cheat_manager_state;
+   retro_time_t current_time;
 
    if ((!cheat_st->cheats))
       return;
+
+   /* One reading for the whole pass: every cheat in it is applied at
+    * the same instant, and the clock is a syscall on more than one
+    * platform - a large cheat file would otherwise pay for one per
+    * entry, per frame. */
+   current_time = cpu_features_get_time_usec();
 
    for (i = 0; i < cheat_st->size; i++)
    {
@@ -1750,7 +1754,8 @@ void cheat_manager_apply_retro_cheats(void)
             break;
       }
 
-      cheat_manager_apply_rumble(&cheat_st->cheats[i], curr_val);
+      cheat_manager_apply_rumble(&cheat_st->cheats[i], curr_val,
+            current_time);
 
       switch (cheat_st->cheats[i].cheat_type)
       {

@@ -37,6 +37,11 @@ bool video_driver_texture_unload(uintptr_t *id)
    *id = 0;
    return true;
 }
+/* No in-place path: every animation frame is a replacement load, so
+ * the upload and unload counts the probes read keep their meaning. */
+bool video_driver_texture_can_update(void) { return false; }
+bool video_driver_texture_update(uintptr_t id, void *data)
+{ (void)id; (void)data; return false; }
 unsigned video_driver_get_disp_flags(void) { return 0; }
 void video_driver_get_video_output_size(unsigned *w, unsigned *h, char *d, size_t l)
 { *w = 1920; *h = 1080; (void)d; (void)l; }
@@ -70,6 +75,13 @@ void gfx_animation_push(void *entry)
    (void)entry;
    hp.fade_pushes++;
 }
+
+/* Blending goes through gfx_display now, on the same terms as the
+ * draw above: void* for the same reason, and nothing to do here. */
+void gfx_display_blend_begin(void *dispctx, void *data)
+{ (void)dispctx; (void)data; }
+void gfx_display_blend_end(void *dispctx, void *data)
+{ (void)dispctx; (void)data; }
 bool gfx_animation_kill_by_tag(uintptr_t *tag) { (void)tag; return true; }
 
 /* ---- task queue ---- */
@@ -276,3 +288,12 @@ int  config_userdata_get_int_array(void *u, const char *k, int **v,
       unsigned *n) { (void)u; (void)k; (void)v; (void)n; return 0; }
 int  config_userdata_get_string(void *u, const char *k, char **v,
       const char *d) { (void)u; (void)k; (void)v; (void)d; return 0; }
+
+/* The surface layer asks the driver what it wants before a decode
+ * (gfx_surface_query_requirements): here there is no driver, so the
+ * answers are the software defaults - no 10-bit source, no compressed
+ * sampling. */
+bool video_driver_test_all_flags(int flags)
+{ (void)flags; return false; }
+bool video_driver_supports_texture_format(int fmt)
+{ (void)fmt; return false; }

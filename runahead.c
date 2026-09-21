@@ -1408,7 +1408,6 @@ static bool runahead_savestate_info_init(
 {
    retro_ctx_serialize_info_t *info       = &runloop_st->runahead_savestate_info;
 
-   runloop_st->runahead_save_state_size   = save_state_size;
    runloop_st->flags                     |= RUNLOOP_FLAG_RUNAHEAD_SAVE_STATE_SIZE_KNOWN;
 
    /* Free any previous buffer so callers can safely re-init.  The
@@ -1514,7 +1513,6 @@ static void runahead_err(runloop_state_t *runloop_st)
    runloop_st->flags &= ~RUNLOOP_FLAG_RUNAHEAD_AVAILABLE;
    runahead_savestate_info_free(runloop_st);
    runahead_remove_hooks(runloop_st);
-   runloop_st->runahead_save_state_size       = 0;
    runloop_st->flags                         |= RUNLOOP_FLAG_RUNAHEAD_SAVE_STATE_SIZE_KNOWN;
 }
 
@@ -1729,7 +1727,7 @@ void runahead_run(void *data,
 
          if (suspended_frame)
          {
-            if (video_st->flags & VIDEO_FLAG_RUNAHEAD_IS_ACTIVE)
+            if ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags) & VIDEO_FLAG_RUNAHEAD_IS_ACTIVE)
                video_st->main_flags |=  VIDEO_FLAG_ACTIVE;
             else
                video_st->main_flags &= ~VIDEO_FLAG_ACTIVE;
@@ -1771,7 +1769,7 @@ void runahead_run(void *data,
       /* run main core with video suspended */
       video_st->main_flags &= ~VIDEO_FLAG_ACTIVE;
       core_run();
-      if (video_st->flags & VIDEO_FLAG_RUNAHEAD_IS_ACTIVE)
+      if ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags) & VIDEO_FLAG_RUNAHEAD_IS_ACTIVE)
          video_st->main_flags |=  VIDEO_FLAG_ACTIVE;
       else
          video_st->main_flags &= ~VIDEO_FLAG_ACTIVE;
@@ -1808,7 +1806,7 @@ void runahead_run(void *data,
             else
                runloop_st->flags        &= ~RUNLOOP_FLAG_RUNAHEAD_SECONDARY_CORE_AVAILABLE;
             AUDIO_FLAGS_CLEAR(audio_st, AUDIO_FLAG_SUSPENDED | AUDIO_FLAG_HARD_DISABLE);
-            if (video_st->flags & VIDEO_FLAG_RUNAHEAD_IS_ACTIVE)
+            if ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags) & VIDEO_FLAG_RUNAHEAD_IS_ACTIVE)
                video_st->main_flags |=  VIDEO_FLAG_ACTIVE;
             else
                video_st->main_flags &= ~VIDEO_FLAG_ACTIVE;
@@ -2242,7 +2240,6 @@ error:
 void runahead_clear_variables(void *data)
 {
    runloop_state_t *runloop_st            = (runloop_state_t*)data;
-   runloop_st->runahead_save_state_size   = 0;
    runloop_st->flags                     &= ~RUNLOOP_FLAG_RUNAHEAD_SAVE_STATE_SIZE_KNOWN;
    video_driver_modify_disp_flags(VIDEO_FLAG_RUNAHEAD_IS_ACTIVE, 0);
    runloop_st->flags                     |= RUNLOOP_FLAG_RUNAHEAD_AVAILABLE

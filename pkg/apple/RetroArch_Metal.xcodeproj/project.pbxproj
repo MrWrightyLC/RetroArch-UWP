@@ -380,7 +380,8 @@
 		05BF821D20ED69D100D95B19 /* configuration.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = configuration.h; path = ../../configuration.h; sourceTree = "<group>"; };
 		05C5D53320E3DD0900654EE4 /* input_types.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = input_types.h; sourceTree = "<group>"; };
 		05C5D53820E3DD0900654EE4 /* cocoa_input.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = cocoa_input.h; sourceTree = "<group>"; };
-		05C5D54120E3DD0900654EE4 /* sdl_input.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = sdl_input.c; sourceTree = "<group>"; };
+		05C5D54120E3DD0900654EE4 /* sdl1_input.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = sdl1_input.c; sourceTree = "<group>"; };
+		05C5D54120E3DD0900654EE5 /* sdl2_input.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = sdl2_input.c; sourceTree = "<group>"; };
 		05C5D54C20E3DD0900654EE4 /* input_keymaps.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = input_keymaps.h; sourceTree = "<group>"; };
 		05C5D54E20E3DD0900654EE4 /* blissbox.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = blissbox.h; sourceTree = "<group>"; };
 		05C5D55420E3DD0900654EE4 /* GCExtendedGamepadSnapshot.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = GCExtendedGamepadSnapshot.h; sourceTree = "<group>"; };
@@ -410,7 +411,8 @@
 		05C5D58120E3DD0900654EE4 /* input_x11_common.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = input_x11_common.h; sourceTree = "<group>"; };
 		05C5D58220E3DD0900654EE4 /* input_autodetect_builtin.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = input_autodetect_builtin.c; sourceTree = "<group>"; };
 		05C5D58320E3DD0900654EE4 /* input_keymaps.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = input_keymaps.c; sourceTree = "<group>"; };
-		05C5D58720E3DD0900654EE4 /* sdl_joypad.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = sdl_joypad.c; sourceTree = "<group>"; };
+		05C5D58720E3DD0900654EE4 /* sdl1_joypad.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = sdl1_joypad.c; sourceTree = "<group>"; };
+		05C5D58720E3DD0900654EE5 /* sdl2_joypad.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = sdl2_joypad.c; sourceTree = "<group>"; };
 		05C5D58820E3DD0900654EE4 /* sdl3_joypad.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = sdl3_joypad.c; sourceTree = "<group>"; };
 		05C5D58D20E3DD0900654EE4 /* mfi_joypad.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = mfi_joypad.m; sourceTree = "<group>"; };
 		05C5D59820E3DD0A00654EE4 /* hid_joypad.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = hid_joypad.c; sourceTree = "<group>"; };
@@ -1067,7 +1069,8 @@
 			children = (
 				E8EE1E942A2C6A26003C73F6 /* cocoa_input.m */,
 				05C5D53820E3DD0900654EE4 /* cocoa_input.h */,
-				05C5D54120E3DD0900654EE4 /* sdl_input.c */,
+				05C5D54120E3DD0900654EE4 /* sdl1_input.c */,
+				05C5D54120E3DD0900654EE5 /* sdl2_input.c */,
 			);
 			path = drivers;
 			sourceTree = "<group>";
@@ -1135,7 +1138,8 @@
 			children = (
 				05C5D59820E3DD0A00654EE4 /* hid_joypad.c */,
 				05C5D58D20E3DD0900654EE4 /* mfi_joypad.m */,
-				05C5D58720E3DD0900654EE4 /* sdl_joypad.c */,
+				05C5D58720E3DD0900654EE4 /* sdl1_joypad.c */,
+				05C5D58720E3DD0900654EE5 /* sdl2_joypad.c */,
 				05C5D58820E3DD0900654EE4 /* sdl3_joypad.c */,
 			);
 			path = drivers_joypad;

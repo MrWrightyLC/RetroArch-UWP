@@ -160,6 +160,20 @@ void gfx_display_draw(gfx_display_ctx_driver_t *dispctx,
 { (void)dispctx; (void)draw; (void)data;
   (void)video_width; (void)video_height; }
 
+/* The widgets turn blending on and off through gfx_display now, and
+ * send its batch out at the end of their frame. None of that draws
+ * anything here. */
+static gfx_display_t stub_disp;
+gfx_display_t *disp_get_ptr(void) { return &stub_disp; }
+
+void gfx_display_flush_batch(gfx_display_t *p_disp) { (void)p_disp; }
+
+void gfx_display_blend_begin(gfx_display_ctx_driver_t *dispctx, void *data)
+{ (void)dispctx; (void)data; }
+
+void gfx_display_blend_end(gfx_display_ctx_driver_t *dispctx, void *data)
+{ (void)dispctx; (void)data; }
+
 void gfx_display_rotate_z(gfx_display_t *p_disp, math_matrix_4x4 *matrix,
       float cosine, float sine, void *data)
 { (void)p_disp; (void)matrix; (void)cosine; (void)sine; (void)data; }
@@ -251,3 +265,11 @@ STUB_WIDGET(gfx_widget_achievement_popup);
 STUB_WIDGET(gfx_widget_leaderboard_display);
 STUB_WIDGET(gfx_widget_netplay_chat);
 STUB_WIDGET(gfx_widget_netplay_ping);
+
+/* Producers ask the surface layer what the driver wants before they
+ * decode; with no driver here the answer is what a software path
+ * takes: ARGB words. */
+bool gfx_surface_wants_rgba(void)
+{
+   return false;
+}

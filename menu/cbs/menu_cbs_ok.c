@@ -45,6 +45,7 @@
 #endif
 
 #include "../../config.def.h"
+#include "../../gfx/gfx_surface.h"
 #include "../../driver.h"
 #include "../../file_path_special.h"
 
@@ -284,6 +285,8 @@ static enum msg_hash_enums action_ok_dl_to_enum(unsigned lbl)
          return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_SPECIAL;
       case ACTION_OK_DL_DROPDOWN_BOX_LIST_RESOLUTION:
          return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_RESOLUTION;
+      case ACTION_OK_DL_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION:
+         return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION;
       case ACTION_OK_DL_DROPDOWN_BOX_LIST_AUDIO_DEVICE:
          return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_AUDIO_DEVICE;
       case ACTION_OK_DL_DROPDOWN_BOX_LIST_MIDI_DEVICE:
@@ -832,6 +835,14 @@ int generic_action_ok_displaylist_push(
          info_path          = path;
          info_label         = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_RESOLUTION_STR;
          info.enum_idx      = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_RESOLUTION;
+         dl_type            = DISPLAYLIST_GENERIC;
+         break;
+      case ACTION_OK_DL_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION:
+         info.type          = type;
+         info.directory_ptr = idx;
+         info_path          = path;
+         info_label         = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION_STR;
+         info.enum_idx      = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION;
          dl_type            = DISPLAYLIST_GENERIC;
          break;
       case ACTION_OK_DL_DROPDOWN_BOX_LIST_PLAYLIST_DEFAULT_CORE:
@@ -2433,7 +2444,7 @@ static int generic_action_ok(const char *path,
                   action_path);
 
             task_push_image_load(action_path,
-                  (video_driver_get_disp_flags() & VIDEO_FLAG_USE_RGBA), 0,
+                  gfx_surface_wants_rgba(), 0,
                   0,
                   menu_display_handle_wallpaper_upload, NULL);
          }
@@ -7757,15 +7768,20 @@ static int action_ok_push_dropdown_item_video_shader_param_generic(const char *p
 
    video_shader_driver_get_current_shader(&shader_info);
 
-   param_prev    = &shader_info.data->parameters[entry_idx - offset];
    if (shader)
       param_menu = &shader->parameters [entry_idx - offset];
 
-   if (!param_prev || !param_menu)
+   if (!shader_info.data || !param_menu)
       return -1;
 
-   param_prev->current  = val;
-   param_menu->current  = param_prev->current;
+   /* Clamp against the live parameter's stable range, then submit
+    * through the owning-thread setter (see menu_cbs_right.c). */
+   param_prev           = &shader_info.data->parameters[entry_idx - offset];
+   val                  = MIN(MAX(param_prev->minimum, val),
+         param_prev->maximum);
+   video_shader_driver_set_parameter(shader_info.data,
+         entry_idx - offset, val);
+   param_menu->current  = val;
 
    shader->flags       |= SHDR_FLAG_MODIFIED;
 
@@ -7801,6 +7817,24 @@ static int action_ok_push_dropdown_item_resolution(const char *path,
             label, type, idx, entry_idx) == 1)
       return -1;
    return 0;
+}
+
+/* The super width the engine is asked for. The values are widths, not
+ * an index - 0 and 1 mean native and best-fit - so the row carries
+ * the value and the entry index only orders the list. */
+static int action_ok_push_dropdown_item_crt_super_resolution(const char *path,
+      const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+   settings_t *settings = config_get_ptr();
+   static const unsigned values[] = { 0, 1, 1920, 2560, 3840 };
+
+   if (idx >= sizeof(values) / sizeof(values[0]))
+      return -1;
+
+   configuration_set_uint(settings,
+         settings->uints.crt_switch_resolution_super, values[idx]);
+
+   return action_cancel_pop_default(NULL, NULL, 0, 0);
 }
 
 static int action_ok_push_dropdown_item_playlist_default_core(
@@ -9994,6 +10028,9 @@ static int menu_cbs_init_bind_ok_compare_type(menu_file_list_cbs_t *cbs,
             break;
          case MENU_SETTING_DROPDOWN_ITEM_RESOLUTION:
             BIND_ACTION_OK(cbs, action_ok_push_dropdown_item_resolution);
+            break;
+         case MENU_SETTING_DROPDOWN_ITEM_CRT_SUPER_RESOLUTION:
+            BIND_ACTION_OK(cbs, action_ok_push_dropdown_item_crt_super_resolution);
             break;
          case MENU_SETTING_DROPDOWN_ITEM_VIDEO_SHADER_NUM_PASS:
             BIND_ACTION_OK(cbs, action_ok_push_dropdown_item_video_shader_num_pass);

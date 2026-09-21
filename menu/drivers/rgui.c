@@ -47,6 +47,7 @@
 #include "../../frontend/frontend_driver.h"
 
 #include "../menu_driver.h"
+#include "../../gfx/gfx_surface.h"
 #include "../../gfx/gfx_animation.h"
 #include "../../gfx/gfx_thumbnail.h"
 
@@ -295,6 +296,7 @@ enum rgui_flags
 typedef struct
 {
    retro_time_t thumbnail_load_trigger_time; /* uint64_t */
+   retro_time_t draw_entry_hold_until;
 
    struct
    {
@@ -326,7 +328,12 @@ typedef struct
    thumbnail_t mini_thumbnail;
    thumbnail_t mini_left_thumbnail;
 
-   rgui_video_settings_t menu_video_settings;      /* int alignment */
+   rgui_video_settings_t menu_video_settings;
+   /* Copy staged by a delay_update publish (the frame path under
+    * threaded video); rgui_render() on the main thread - which owns
+    * settings writes - applies it under RGUI_FLAG_ASPECT_UPDATE_PENDING
+    * before firing CMD_EVENT_VIDEO_SET_ASPECT_RATIO. */
+   rgui_video_settings_t pending_video_config;      /* int alignment */
    rgui_video_settings_t content_video_settings;   /* int alignment */
 
    unsigned font_width;
@@ -346,7 +353,6 @@ typedef struct
    unsigned menu_aspect_ratio;
    unsigned menu_aspect_ratio_lock;
    unsigned language;
-   unsigned draw_entry_delay;
 
    rgui_term_layout_t term_layout;
 
@@ -2711,7 +2717,7 @@ static bool rgui_request_thumbnail(
          /* Would like to cancel any existing image load tasks
           * here, but can't see how to do it... */
          if (task_push_image_load(thumbnail->path,
-               (video_driver_get_disp_flags() & VIDEO_FLAG_USE_RGBA),
+               gfx_surface_wants_rgba(),
                0,
                0,
                (thumbnail_id == GFX_THUMBNAIL_LEFT)
@@ -3727,7 +3733,7 @@ end:
              * here - in general, wallpaper is loaded once per session
              * and then forgotten, so performance issues are not a concern */
             task_push_image_load(wallpaper_path,
-                  (video_driver_get_disp_flags() & VIDEO_FLAG_USE_RGBA),
+                  gfx_surface_wants_rgba(),
                   0,
                   0,
                   menu_display_handle_wallpaper_upload,
@@ -5709,8 +5715,16 @@ static enum rgui_entry_value_type rgui_get_entry_value_type(
 static bool rgui_set_aspect_ratio(
       rgui_t *rgui,
       gfx_display_t *p_disp,
-      bool delay_update);
+      bool delay_update,
+      unsigned aspect_ratio,
+      unsigned aspect_ratio_lock);
 #endif
+
+/* Forward: rgui_render()'s pending-aspect pump and its
+ * framebuffer-resize flush both run before the definitions. */
+static void rgui_apply_video_config(
+      const rgui_video_settings_t *video_settings);
+static void rgui_flush_video_config(rgui_t *rgui);
 
 /* Fetches current thumbnail label.
  * Returns true if label is valid. */
@@ -5813,9 +5827,12 @@ static void rgui_render(void *data, unsigned width, unsigned height,
       rgui->mini_thumbnail_delay--;
    }
 
-   /* Apply pending aspect ratio update */
+   /* Apply pending aspect ratio update: the staged settings writes
+    * land here, on the thread that owns them, before the command
+    * that consumes them fires. */
    if (rgui->flags & RGUI_FLAG_ASPECT_UPDATE_PENDING)
    {
+      rgui_apply_video_config(&rgui->pending_video_config);
       command_event(CMD_EVENT_VIDEO_SET_ASPECT_RATIO, NULL);
       rgui->flags &= ~RGUI_FLAG_ASPECT_UPDATE_PENDING;
    }
@@ -5865,7 +5882,12 @@ static void rgui_render(void *data, unsigned width, unsigned height,
     * must be regenerated - easiest way is to just call
     * rgui_set_aspect_ratio() */
    if (fb_size_changed)
-      rgui_set_aspect_ratio(rgui, p_disp, false);
+   {
+      rgui_set_aspect_ratio(rgui, p_disp, false,
+            settings->uints.menu_rgui_aspect_ratio,
+            settings->uints.menu_rgui_aspect_ratio_lock);
+      rgui_flush_video_config(rgui);
+   }
 #endif
 
    if (     (rgui->flags & RGUI_FLAG_BG_MODIFIED)
@@ -6721,12 +6743,12 @@ static void rgui_get_video_config(
    video_settings->vp.y             = custom_vp->y;
 }
 
-static void rgui_set_video_config(
-      rgui_t *rgui,
-      settings_t *settings,
-      rgui_video_settings_t *video_settings,
-      bool delay_update)
+/* Main thread only: writes the aspect index and custom viewport into
+ * the configuration and refreshes the custom-aspect LUT entry. */
+static void rgui_apply_video_config(
+      const rgui_video_settings_t *video_settings)
 {
+   settings_t *settings                   = config_get_ptr();
    /* Could use settings->video_vp_custom directly,
     * but this seems to be the standard way of doing it... */
    video_viewport_t *custom_vp            = &settings->video_vp_custom;
@@ -6738,14 +6760,40 @@ static void rgui_set_video_config(
 
    aspectratio_lut[ASPECT_RATIO_CUSTOM].value =
          (float)custom_vp->width / custom_vp->height;
+}
 
-   if (delay_update)
-      rgui->flags |=  RGUI_FLAG_ASPECT_UPDATE_PENDING;
-   else
-   {
-      command_event(CMD_EVENT_VIDEO_SET_ASPECT_RATIO, NULL);
-      rgui->flags &= ~RGUI_FLAG_ASPECT_UPDATE_PENDING;
-   }
+/* Stage a video configuration for rgui_render() to apply. The frame
+ * path reaches here under threaded video, and both the settings
+ * writes and CMD_EVENT_VIDEO_SET_ASPECT_RATIO belong to the main
+ * thread (the command deadlocks from the frame - see the note in
+ * rgui_frame); main-side callers that want the deferral (populate)
+ * use it too. Latest staged wins. */
+static void rgui_stage_video_config(
+      rgui_t *rgui,
+      const rgui_video_settings_t *video_settings)
+{
+   rgui->pending_video_config = *video_settings;
+   rgui->flags |=  RGUI_FLAG_ASPECT_UPDATE_PENDING;
+}
+
+/* Main thread only: apply and signal immediately. */
+static void rgui_set_video_config_now(
+      rgui_t *rgui,
+      const rgui_video_settings_t *video_settings)
+{
+   rgui_apply_video_config(video_settings);
+   command_event(CMD_EVENT_VIDEO_SET_ASPECT_RATIO, NULL);
+   rgui->flags &= ~RGUI_FLAG_ASPECT_UPDATE_PENDING;
+}
+
+/* Main thread only: apply whatever rgui_set_aspect_ratio() staged,
+ * for callers that need the configuration in place before they
+ * proceed (video init, menu toggle) rather than at the next
+ * rgui_render(). */
+static void rgui_flush_video_config(rgui_t *rgui)
+{
+   if (rgui->flags & RGUI_FLAG_ASPECT_UPDATE_PENDING)
+      rgui_set_video_config_now(rgui, &rgui->pending_video_config);
 }
 
 /* Note: This function is only called when aspect ratio
@@ -6871,14 +6919,20 @@ static void rgui_update_menu_viewport(
    rgui->menu_video_settings.vp.y = 0;
 }
 
+/* Dual-context: rgui_render(), init, populate and toggle call this
+ * on the main thread; rgui_frame() calls it on the video thread
+ * under threaded video. The two settings it needs arrive as
+ * arguments, supplied from each caller's own context - the live
+ * settings on the main paths, the snapshot on the frame path. */
 static bool rgui_set_aspect_ratio(
       rgui_t *rgui,
       gfx_display_t *p_disp,
-      bool delay_update)
+      bool delay_update,
+      unsigned aspect_ratio,
+      unsigned aspect_ratio_lock)
 {
    unsigned base_term_width;
    unsigned mini_thumbnail_term_width;
-   settings_t       *settings   = config_get_ptr();
 #if defined(GEKKO)
    /* Note: Maximum Wii frame buffer width is 424, not
     * the usual 426, since the last two bits of the
@@ -6892,13 +6946,15 @@ static bool rgui_set_aspect_ratio(
 #else
    unsigned max_frame_buf_width = RGUI_MAX_FB_WIDTH;
 #endif
+#if !defined(GEKKO) && !defined(DINGUX)
    struct video_viewport vp;
+#endif
+
 #if defined(DINGUX)
-   unsigned aspect_ratio        = RGUI_DINGUX_ASPECT_RATIO;
-   unsigned aspect_ratio_lock   = RGUI_ASPECT_RATIO_LOCK_NONE;
-#else
-   unsigned aspect_ratio        = settings->uints.menu_rgui_aspect_ratio;
-   unsigned aspect_ratio_lock   = settings->uints.menu_rgui_aspect_ratio_lock;
+   /* Dingux devices run a fixed aspect regardless of configuration:
+    * override the caller-supplied values. */
+   aspect_ratio      = RGUI_DINGUX_ASPECT_RATIO;
+   aspect_ratio_lock = RGUI_ASPECT_RATIO_LOCK_NONE;
 #endif
 
    rgui_buffers_free(rgui);
@@ -7264,8 +7320,14 @@ static bool rgui_set_aspect_ratio(
    if (   (aspect_ratio_lock != RGUI_ASPECT_RATIO_LOCK_NONE)
        && (!(rgui->flags & RGUI_FLAG_IGNORE_RESIZE_EVENTS)))
    {
-      rgui_update_menu_viewport(rgui, p_disp, settings->uints.menu_rgui_aspect_ratio_lock);
-      rgui_set_video_config(rgui, settings, &rgui->menu_video_settings, delay_update);
+      rgui_update_menu_viewport(rgui, p_disp, aspect_ratio_lock);
+      /* Always staged: this function is frame-reachable, and the
+       * settings writes plus the aspect command belong to the main
+       * thread. Main-side callers that need the update applied
+       * before they proceed call rgui_flush_video_config() on
+       * return; everyone else picks it up at the next
+       * rgui_render(). */
+      rgui_stage_video_config(rgui, &rgui->menu_video_settings);
    }
 
    return true;
@@ -7357,8 +7419,13 @@ static void *rgui_init(void **userdata, bool video_is_threaded)
     * - Configures variable 'menu display' settings */
    rgui->menu_aspect_ratio_lock     = aspect_ratio_lock;
    rgui->flags                     &= ~RGUI_FLAG_ASPECT_UPDATE_PENDING;
-   if (!rgui_set_aspect_ratio(rgui, p_disp, false))
+   if (!rgui_set_aspect_ratio(rgui, p_disp, false,
+         settings->uints.menu_rgui_aspect_ratio,
+         settings->uints.menu_rgui_aspect_ratio_lock))
       goto error;
+   /* Video init reads the aspect settings next: apply what was
+    * staged before proceeding. */
+   rgui_flush_video_config(rgui);
 
    /* Fixed 'menu display' settings */
    new_font_height                  = rgui->font_height_stride * 2;
@@ -8244,7 +8311,9 @@ static void rgui_populate_entries(
       /* Need to recalculate terminal dimensions
        * > easiest method is to call
        *   rgui_set_aspect_ratio() */
-      rgui_set_aspect_ratio(rgui, p_disp, true);
+      rgui_set_aspect_ratio(rgui, p_disp, true,
+            settings->uints.menu_rgui_aspect_ratio,
+            settings->uints.menu_rgui_aspect_ratio_lock);
    }
 #endif
 
@@ -8411,7 +8480,7 @@ static void rgui_populate_entries(
          rgui_get_video_config(&current_video_settings, settings, settings->uints.video_aspect_ratio_idx);
          if (rgui_is_video_config_equal(&current_video_settings, &rgui->menu_video_settings))
          {
-            rgui_set_video_config(rgui, settings, &rgui->content_video_settings, false);
+            rgui_set_video_config_now(rgui, &rgui->content_video_settings);
             /* Menu viewport has been overridden - must ignore
              * resize events until the menu is next toggled off */
             rgui->flags             |=  RGUI_FLAG_IGNORE_RESIZE_EVENTS;
@@ -8540,18 +8609,17 @@ static int rgui_pointer_up(
 static void rgui_frame(void *data, video_frame_info_t *video_info)
 {
    rgui_t *rgui                        = (rgui_t*)data;
-   settings_t *settings                = config_get_ptr();
    struct menu_state *menu_st          = menu_state_get_ptr();
-   bool bg_filler_thickness_enable     = settings->bools.menu_rgui_background_filler_thickness_enable;
-   bool border_filler_thickness_enable = settings->bools.menu_rgui_border_filler_thickness_enable;
+   bool bg_filler_thickness_enable     = video_info->menu.rgui_background_filler_thickness_enable;
+   bool border_filler_thickness_enable = video_info->menu.rgui_border_filler_thickness_enable;
 #if defined(DINGUX)
    unsigned aspect_ratio               = RGUI_DINGUX_ASPECT_RATIO;
    unsigned aspect_ratio_lock          = RGUI_ASPECT_RATIO_LOCK_NONE;
 #else
-   unsigned aspect_ratio               = settings->uints.menu_rgui_aspect_ratio;
-   unsigned aspect_ratio_lock          = settings->uints.menu_rgui_aspect_ratio_lock;
+   unsigned aspect_ratio               = video_info->menu.rgui_aspect_ratio;
+   unsigned aspect_ratio_lock          = video_info->menu.rgui_aspect_ratio_lock;
 #endif
-   bool border_filler_enable           = settings->bools.menu_rgui_border_filler_enable;
+   bool border_filler_enable           = video_info->menu.rgui_border_filler_enable;
    unsigned video_width                = video_info->width;
    unsigned video_height               = video_info->height;
    gfx_display_t *p_disp               = disp_get_ptr();
@@ -8586,24 +8654,24 @@ static void rgui_frame(void *data, video_frame_info_t *video_info)
          rgui->flags        &= ~RGUI_FLAG_BORDER_ENABLE;
    }
 
-   if (settings->bools.menu_rgui_shadows != ((rgui->flags & RGUI_FLAG_SHADOW_ENABLE) > 0))
+   if (video_info->menu.rgui_shadows != ((rgui->flags & RGUI_FLAG_SHADOW_ENABLE) > 0))
    {
       rgui_set_blit_functions(
             rgui->language,
-            settings->bools.menu_rgui_shadows,
-            settings->bools.menu_rgui_extended_ascii);
+            video_info->menu.rgui_shadows,
+            video_info->menu.rgui_extended_ascii);
 
       rgui->flags           |=  RGUI_FLAG_BG_MODIFIED
                              |  RGUI_FLAG_FORCE_REDRAW;
-      if (settings->bools.menu_rgui_shadows)
+      if (video_info->menu.rgui_shadows)
          rgui->flags        |=  RGUI_FLAG_SHADOW_ENABLE;
       else
          rgui->flags        &= ~RGUI_FLAG_SHADOW_ENABLE;
    }
 
-   if (settings->uints.menu_rgui_particle_effect != rgui->particle_effect)
+   if (video_info->menu.rgui_particle_effect != rgui->particle_effect)
    {
-      rgui->particle_effect  = settings->uints.menu_rgui_particle_effect;
+      rgui->particle_effect  = video_info->menu.rgui_particle_effect;
 
       if (rgui->particle_effect != RGUI_PARTICLE_EFFECT_NONE)
          rgui_init_particle_effect(rgui, p_disp);
@@ -8613,74 +8681,73 @@ static void rgui_frame(void *data, video_frame_info_t *video_info)
 
    if (    (rgui->particle_effect != RGUI_PARTICLE_EFFECT_NONE)
         && (     (!(rgui->flags & RGUI_FLAG_SHOW_SCREENSAVER))
-              || (settings->bools.menu_rgui_particle_effect_screensaver)))
+              || (video_info->menu.rgui_particle_effect_screensaver)))
       rgui->flags           |= RGUI_FLAG_FORCE_REDRAW;
 
-   if (settings->bools.menu_rgui_extended_ascii != ((rgui->flags & RGUI_FLAG_EXTENDED_ASCII_ENABLE) > 0))
+   if (video_info->menu.rgui_extended_ascii != ((rgui->flags & RGUI_FLAG_EXTENDED_ASCII_ENABLE) > 0))
    {
       rgui_set_blit_functions(
             rgui->language,
-            settings->bools.menu_rgui_shadows,
-            settings->bools.menu_rgui_extended_ascii);
+            video_info->menu.rgui_shadows,
+            video_info->menu.rgui_extended_ascii);
 
       rgui->flags                |=  RGUI_FLAG_FORCE_REDRAW;
-      if (settings->bools.menu_rgui_extended_ascii)
+      if (video_info->menu.rgui_extended_ascii)
          rgui->flags             |=  RGUI_FLAG_EXTENDED_ASCII_ENABLE;
       else
          rgui->flags             &= ~RGUI_FLAG_EXTENDED_ASCII_ENABLE;
    }
 
-   if (     (settings->uints.menu_rgui_color_theme != rgui->color_theme)
+   if (     (video_info->menu.rgui_color_theme != rgui->color_theme)
          || (  (rgui->flags & RGUI_FLAG_TRANSPARENCY_SUPPORTED)
-            && (settings->bools.menu_rgui_transparency !=
+            && (video_info->menu.rgui_transparency !=
                ((rgui->flags & RGUI_FLAG_TRANSPARENCY_ENABLE) > 0))))
    {
-      if (settings->uints.menu_rgui_color_theme == RGUI_THEME_DYNAMIC)
+      if (video_info->menu.rgui_color_theme == RGUI_THEME_DYNAMIC)
          rgui_update_dynamic_theme_path(rgui,
-               settings->paths.directory_dynamic_wallpapers);
+               video_info->menu.dynamic_wallpapers_dir);
 
       rgui_prepare_colors(rgui,
-            settings->uints.menu_rgui_color_theme,
-            settings->paths.path_rgui_theme_preset,
-            settings->bools.menu_rgui_transparency,
-            settings->uints.menu_rgui_aspect_ratio
+            video_info->menu.rgui_color_theme,
+            video_info->menu.rgui_theme_preset,
+            video_info->menu.rgui_transparency,
+            video_info->menu.rgui_aspect_ratio
             );
    }
-   else if (settings->uints.menu_rgui_color_theme == RGUI_THEME_CUSTOM)
+   else if (video_info->menu.rgui_color_theme == RGUI_THEME_CUSTOM)
    {
-      if (!string_is_equal(settings->paths.path_rgui_theme_preset,
+      if (!string_is_equal(video_info->menu.rgui_theme_preset,
             rgui->theme_preset_path))
          rgui_prepare_colors(rgui,
-               settings->uints.menu_rgui_color_theme,
-               settings->paths.path_rgui_theme_preset,
-               settings->bools.menu_rgui_transparency,
-               settings->uints.menu_rgui_aspect_ratio
+               video_info->menu.rgui_color_theme,
+               video_info->menu.rgui_theme_preset,
+               video_info->menu.rgui_transparency,
+               video_info->menu.rgui_aspect_ratio
                );
    }
-   else if (settings->uints.menu_rgui_color_theme == RGUI_THEME_DYNAMIC)
+   else if (video_info->menu.rgui_color_theme == RGUI_THEME_DYNAMIC)
    {
       if (!string_is_equal(rgui->last_theme_dynamic_path,
             rgui->theme_dynamic_path))
          rgui_prepare_colors(rgui,
-               settings->uints.menu_rgui_color_theme,
-               settings->paths.path_rgui_theme_preset,
-               settings->bools.menu_rgui_transparency,
-               settings->uints.menu_rgui_aspect_ratio
+               video_info->menu.rgui_color_theme,
+               video_info->menu.rgui_theme_preset,
+               video_info->menu.rgui_transparency,
+               video_info->menu.rgui_aspect_ratio
                );
    }
 
    /* Single-click playlist button hold delay */
-   if (rgui->flags & RGUI_FLAG_DRAW_ENTRY_SKIP && rgui->draw_entry_delay)
+   if (     rgui->flags & RGUI_FLAG_DRAW_ENTRY_SKIP
+         && rgui->draw_entry_hold_until
+         && menu_driver_get_current_time() >= rgui->draw_entry_hold_until)
    {
-      rgui->draw_entry_delay--;
-      if (!rgui->draw_entry_delay)
-      {
-         rgui->flags &= ~RGUI_FLAG_DRAW_ENTRY_SKIP;
-         rgui->flags |=  RGUI_FLAG_FORCE_REDRAW;
-      }
+      rgui->draw_entry_hold_until = 0;
+      rgui->flags &= ~RGUI_FLAG_DRAW_ENTRY_SKIP;
+      rgui->flags |=  RGUI_FLAG_FORCE_REDRAW;
    }
 
-   /* Note: both rgui_set_aspect_ratio() and rgui_set_video_config()
+   /* Note: both rgui_set_aspect_ratio() and the video-config path
     * normally call command_event(CMD_EVENT_VIDEO_SET_ASPECT_RATIO, NULL)
     * ## THIS CANNOT BE DONE INSIDE rgui_frame() IF THREADED VIDEO IS ENABLED ##
     * Attempting to do so creates a deadlock, and causes RetroArch to hang.
@@ -8698,7 +8765,9 @@ static void rgui_frame(void *data, video_frame_info_t *video_info)
        * no longer makes sense to ignore resize events */
       rgui->flags               &= ~RGUI_FLAG_IGNORE_RESIZE_EVENTS;
 
-      rgui_set_aspect_ratio(rgui, p_disp, true);
+      rgui_set_aspect_ratio(rgui, p_disp, true,
+            video_info->menu.rgui_aspect_ratio,
+            video_info->menu.rgui_aspect_ratio_lock);
    }
 
    /* > Check for changes in aspect ratio lock setting */
@@ -8708,15 +8777,15 @@ static void rgui_frame(void *data, video_frame_info_t *video_info)
       rgui->menu_aspect_ratio_lock = aspect_ratio_lock;
 
       if (aspect_ratio_lock == RGUI_ASPECT_RATIO_LOCK_NONE)
-         rgui_set_video_config(rgui, settings, &rgui->content_video_settings, true);
+         rgui_stage_video_config(rgui, &rgui->content_video_settings);
       else
       {
          /* As with changes in aspect ratio, if we reach this point
           * after visiting the video scaling settings menu, resize
           * events should be monitored again */
          rgui->flags               &= ~RGUI_FLAG_IGNORE_RESIZE_EVENTS;
-         rgui_update_menu_viewport(rgui, p_disp, settings->uints.menu_rgui_aspect_ratio_lock);
-         rgui_set_video_config(rgui, settings, &rgui->menu_video_settings, true);
+         rgui_update_menu_viewport(rgui, p_disp, video_info->menu.rgui_aspect_ratio_lock);
+         rgui_stage_video_config(rgui, &rgui->menu_video_settings);
       }
 
       /* Clear any pending 'restore aspect lock' flags */
@@ -8774,15 +8843,17 @@ static void rgui_frame(void *data, video_frame_info_t *video_info)
             || (rgui->window_width < default_fb_width)
             || (video_height < 240)
             || (rgui->window_height < 240))
-         rgui_set_aspect_ratio(rgui, p_disp, true);
+         rgui_set_aspect_ratio(rgui, p_disp, true,
+            video_info->menu.rgui_aspect_ratio,
+            video_info->menu.rgui_aspect_ratio_lock);
 #endif
 
       /* If aspect ratio is locked, have to update viewport */
       if (     (aspect_ratio_lock != RGUI_ASPECT_RATIO_LOCK_NONE)
             && (!(rgui->flags & RGUI_FLAG_IGNORE_RESIZE_EVENTS)))
       {
-         rgui_update_menu_viewport(rgui, p_disp, settings->uints.menu_rgui_aspect_ratio_lock);
-         rgui_set_video_config(rgui, settings, &rgui->menu_video_settings, true);
+         rgui_update_menu_viewport(rgui, p_disp, video_info->menu.rgui_aspect_ratio_lock);
+         rgui_stage_video_config(rgui, &rgui->menu_video_settings);
       }
 
       rgui->window_width  = video_width;
@@ -8797,16 +8868,16 @@ static void rgui_frame(void *data, video_frame_info_t *video_info)
        * since the flicker when switching between playlist view and
        * fullscreen thumbnail view is incredibly jarring...) */
       if ((menu_driver_get_current_time() - rgui->thumbnail_load_trigger_time) >=
-            (settings->uints.menu_rgui_thumbnail_delay * 1000 * ((rgui->flags & RGUI_FLAG_SHOW_FULLSCREEN_THUMBNAIL)
+            (video_info->menu.rgui_thumbnail_delay * 1000 * ((rgui->flags & RGUI_FLAG_SHOW_FULLSCREEN_THUMBNAIL)
                   ? 1.5f
                   : 1.0f)))
          rgui_load_current_thumbnails(rgui, menu_st,
-               settings->bools.network_on_demand_thumbnails);
+               video_info->menu.network_on_demand_thumbnails);
    }
 
    /* Read pointer input */
-   if (     settings->bools.menu_mouse_enable
-         || settings->bools.menu_pointer_enable)
+   if (     video_info->menu.mouse_enable
+         || video_info->menu.pointer_enable)
    {
       menu_input_get_pointer_state(&rgui->pointer);
 
@@ -8865,11 +8936,14 @@ static void rgui_toggle(void *userdata, bool menu_on)
          /* Update menu viewport */
          rgui_update_menu_viewport(rgui, p_disp, settings->uints.menu_rgui_aspect_ratio_lock);
          /* Apply menu video settings */
-         rgui_set_video_config(rgui, settings, &rgui->menu_video_settings, false);
+         rgui_set_video_config_now(rgui, &rgui->menu_video_settings);
       }
       else if (rgui->menu_aspect_ratio == RGUI_ASPECT_RATIO_AUTO)
       {
-         rgui_set_aspect_ratio(rgui, p_disp, false);
+         rgui_set_aspect_ratio(rgui, p_disp, false,
+               settings->uints.menu_rgui_aspect_ratio,
+               settings->uints.menu_rgui_aspect_ratio_lock);
+         rgui_flush_video_config(rgui);
       }
    }
    else
@@ -8883,7 +8957,7 @@ static void rgui_toggle(void *userdata, bool menu_on)
          rgui_get_video_config(&current_video_settings, settings, settings->uints.video_aspect_ratio_idx);
 
          if (rgui_is_video_config_equal(&current_video_settings, &rgui->menu_video_settings))
-            rgui_set_video_config(rgui, settings, &rgui->content_video_settings, false);
+            rgui_set_video_config_now(rgui, &rgui->content_video_settings);
 
          /* Any modified video scaling settings have now been
           * registered, so it is again 'safe' to respond to window
@@ -8987,7 +9061,7 @@ static enum menu_action rgui_parse_menu_entry_action(
                 * until the menu is next toggled off; this is a
                 * one-shot 'fix' that should only be active
                 * during the config save operation */
-               rgui_set_video_config(rgui, settings, &rgui->content_video_settings, false);
+               rgui_set_video_config_now(rgui, &rgui->content_video_settings);
                /* Schedule a restoration of the aspect ratio
                 * lock on the next frame */
                rgui->flags |= RGUI_FLAG_RESTORE_ASPECT_LOCK;
@@ -9023,7 +9097,8 @@ static enum menu_action rgui_parse_menu_entry_action(
 #endif
             }
             rgui->flags |= RGUI_FLAG_DRAW_ENTRY_SKIP;
-            rgui->draw_entry_delay = MENU_DRAW_ENTRY_DELAY;
+            rgui->draw_entry_hold_until = menu_driver_get_current_time()
+                  + MENU_DRAW_ENTRY_DELAY;
          }
          break;
       case MENU_ACTION_CANCEL:

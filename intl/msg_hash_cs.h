@@ -2369,7 +2369,6 @@ static const struct
    char s_9831f77b[173];
    char s_79b8ce4a[81];
    char s_a1a8257e[135];
-   char s_d5231783[101];
    char s_a68d6d11[65];
    char s_74022c02[98];
    char s_8abad013[80];
@@ -2491,8 +2490,6 @@ static const struct
    char s_16ee5cf4[36];
    char s_d9153542[47];
    char s_8e48ec69[39];
-   char s_cd46e260[94];
-   char s_cd482ffe[98];
    char s_49336383[40];
    char s_e92351d4[104];
    char s_8e22cdce[61];
@@ -3170,7 +3167,6 @@ static const struct
    char s_261210b3[76];
    char s_3a4b246c[107];
    char s_2ceab671[137];
-   char s_977f8e82[121];
    char s_3c679f0a[349];
    char s_5b059407[164];
    char s_36033606[178];
@@ -6599,8 +6595,6 @@ static const struct
    "P\305\231epnut\303\255 na modelinu s vysok\303\275m rozli\305\241en\303\255m pro pou\305\276it"
    "\303\255 s nab\303\255dkami s vysok\303\275m rozli\305\241en\303\255m, kdy\305\276 nen\303\255 n"
    "a\304\215ten \305\276\303\241dn\303\275 obsah.",
-   "Pouze pro CRT displeje. Pokus\303\255 se pou\305\276\303\255t p\305\231esn\303\251 rozli\305\241"
-   "en\303\255 j\303\241dra/hry a obnovovac\303\255 frekvenci.",
    "P\305\231ep\303\255nejte mezi nativn\303\255m a ultra\305\241irok\303\275m super rozli\305\241en"
    "\303\255m.",
    "V p\305\231\303\255pad\304\233 pot\305\231eby pou\305\276ijte vlastn\303\255 obnovovac\303\255 f"
@@ -6821,10 +6815,6 @@ static const struct
    "Zapnut\303\255/vypnut\303\255 funkce Run-Ahead.",
    "Ulo\305\276\303\255 pozici do aktu\303\241ln\304\233 vybran\303\251ho slotu.",
    "Zachyt\303\255 obr\303\241zek aktu\303\241ln\303\255ho obsahu.",
-   "Na\304\215te a pou\305\276ije dal\305\241\303\255 soubor p\305\231edvolby shaderu v ko\305\231en"
-   "ov\303\251m adres\303\241\305\231i 'Video Shadery'.",
-   "Na\304\215te a pou\305\276ije p\305\231edchoz\303\255 soubor p\305\231edvolby shaderu v ko\305"
-   "\231enov\303\251m adres\303\241\305\231i 'Video Shadery'.",
    "Zapne/vypne aktu\303\241ln\304\233 vybran\303\275 shader.",
    "Povol\303\255 zpomalen\303\275 pohyb p\305\231i podr\305\276en\303\255. Po uvoln\304\233n\303"
    "\255 tla\304\215\303\255tka b\304\233\305\276\303\255 obsah norm\303\241ln\303\255 rychlost\303"
@@ -8113,9 +8103,6 @@ static const struct
    "Ulo\305\276it p\305\231edvolbu shaderu, kter\303\241 m\303\241 odkaz na p\305\257vodn\303\255 na"
    "\304\215tenou p\305\231edvolbu a obsahuje pouze zm\304\233ny parametr\305\257, kter\303\251 jste"
    " provedli.",
-   "Otev\305\231en\303\255 Pr\305\257zkumn\303\255ka soubor\305\257 v posledn\303\255m pou\305\276it"
-   "\303\251m adres\303\241\305\231i p\305\231i na\304\215\303\255t\303\241n\303\255 p\305\231edvole"
-   "b a pr\305\257chod\305\257 shader\305\257.",
    "UPOZORN\304\232N\303\215: Rychl\303\251 blik\303\241n\303\255 m\305\257\305\276e na n\304\233kte"
    "r\303\275ch displej\303\255ch zp\305\257sobit p\305\231etrv\303\241v\303\241n\303\255 obrazu. Po"
    "u\305\276\303\255vejte na vlastn\303\255 nebezpe\304\215\303\255 // Simuluje z\303\241kladn\303"
@@ -8809,7 +8796,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_cs_blob_check[
-      (sizeof(msg_hash_cs_blob) == (162976u
+      (sizeof(msg_hash_cs_blob) == (162562u
 #ifdef ANDROID
        + 390u
 #endif
@@ -11527,7 +11514,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_CORE_UPDATER_SHOW_EXPERIMENTAL_CORES,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCHRES_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_HIRES_MENU,
-   (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_SUPER,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_USE_CUSTOM_REFRESH_RATE,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_VERTICAL_ADJUST,
@@ -11649,8 +11635,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_RUNAHEAD_TOGGLE,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SAVE_STATE_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SCREENSHOT,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_NEXT,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_PREV,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_TOGGLE,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_HOLD_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_KEY,
@@ -12328,7 +12312,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_GLOBAL,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_PARENT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_REFERENCE,
-   (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_REMEMBER_LAST_DIR,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_SUBFRAMES,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHARED_CONTEXT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SMOOTH,

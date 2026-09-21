@@ -47,6 +47,53 @@ static void astretch_copy(const audio_stretch_t *s, void *dst,
             (frames - first) * s->frame_bytes);
 }
 
+/* These gathered values are native int16, unlike the shared helper's
+ * wider stereo sums. Keep all accumulation and normalization exact. */
+static INLINE int64_t astretch_corr_i(const int32_t *a, const int32_t *b,
+      unsigned n)
+{
+#if WSOLA_HAVE_SSE2 && !defined(AUDIO_STRETCH_SCALAR)
+   unsigned i = 0;
+   int64_t dots[2], dot;
+   uint64_t energies[2], energy, root;
+   __m128i zero = _mm_setzero_si128();
+   __m128i overflow = _mm_set1_epi32(INT32_MIN);
+   __m128i sum = zero, squares = zero;
+   for (; i + 8 <= n; i += 8)
+   {
+      __m128i x = _mm_packs_epi32(
+            _mm_loadu_si128((const __m128i*)(a + i)),
+            _mm_loadu_si128((const __m128i*)(a + i + 4)));
+      __m128i y = _mm_packs_epi32(
+            _mm_loadu_si128((const __m128i*)(b + i)),
+            _mm_loadu_si128((const __m128i*)(b + i + 4)));
+      __m128i d = _mm_madd_epi16(x, y);
+      __m128i e = _mm_madd_epi16(y, y);
+      /* Two (-32768 * -32768) products yield +2^31. This is the only
+       * overflowing pair; its INT32_MIN encoding must zero-extend. */
+      __m128i sign = _mm_andnot_si128(_mm_cmpeq_epi32(d, overflow),
+            _mm_srai_epi32(d, 31));
+      sum = _mm_add_epi64(sum, _mm_unpacklo_epi32(d, sign));
+      sum = _mm_add_epi64(sum, _mm_unpackhi_epi32(d, sign));
+      squares = _mm_add_epi64(squares, _mm_unpacklo_epi32(e, zero));
+      squares = _mm_add_epi64(squares, _mm_unpackhi_epi32(e, zero));
+   }
+   _mm_storeu_si128((__m128i*)dots, sum);
+   _mm_storeu_si128((__m128i*)energies, squares);
+   dot = dots[0] + dots[1];
+   energy = energies[0] + energies[1];
+   for (; i < n; i++)
+   {
+      dot += (int64_t)a[i] * b[i];
+      energy += (uint64_t)((int64_t)b[i] * b[i]);
+   }
+   root = wsola_isqrt64(energy);
+   return (dot * 65536) / (int64_t)(root ? root : 1);
+#else
+   return wsola_corr_i(a, b, n);
+#endif
+}
+
 static unsigned astretch_search(audio_stretch_t *s)
 {
    unsigned c, f, selected = 0, begin, end, candidate, best, distance;
@@ -107,7 +154,7 @@ static unsigned astretch_search(audio_stretch_t *s)
       score_f = s->correlation((const float*)s->reference,
             (const float*)s->search + best - begin, s->hop, energy_f);
    else
-      score_i = wsola_corr_i((const int32_t*)s->reference,
+      score_i = astretch_corr_i((const int32_t*)s->reference,
             (const int32_t*)s->search + best - begin, s->hop);
    for (candidate = begin; candidate <= end; candidate++)
    {
@@ -122,7 +169,7 @@ static unsigned astretch_search(audio_stretch_t *s)
       }
       else
       {
-         int64_t score = wsola_corr_i((const int32_t*)s->reference,
+         int64_t score = astretch_corr_i((const int32_t*)s->reference,
                (const int32_t*)s->search + candidate - begin, s->hop);
          better = score > score_i || (score == score_i && d < distance);
          if (better) score_i = score;
@@ -181,7 +228,7 @@ audio_stretch_t *audio_stretch_new(unsigned rate, unsigned channels,
          || channels > AUDIO_STRETCH_MAX_CHANNELS
          || !search_channels || (search_channels >> channels)) return NULL;
    hop = (rate + 187) / 375;
-   radius = hop / 2;
+   radius = hop * 4;
    capacity = 2 * hop + 2 * radius;
    sample = is_float ? sizeof(float) : sizeof(int16_t);
    native_bytes = (capacity + 2 * hop) * channels * sample;
@@ -569,6 +616,7 @@ struct audio_stretch_stream
    audio_stretch_transition_t *transition;
    size_t frame_bytes, count, read, gap;
    void *bound_output;
+   const void *bound_source;
    size_t bound_capacity, bound_count, bound_read;
    unsigned hop;
    enum astretch_stream_phase phase;
@@ -611,6 +659,7 @@ void audio_stretch_stream_reset(audio_stretch_stream_t *s)
    s->count = s->read = 0; s->gap = (size_t)-1;
    s->phase = ASTRETCH_STREAM_RAW; s->eof = false;
    s->bound_count = s->bound_read = 0;
+   s->bound_source = NULL;
 }
 
 bool audio_stretch_stream_quiescent(const audio_stretch_stream_t *s)
@@ -796,14 +845,19 @@ const void *audio_stretch_stream_peek(const audio_stretch_stream_t *s,
 {
    if (!frames) return NULL;
    *frames = s ? s->bound_count - s->bound_read : 0;
-   return *frames ? (const char*)s->bound_output + s->bound_read * s->frame_bytes : NULL;
+   return *frames ? (const char*)(s->bound_source ? s->bound_source : s->bound_output)
+      + s->bound_read * s->frame_bytes : NULL;
 }
 
 bool audio_stretch_stream_consume(audio_stretch_stream_t *s, size_t frames)
 {
    if (!s || !s->bound_output || frames > s->bound_count - s->bound_read) return false;
    s->bound_read += frames;
-   if (s->bound_read == s->bound_count) s->bound_read = s->bound_count = 0;
+   if (s->bound_read == s->bound_count)
+   {
+      s->bound_read = s->bound_count = 0;
+      s->bound_source = NULL;
+   }
    return true;
 }
 
@@ -832,6 +886,29 @@ bool audio_stretch_stream_push(audio_stretch_stream_t *s,
 {
    return audio_stretch_stream_push_limit(s, input, frames, used, tempo, active,
          (size_t)-1);
+}
+
+bool audio_stretch_stream_push_view_limit(audio_stretch_stream_t *s,
+      const void *input, size_t frames, size_t *used, double tempo, bool active,
+      size_t limit)
+{
+   struct audio_stretch_io io;
+   if (active || !audio_stretch_stream_quiescent(s) || !limit)
+      return audio_stretch_stream_push_limit(s, input, frames, used,
+            tempo, active, limit);
+   if (!used) return false;
+   *used = 0;
+   if (!s || !s->bound_output) return false;
+   /* Validate without copying or changing transport state. */
+   io.input = input; io.input_frames = frames;
+   io.output = s->bound_output; io.output_capacity = 0;
+   if (!astretch_stream_process(s, &io, tempo, active)) return false;
+   if (frames > limit) frames = limit;
+   if (frames > s->bound_capacity) frames = s->bound_capacity;
+   s->bound_source = frames ? input : NULL;
+   s->bound_count = frames;
+   *used = frames;
+   return true;
 }
 
 bool audio_stretch_stream_finish_limit(audio_stretch_stream_t *s,

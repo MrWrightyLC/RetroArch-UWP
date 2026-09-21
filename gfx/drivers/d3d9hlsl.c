@@ -7415,7 +7415,9 @@ static void d3d9_hlsl_overlay_tex_geom(
 {
    d3d9_video_t *d3d = (d3d9_video_t*)data;
 
-   if (!d3d)
+   /* Called whenever the frontend likes, not only after a load that
+    * worked: no page, or an index off the end of it, is nothing. */
+   if (!d3d || !d3d->overlays || index >= d3d->overlays_size)
       return;
 
    d3d->overlays[index].tex_coords[0] = x;
@@ -7432,7 +7434,7 @@ static void d3d9_hlsl_overlay_vertex_geom(
 {
    d3d9_video_t *d3d = (d3d9_video_t*)data;
 
-   if (!d3d)
+   if (!d3d || !d3d->overlays || index >= d3d->overlays_size)
       return;
 
    y                                   = 1.0f - y;
@@ -7455,7 +7457,13 @@ static bool d3d9_hlsl_overlay_load(void *data,
       return false;
 
    d3d9_hlsl_free_overlays(d3d);
+   if (!num_images)
+      return true;
    d3d->overlays      = (overlay_t*)calloc(num_images, sizeof(*d3d->overlays));
+   /* A size with no array behind it is a NULL the free, the draw and
+    * the setters would all walk. */
+   if (!d3d->overlays)
+      return false;
    d3d->overlays_size = num_images;
 
    for (i = 0; i < num_images; i++)
@@ -7479,15 +7487,17 @@ static bool d3d9_hlsl_overlay_load(void *data,
          return false;
       }
 
-      IDirect3DTexture9_LockRect((LPDIRECT3DTEXTURE9)overlay->tex, 0, &d3dlr, NULL, D3DLOCK_NOSYSLOCK);
+      /* A lock that failed leaves d3dlr as it was found: not an
+       * address to copy a texture to. */
+      if (SUCCEEDED(IDirect3DTexture9_LockRect((LPDIRECT3DTEXTURE9)overlay->tex, 0, &d3dlr, NULL, D3DLOCK_NOSYSLOCK)))
       {
          uint32_t       *dst = (uint32_t*)(d3dlr.pBits);
          const uint32_t *src = images[i].pixels;
          unsigned      pitch = d3dlr.Pitch >> 2;
          for (y = 0; y < height; y++, dst += pitch, src += width)
             memcpy(dst, src, width << 2);
+         IDirect3DTexture9_UnlockRect((LPDIRECT3DTEXTURE9)overlay->tex, 0);
       }
-      IDirect3DTexture9_UnlockRect((LPDIRECT3DTEXTURE9)overlay->tex, 0);
 
       overlay->tex_w         = width;
       overlay->tex_h         = height;
@@ -7502,14 +7512,12 @@ static bool d3d9_hlsl_overlay_load(void *data,
 
 static void d3d9_hlsl_overlay_enable(void *data, bool state)
 {
-   unsigned i;
    d3d9_video_t            *d3d = (d3d9_video_t*)data;
 
    if (!d3d)
       return;
 
-   for (i = 0; i < d3d->overlays_size; i++)
-      d3d->overlays_enabled = state;
+   d3d->overlays_enabled = state;
 
 #ifndef XBOX
    win32_show_cursor(d3d, state);
@@ -7521,6 +7529,9 @@ static void d3d9_hlsl_overlay_full_screen(void *data, bool enable)
    unsigned i;
    d3d9_video_t *d3d = (d3d9_video_t*)data;
 
+   if (!d3d || !d3d->overlays)
+      return;
+
    for (i = 0; i < d3d->overlays_size; i++)
       d3d->overlays[i].fullscreen = enable;
 }
@@ -7528,13 +7539,14 @@ static void d3d9_hlsl_overlay_full_screen(void *data, bool enable)
 static void d3d9_hlsl_overlay_set_alpha(void *data, unsigned index, float mod)
 {
    d3d9_video_t *d3d = (d3d9_video_t*)data;
-   if (d3d)
+   if (d3d && d3d->overlays && index < d3d->overlays_size)
       d3d->overlays[index].alpha_mod = mod;
 }
 
 static const video_overlay_interface_t d3d9_hlsl_overlay_interface = {
    d3d9_hlsl_overlay_enable,
    d3d9_hlsl_overlay_load,
+   NULL, /* load_textures */
    d3d9_hlsl_overlay_tex_geom,
    d3d9_hlsl_overlay_vertex_geom,
    d3d9_hlsl_overlay_full_screen,
@@ -8279,7 +8291,7 @@ static bool d3d9_hlsl_alive(void *data)
    d3d9_video_t *d3d     = (d3d9_video_t*)data;
 
    /* Read from local bookkeeping rather than video_st (which would
-    * acquire context_lock + display_lock).  d3d->vp.full_* is
+    * cross threads needlessly).  d3d->vp.full_* is
     * written at every set_size call site in this driver. */
    temp_width  = d3d->vp.full_width;
    temp_height = d3d->vp.full_height;

@@ -49,6 +49,7 @@ enum thread_cmd
 
    CMD_OVERLAY_ENABLE,
    CMD_OVERLAY_LOAD,
+   CMD_OVERLAY_LOAD_TEXTURES,
    CMD_OVERLAY_TEX_GEOM,
    CMD_OVERLAY_VERTEX_GEOM,
    CMD_OVERLAY_FULL_SCREEN,
@@ -123,6 +124,7 @@ typedef struct thread_packet
       struct
       {
          const struct texture_image *data;
+         const uintptr_t *textures;
          unsigned num;
       } image;
 
@@ -191,6 +193,16 @@ typedef struct thread_packet
 typedef void (*video_thread_async_done_t)(void *user, uintptr_t handle);
 typedef void (*video_thread_async_release_t)(void *img);
 
+/* What the video thread does with a node. LOAD creates a texture from
+ * img and reports the handle; UPDATE writes img into the texture whose
+ * handle the node carries, in place, and reports that handle back (0
+ * when the driver could not take the update). */
+enum video_thread_async_kind
+{
+   VIDEO_THREAD_ASYNC_LOAD = 0,
+   VIDEO_THREAD_ASYNC_UPDATE
+};
+
 typedef struct video_thread_async_load
 {
    struct video_thread_async_load *next;
@@ -200,6 +212,13 @@ typedef struct video_thread_async_load
    video_thread_async_release_t release;
    uintptr_t handle;
    enum texture_filter_type filter;
+   uint8_t kind;                   /* enum video_thread_async_kind */
+   /* The node belongs to the poster, who embeds it in a resource that
+    * outlives the post: the wrapper never frees it, and delivers
+    * done() exactly once for every accepted post, so the poster can
+    * count on getting it back. Nodes the wrapper allocates itself
+    * (video_thread_texture_load_async) have this clear. */
+   uint8_t caller_owned;
 } video_thread_async_load_t;
 
 /* Deep enough for the burst an overlay issues between two frames - one
@@ -210,6 +229,36 @@ typedef struct video_thread_async_load
  * lie, so none of it reaches a stack frame. A power of two: the index
  * wraps with a mask. */
 #define VIDEO_THREAD_DEFERRED_MAX 128
+
+/* The main thread's cost of handing a frame to the video thread,
+ * counted in CPU cycles in video_thread_frame() while the statistics
+ * overlay is shown and shown as microseconds, over windows of 120
+ * pushed frames. Time deliberately spent waiting for a free slot is
+ * kept apart from the handoff itself. */
+typedef struct video_thread_handoff_stats
+{
+   uint64_t handoff_avg_x100; /* entry to signal, wait excluded, us */
+   uint64_t handoff_worst;
+   uint64_t copy_avg_x100;    /* the frame memcpy, us */
+   uint64_t copy_worst;
+   uint64_t wait_avg_x100;    /* slot wait, us */
+   uint64_t wait_worst;
+   uint64_t bytes_per_frame;  /* copied */
+   unsigned frames_copied;    /* of the window */
+   unsigned frames_zero_copy;
+   unsigned frames_hw;
+   unsigned waits;            /* pushes that waited for a slot */
+   unsigned dropped;          /* pushes that replaced a queued frame */
+   unsigned drains;           /* holds run a period long to drain */
+   /* The core's software-framebuffer asks in the window: granted a
+    * slot, granted but pushed from elsewhere, declined because both
+    * slots were taken, declined because the frame would not fit */
+   unsigned asked;
+   unsigned lent;
+   unsigned lapsed;
+   unsigned declined_ring;
+   unsigned declined_size;
+} video_thread_handoff_stats_t;
 
 typedef struct thread_video
 {
@@ -266,6 +315,11 @@ typedef struct thread_video
     * last handoff returned. Both main-thread only. */
    retro_time_t render_time;
    retro_time_t core_time;
+   /* The last frame presented had queued behind another: the next
+    * hold runs a period longer to drain it. Video thread sets it,
+    * the hold takes it, both under 'lock'. */
+   unsigned drain_cooldown;
+   bool drain_pending;
    /* Fast-forward, from the frame info at the push: the hold stands
     * down for it. Distinct from nonblock, which vsync-off also sets. */
    bool fast_forward;
@@ -276,6 +330,20 @@ typedef struct thread_video
     * accumulated in the content's own period. Main thread. */
    retro_time_t content_due;
    retro_time_t run_start;
+   /* Handoff cost, this window and the last full one. Main thread. */
+   struct
+   {
+      uint64_t handoff_sum, handoff_max;   /* cycles */
+      uint64_t copy_sum, copy_max;
+      uint64_t wait_sum, wait_max;
+      uint64_t span_ticks, span_us;        /* the window's tick rate */
+      uint64_t bytes;
+      unsigned copied, zero_copy, hw, waits, dropped, drains;
+      unsigned asked, lent, lapsed, declined_ring, declined_size;
+      unsigned frames;
+      bool counting;                       /* overlay was up last push */
+      video_thread_handoff_stats_t last;
+   } handoff;
    bool display_pacing;
    bool present_repeat;
    /* A main-thread present_last() asks for one repeat at the next
@@ -324,12 +392,21 @@ typedef struct thread_video
     * filter; its bytes per pixel. Staged by video_thread_defer_filter() */
    unsigned filter_next;
 #endif
+   /* Main thread: the next frame pushed is in a source pixel format the
+    * driver does not take, for this thread to convert. One of
+    * enum video_thread_convert. Staged by video_thread_defer_convert() */
+   unsigned convert_next;
    /* cond_ring: ring progress (frame.pending / frame.busy changing),
     * broadcast by the video thread when it claims or completes a slot.
     * Any number of waiters, each re-testing its own predicate. */
    scond_t *cond_ring;
    scond_t *cond_thread;
    sthread_t *thread;
+   /* The video singleton's (stable) address, captured on the main
+    * thread at init: the loop and its helpers reach ra-video state
+    * through this, never through the getter, so no thread entry in
+    * this file calls into a singleton getter at all. */
+   video_driver_state_t *video_st;
 
    video_info_t info;
    const video_driver_t *driver;
@@ -343,8 +420,19 @@ typedef struct thread_video
    input_driver_t **input;
    void **input_data;
 
-   float *alpha_mod;
-   slock_t *alpha_lock;
+   /* Overlay alpha modulation, lock-free. The values are float bits
+    * in atomic ints: the main thread's set_alpha (fire-and-forget by
+    * design) stores a value relaxed and then store-releases
+    * alpha_update; the video thread's per-frame apply clears the
+    * flag with an acquire exchange BEFORE reading the values, so a
+    * set that lands mid-apply re-raises the flag and is applied
+    * whole next frame - the exchange-first order is what makes an
+    * update impossible to lose. The array pointer and alpha_mods
+    * are written only inside the CMD_OVERLAY_LOAD handler, with the
+    * main thread blocked in that command's reply wait and the video
+    * thread out of its frame call, so plain reads of both are safe
+    * everywhere. */
+   retro_atomic_int_t *alpha_mod;
 
    struct
    {
@@ -390,7 +478,7 @@ typedef struct thread_video
    enum thread_cmd send_cmd;
    enum thread_cmd reply_cmd;
 
-   bool alpha_update;
+   retro_atomic_int_t alpha_update;
 
    /* Core frames cross to the video thread through a two-slot ring so
     * the main thread's copy of frame N+1 overlaps the worker's upload
@@ -417,6 +505,10 @@ typedef struct thread_video
          /* Hardware-rendered frame: the HW ring slot it lives in, -1
           * for a software frame. See hw_ring below. */
          int hw_slot;
+         /* The push carried no pixels (the core duped): the driver is
+          * given NULL and repeats what it has, never this buffer -
+          * which holds whatever frame was last put in it, an old one. */
+         bool dupe;
          uint8_t *buffer;
          unsigned width;
          unsigned height;
@@ -431,6 +523,9 @@ typedef struct thread_video
           * it may write them again while this frame is drawn. */
          char widget_dir_assets[PATH_MAX_LENGTH];
          char widget_path_font[PATH_MAX_LENGTH];
+         /* And the two the menu's frame() watches for a change */
+         char menu_rgui_theme_preset[PATH_MAX_LENGTH];
+         char menu_dynamic_wallpapers_dir[PATH_MAX_LENGTH];
          size_t status_text_len;
 #endif
 #ifdef HAVE_VIDEO_FILTER
@@ -438,6 +533,9 @@ typedef struct thread_video
           * on: its bytes per pixel, 0 for a frame ready to draw */
          unsigned filter_bpp;
 #endif
+         /* A frame still in the core's source pixel format, for this
+          * thread to convert before the filter and the driver */
+         unsigned convert;
          /* Built by the main thread in video_thread_frame() and handed
           * to the driver's frame call by pointer on the video thread.
           * video_driver_build_info() reads video_driver_st and
@@ -573,6 +671,14 @@ bool video_thread_font_init(
       custom_font_command_method_t func,
       bool is_threaded);
 
+/* Blocking run-on-video-thread: func(data) executes on the video
+ * thread while the caller waits, or directly when the wrapper is
+ * not active. The mechanism behind video_thread_texture_handle,
+ * exported for any main-thread code that must touch video-thread-
+ * owned state. */
+uintptr_t video_thread_run_blocking(custom_command_method_t func,
+      void *data);
+
 uintptr_t video_thread_texture_handle(void *data,
       custom_command_method_t func);
 
@@ -588,6 +694,23 @@ bool video_thread_texture_load_async(void *img,
       enum texture_filter_type filter,
       video_thread_async_done_t done, void *user,
       video_thread_async_release_t release);
+
+/* Post a caller-owned node (see video_thread_async_load_t) for the
+ * video thread: kind, img, handle (UPDATE), filter (LOAD), done, user
+ * and release filled in by the caller, next left alone. The node is
+ * the wrapper's from the return until done() has run, which happens
+ * from video_thread_async_poll() on the main thread, or from the
+ * wrapper's teardown with handle 0. No allocation: this is the
+ * streaming path, one embedded node per surface. Returns false, having
+ * taken nothing, when the wrapper is not active or the caller is the
+ * video thread; the caller then runs the operation synchronously.
+ * Main thread only. */
+bool video_thread_async_post(video_thread_async_load_t *n);
+
+/* Whether the wrapped driver updates textures in place; false while
+ * no wrapper is up. video_driver_texture_can_update() asks this so a
+ * wrapper forwarder is never mistaken for a capability. */
+bool video_thread_texture_can_update(void);
 
 /* Deliver completed asynchronous uploads to their done() callbacks.
  * Main thread; video_thread_frame() calls it, callers that upload
@@ -623,6 +746,9 @@ bool video_thread_latency_stats(retro_time_t *avg, retro_time_t *worst,
  * is installed; this reads it under the wrapper's lock. Without the
  * wrapper (or from the video thread) it is the plain value. */
 uint64_t video_thread_swap_count(void);
+
+/* False when the wrapper is not active. Main thread. */
+bool video_thread_get_handoff_stats(video_thread_handoff_stats_t *out);
 
 /* On the main thread, on Cocoa: run the trampoline mode briefly so a
  * job the video thread marshalled to the main thread can run. Anywhere
@@ -666,6 +792,18 @@ void video_thread_status_text(const char *s);
  * filter on it before drawing. */
 void video_thread_defer_filter(unsigned in_bpp);
 #endif
+
+/* Source pixel formats the video thread converts on the frame's way to
+ * the driver, in place of the main thread doing so before handover */
+enum video_thread_convert
+{
+   VIDEO_THREAD_CONVERT_NONE = 0,
+   VIDEO_THREAD_CONVERT_0RGB1555,    /* to RGB565 through the scaler */
+   VIDEO_THREAD_CONVERT_XRGB2101010  /* to XRGB8888 */
+};
+
+/* Stages the next frame pushed for conversion on the video thread */
+void video_thread_defer_convert(enum video_thread_convert kind);
 
 RETRO_END_DECLS
 

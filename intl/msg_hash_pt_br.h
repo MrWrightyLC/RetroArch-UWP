@@ -2609,7 +2609,6 @@ static const struct
    char s_79b8ce4a[71];
    char s_a1a8257e[104];
    char s_282f7955[99];
-   char s_d5231783[101];
    char s_a68d6d11[48];
    char s_74022c02[103];
    char s_8abad013[89];
@@ -2757,8 +2756,6 @@ static const struct
    char s_d9153542[52];
    char s_8e48ec69[37];
    char s_cd43c108[86];
-   char s_cd46e260[106];
-   char s_cd482ffe[106];
    char s_49336383[50];
    char s_e92351d4[132];
    char s_8e22cdce[49];
@@ -3542,7 +3539,6 @@ static const struct
    char s_261210b3[80];
    char s_3a4b246c[112];
    char s_2ceab671[163];
-   char s_977f8e82[105];
    char s_3c679f0a[269];
    char s_5b059407[150];
    char s_36033606[154];
@@ -7113,8 +7109,6 @@ static const struct
    "\272do n\303\243o for carregado.",
    "Percorra essas op\303\247\303\265es para ajustar as configura\303\247\303\265es horizontais e al"
    "terar o tamanho da imagem.",
-   "Para monitores CRT apenas. Tenta usar a resolu\303\247\303\243o exata do n\303\272cleo/jogo e a "
-   "taxa de atualiza\303\247\303\243o.",
    "Alterna entre resolu\303\247\303\265es nativas e ultrawide.",
    "Use uma taxa de atualiza\303\247\303\243o personalizada especificada no arquivo de configura\303"
    "\247\303\243o, se necess\303\241rio.",
@@ -7333,10 +7327,6 @@ static const struct
    "Salva um save state no slot atualmente selecionado.",
    "Salva uma imagem do conte\303\272do atual.",
    "Mant\303\251m o shader selecionado ativado/desativado enquanto a tecla estiver pressionada.",
-   "Carrega e aplica o arquivo de predefini\303\247\303\243o do shader anterior na raiz do diret\303"
-   "\263rio \"Shader de v\303\255deo\".",
-   "Carrega e aplica o arquivo de predefini\303\247\303\243o do shader anterior na raiz do diret\303"
-   "\263rio \"Shader de v\303\255deo\".",
    "Liga/desliga o sombreador atualmente selecionado.",
    "Habilita a c\303\242mera lenta enquanto a tecla \303\251 pressionada. O conte\303\272do \303\251"
    " executado na velocidade normal quando a tecla \303\251 liberada.",
@@ -8595,8 +8585,6 @@ static const struct
    "Salva uma predefini\303\247\303\243o do Shader com um link para a predefini\303\247\303\243o ori"
    "ginal que j\303\241 est\303\241 carregada e inclui apenas as altera\303\247\303\265es que voc"
    "\303\252 fez no par\303\242metro.",
-   "Abre o Navegador de Arquivos no \303\272ltimo diret\303\263rio usado ao carregar predefini\303"
-   "\247\303\265es e passes de shader.",
    "AVISO: Tremula\303\247\303\243o r\303\241pida pode causar persist\303\252ncia de imagem em algum"
    "as telas. Use por sua conta em risco // Simula uma varredura b\303\241sica sobre v\303\241rios s"
    "ubquadros dividindo a tela verticalmente e renderizando cada parte da tela de acordo com quantos"
@@ -9293,7 +9281,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_pt_br_blob_check[
-      (sizeof(msg_hash_pt_br_blob) == (194720u
+      (sizeof(msg_hash_pt_br_blob) == (194302u
 #ifdef ANDROID
        + 352u
 #endif
@@ -12309,7 +12297,6 @@ static const uint32_t msg_hash_pt_br_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCHRES_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_HIRES_MENU,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_PORCH_ADJUST,
-   (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_SUPER,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_USE_CUSTOM_REFRESH_RATE,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_VERTICAL_ADJUST,
@@ -12457,8 +12444,6 @@ static const uint32_t msg_hash_pt_br_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SAVE_STATE_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SCREENSHOT,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_HOLD,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_NEXT,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_PREV,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_TOGGLE,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_HOLD_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_KEY,
@@ -13242,7 +13227,6 @@ static const uint32_t msg_hash_pt_br_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_GLOBAL,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_PARENT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_REFERENCE,
-   (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_REMEMBER_LAST_DIR,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_SUBFRAMES,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHARED_CONTEXT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SMOOTH,

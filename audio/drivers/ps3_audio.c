@@ -16,7 +16,9 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <malloc.h>
 
+#include <retro_atomic.h>
 #include <retro_spsc.h>
 
 #include <defines/ps3_defines.h>
@@ -50,7 +52,24 @@ typedef struct
    uint32_t audio_port;
    bool nonblock;
    bool started;
-   volatile bool quit_thread;
+   /* Set by the thread tearing the driver down, read by the output
+    * thread's loop. An atomic and not a volatile bool: volatile orders
+    * nothing between the two. */
+   retro_atomic_int_t quit_thread;
+   /* Blocks the output thread had nothing for and sent as silence. */
+   retro_atomic_size_t underruns;
+   /* One block, handed to audioAddData() as it comes out of the ring.
+    * On the heap and not the output thread's stack: that thread is
+    * created with 4 KiB, which a stereo block already half fills and
+    * a six channel one would run straight past. Aligned as the stack
+    * copy was. */
+   float *out_block;
+   size_t out_block_size;
+   /* The layout asked for, and the channels the port was opened with.
+    * They agree unless the port refused the count, which is what
+    * layout() reports on. */
+   uint32_t layout;
+   unsigned channels;
 } ps3_audio_t;
 
 
@@ -60,27 +79,30 @@ static void ps3_event_loop(void *data)
 static void ps3_event_loop(uint64_t data)
 #endif
 {
-   float out_tmp[AUDIO_BLOCK_SAMPLES * AUDIO_CHANNELS]
-      __attribute__((aligned(16)));
    sys_event_queue_t id;
    sys_ipc_key_t key;
    sys_event_t event;
    ps3_audio_t *aud = (ps3_audio_t*)(uintptr_t)data;
+   float *out_block = aud->out_block;
+   size_t block     = aud->out_block_size;
 
    audioCreateNotifyEventQueue(&id, &key);
    audioSetNotifyEventQueue(key);
 
-   while (!aud->quit_thread)
+   while (!retro_atomic_load_acquire_int(&aud->quit_thread))
    {
       sysEventQueueReceive(id, &event, PS3_SYS_NO_TIMEOUT);
 
-      if (retro_spsc_read_avail(&aud->ring) >= sizeof(out_tmp))
-         retro_spsc_read(&aud->ring, out_tmp, sizeof(out_tmp));
+      if (retro_spsc_read_avail(&aud->ring) >= block)
+         retro_spsc_read(&aud->ring, out_block, block);
       else
-         memset(out_tmp, 0, sizeof(out_tmp));
+      {
+         memset(out_block, 0, block);
+         retro_atomic_fetch_add_size(&aud->underruns, 1);
+      }
       sysLwCondSignal(&aud->cond);
 
-      audioAddData(aud->audio_port, out_tmp,
+      audioAddData(aud->audio_port, out_block,
             AUDIO_BLOCK_SAMPLES, 1.0);
    }
 
@@ -92,6 +114,7 @@ static void *ps3_audio_init(const char *device,
       unsigned rate, unsigned latency,
       unsigned *new_rate)
 {
+   unsigned channels;
    audioPortParam params;
    ps3_audio_t *data                 = NULL;
 #ifdef __PSL1GHT__
@@ -112,7 +135,16 @@ static void *ps3_audio_init(const char *device,
 
    audioInit();
 
-   params.numChannels                = AUDIO_CHANNELS;
+   /* The layout the frontend wants, where the port takes that many
+    * channels: libaudio opens two, six or eight, so a four channel
+    * mask is not one of them and opens as stereo. layout() reports
+    * what was granted. */
+   data->layout                      = audio_driver_requested_layout();
+   channels                          = audio_layout_channels(data->layout);
+   if (channels != 2 && channels != 6 && channels != 8)
+      channels                       = AUDIO_CHANNELS;
+
+   params.numChannels                = channels;
    params.numBlocks                  = AUDIO_BLOCKS;
    params.param_attrib               = 0;
 #if 0
@@ -124,16 +156,40 @@ static void *ps3_audio_init(const char *device,
 
    if (audioPortOpen(&params, &data->audio_port) != CELL_OK)
    {
+      /* A port that would not take the wider count still takes two. */
+      if (channels == AUDIO_CHANNELS)
+      {
+         audioQuit();
+         free(data);
+         return NULL;
+      }
+      channels           = AUDIO_CHANNELS;
+      params.numChannels = channels;
+      if (audioPortOpen(&params, &data->audio_port) != CELL_OK)
+      {
+         audioQuit();
+         free(data);
+         return NULL;
+      }
+   }
+   data->channels  = channels;
+
+   data->out_block_size = AUDIO_BLOCK_SAMPLES * channels * sizeof(float);
+   data->out_block      = (float*)memalign(16, data->out_block_size);
+   if (!data->out_block)
+   {
+      audioPortClose(data->audio_port);
       audioQuit();
       free(data);
       return NULL;
    }
 
    data->ring_size = AUDIO_BLOCK_SAMPLES *
-         AUDIO_CHANNELS * AUDIO_BLOCKS * sizeof(float);
+         channels * AUDIO_BLOCKS * sizeof(float);
    data->ring_init = retro_spsc_init(&data->ring, data->ring_size);
    if (!data->ring_init)
    {
+      free(data->out_block);
       audioPortClose(data->audio_port);
       audioQuit();
       free(data);
@@ -145,6 +201,8 @@ static void *ps3_audio_init(const char *device,
 
    audioPortStart(data->audio_port);
    data->started = true;
+   retro_atomic_int_init(&data->quit_thread, 0);
+   retro_atomic_size_init(&data->underruns, 0);
    sysThreadCreate(&data->thread, ps3_event_loop,
 #ifdef __PSL1GHT__
    data,
@@ -190,7 +248,8 @@ static ssize_t ps3_audio_write(void *data, const void *s, size_t len)
       int laps = PS3_AUDIO_WAIT_LAPS;
       while (ps3_audio_write_avail(aud) < len)
       {
-         if (!aud->started || aud->quit_thread)
+         if (      !aud->started
+               || retro_atomic_load_acquire_int(&aud->quit_thread))
             return 0;
          ps3_audio_wait_block(aud);
          if (--laps < 0)
@@ -244,7 +303,7 @@ static void ps3_audio_free(void *data)
    uint64_t val;
    ps3_audio_t *aud = data;
 
-   aud->quit_thread = true;
+   retro_atomic_store_release_int(&aud->quit_thread, 1);
    ps3_audio_start(aud, false);
    sysThreadJoin(aud->thread, &val);
 
@@ -257,6 +316,7 @@ static void ps3_audio_free(void *data)
    sysLwMutexDestroy(&aud->cond_lock);
    sysLwCondDestroy(&aud->cond);
 
+   free(aud->out_block);
    free(data);
 }
 
@@ -293,7 +353,8 @@ static size_t ps3_audio_wait_writable(void *data, size_t len)
 
    for (;;)
    {
-      if (!aud->started || aud->quit_thread)
+      if (      !aud->started
+            || retro_atomic_load_acquire_int(&aud->quit_thread))
          return 0;
       avail = ps3_audio_write_avail(aud);
       if (avail >= len)
@@ -305,6 +366,20 @@ static size_t ps3_audio_wait_writable(void *data, size_t len)
       if (--laps < 0)
          return 0;
    }
+}
+
+static uint32_t ps3_audio_layout(void *data)
+{
+   ps3_audio_t *aud = (ps3_audio_t*)data;
+   if (!aud || aud->channels != audio_layout_channels(aud->layout))
+      return AUDIO_LAYOUT_STEREO;
+   return aud->layout;
+}
+
+static size_t ps3_audio_underruns(void *data)
+{
+   ps3_audio_t *aud = (ps3_audio_t*)data;
+   return aud ? retro_atomic_load_acquire_size(&aud->underruns) : 0;
 }
 
 audio_driver_t audio_ps3 = {
@@ -322,5 +397,8 @@ audio_driver_t audio_ps3 = {
    ps3_audio_write_avail,
    ps3_audio_buffer_size,
    NULL, /* write_raw */
-   ps3_audio_wait_writable
+   ps3_audio_wait_writable,
+   NULL, /* frames_consumed */
+   ps3_audio_underruns,
+   ps3_audio_layout
 };

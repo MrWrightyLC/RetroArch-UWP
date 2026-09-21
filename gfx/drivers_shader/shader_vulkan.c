@@ -971,6 +971,7 @@ struct vulkan_filter_chain
    void *queue_lock_handle;
    void (*lock_queue)(void *handle);
    void (*unlock_queue)(void *handle);
+   void (*wait_submissions)(void *handle);
 };
 
 static INLINE void slang_chain_lock_queue(struct vulkan_filter_chain *chain)
@@ -1539,6 +1540,7 @@ static struct vulkan_filter_chain *slang_chain_new(
    chain->original_format   = info->original_format;
    chain->queue_lock_handle = info->queue_lock_handle;
    chain->lock_queue        = info->lock_queue;
+   chain->wait_submissions  = info->wait_submissions;
    chain->unlock_queue      = info->unlock_queue;
    common_resources_init(&chain->common, info->device,
          info->memory_properties);
@@ -1654,16 +1656,24 @@ static void slang_chain_execute_deferred(struct vulkan_filter_chain *chain)
 
 static void slang_chain_flush(struct vulkan_filter_chain *chain)
 {
-   /* vkDeviceWaitIdle is specified as vkQueueWaitIdle on every queue,
-    * and so needs the same external synchronisation a submit does.
-    * Nothing weaker than holding the lock across the wait satisfies
-    * that, which does mean vkQueuePresentKHR blocks for the duration
-    * (see the TDR note in vulkan_common.c) -- acceptable here because
-    * every caller is a chain teardown or rebuild, never a per-frame
-    * path. */
-   slang_chain_lock_queue(chain);
-   vkDeviceWaitIdle(chain->device);
-   slang_chain_unlock_queue(chain);
+   /* Every caller is a chain teardown or rebuild, and what it has to
+    * outlive is the frames that still reference the chain's images,
+    * buffers and descriptor sets: the video driver's own submissions,
+    * which it can wait on by fence without touching the queue. That
+    * is what wait_submissions does. Only a driver that gave none
+    * gets the device drained, and that is specified as vkQueueWaitIdle
+    * on every queue, so it takes the lock a submit does - and blocks
+    * vkQueuePresentKHR for the duration, and cannot complete while a
+    * hardware core waiting on that same lock still has work to submit
+    * that the queue is waiting for. */
+   if (chain->wait_submissions)
+      chain->wait_submissions(chain->queue_lock_handle);
+   else
+   {
+      slang_chain_lock_queue(chain);
+      vkDeviceWaitIdle(chain->device);
+      slang_chain_unlock_queue(chain);
+   }
    slang_chain_execute_deferred(chain);
 }
 
@@ -2903,7 +2913,7 @@ static void slang_pass_get_output_size(struct slang_pass *pass,
          break;
 
       case GLSLANG_FILTER_CHAIN_SCALE_VIEWPORT:
-         width = (retroarch_get_rotation() % 2 ? pass->curr_vp.height : pass->curr_vp.width) * pass->pass_info.scale_x;
+         width = (pass->common->rotation % 2 ? pass->curr_vp.height : pass->curr_vp.width) * pass->pass_info.scale_x;
          break;
 
       case GLSLANG_FILTER_CHAIN_SCALE_ABSOLUTE:
@@ -2925,7 +2935,7 @@ static void slang_pass_get_output_size(struct slang_pass *pass,
          break;
 
       case GLSLANG_FILTER_CHAIN_SCALE_VIEWPORT:
-         height = (retroarch_get_rotation() % 2 ? pass->curr_vp.width : pass->curr_vp.height) * pass->pass_info.scale_y;
+         height = (pass->common->rotation % 2 ? pass->curr_vp.width : pass->curr_vp.height) * pass->pass_info.scale_y;
          break;
 
       case GLSLANG_FILTER_CHAIN_SCALE_ABSOLUTE:
@@ -3609,7 +3619,7 @@ static bool slang_pass_build(struct slang_pass *pass)
       if (g->uniform || g->push_constant ||
           a->uniform || a->push_constant ||
           r->uniform || r->push_constant)
-         input_state_get_ptr()->shader_uses_sensors = true;
+         input_driver_set_shader_uses_sensors(true);
    }
 
    /* Filter out pass->parameters which we will never use anyways.
@@ -3926,16 +3936,17 @@ static void slang_pass_build_semantics(struct slang_pass *pass,
                       pass->common->hdr10);
 #endif /* VULKAN_HDR_SWAPCHAIN */
 
-   /* Sensor uniforms — per-frame snapshot cached
-    * by input_driver_poll() on the main thread */
+   /* Sensor uniforms — one coherent seqlock'd snapshot of the values
+    * input_driver_poll() published on the main thread. */
    {
-      input_driver_state_t *input_st = input_state_get_ptr();
+      float gyro[3], accel[3], rest[3];
+      input_driver_read_sensor_snapshot(gyro, accel, rest);
       slang_pass_build_semantic_vec3(pass, buffer, SLANG_SEMANTIC_GYROSCOPE,
-                        input_st->sensor_gyroscope_cache);
+                        gyro);
       slang_pass_build_semantic_vec3(pass, buffer, SLANG_SEMANTIC_ACCELEROMETER,
-                        input_st->sensor_accelerometer_cache);
+                        accel);
       slang_pass_build_semantic_vec3(pass, buffer, SLANG_SEMANTIC_ACCELEROMETER_REST,
-                        input_st->sensor_accelerometer_rest);
+                        rest);
    }
 
    /* Standard inputs */
@@ -5018,7 +5029,7 @@ void vulkan_filter_chain_free(
       vulkan_filter_chain_t *chain)
 {
    slang_chain_free(chain);
-   input_state_get_ptr()->shader_uses_sensors = false;
+   input_driver_set_shader_uses_sensors(false);
 }
 
 void vulkan_filter_chain_set_shader(
