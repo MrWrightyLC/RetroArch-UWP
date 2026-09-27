@@ -25,6 +25,11 @@
 #include "../../retroarch.h"
 #include "../../verbosity.h"
 
+/* libctru defines this from 1.5 on; it is the SoC clock by sixteen. */
+#ifndef SYSCLOCK_ARM11
+#define SYSCLOCK_ARM11 (16756991u * 8u * 2u)
+#endif
+
 /* The rate the channel is set to and the rate the frontend is told,
  * which have to be the one number: the channel interpolates with
  * NDSP_INTERP_NONE, so anything the frontend resamples to that the
@@ -69,8 +74,7 @@ typedef struct
    uint64_t clk_anchor_tick;
    int      clk_have_anchor;
    double   clk_sx, clk_sy, clk_sxx, clk_sxy, clk_n;
-   retro_atomic_int_t clk_ppm;
-   retro_atomic_int_t clk_valid;
+   retro_atomic_int_t clk_ppm; /* AUDIO_CLOCK_PPM_NONE until known */
    bool nonblock;
    bool playing;
 } ctr_dsp_audio_t;
@@ -100,7 +104,7 @@ static void ctr_dsp_audio_clock_sample(ctr_dsp_audio_t *ctr, uint32_t frames)
       ctr->clk_have_anchor = 1;
       ctr->clk_sx = ctr->clk_sy = ctr->clk_sxx = ctr->clk_sxy
                   = ctr->clk_n = 0.0;
-      retro_atomic_store_release_int(&ctr->clk_valid, 0);
+      retro_atomic_store_release_int(&ctr->clk_ppm, AUDIO_CLOCK_PPM_NONE);
       return;
    }
 
@@ -130,7 +134,6 @@ static void ctr_dsp_audio_clock_sample(ctr_dsp_audio_t *ctr, uint32_t frames)
       if (ppm > -100000.0 && ppm < 100000.0)
       {
          retro_atomic_store_release_int(&ctr->clk_ppm, (int)ppm);
-         retro_atomic_store_release_int(&ctr->clk_valid, 1);
       }
    }
 }
@@ -181,6 +184,7 @@ static void *ctr_dsp_audio_init(const char *device, unsigned rate, unsigned late
       ndspExit();
       return NULL;
    }
+   retro_atomic_int_init(&ctr->clk_ppm, AUDIO_CLOCK_PPM_NONE);
    LightEvent_Init(&ctr->frame_event, RESET_ONESHOT);
    ndspSetCallback(ctr_dsp_audio_frame_cb, ctr);
 
@@ -235,6 +239,30 @@ static void ctr_dsp_audio_free(void *data)
  * stopped one takes to be noticed. */
 #define CTR_DSP_AUDIO_STALL_TIMEOUT_NS 256000000LL
 #define CTR_DSP_AUDIO_WAIT_WRITABLE_LAPS 8
+
+/* LightEvent_WaitTimeout() is libctru 2's; on 1.x the wait is the
+ * try-wait polled in slices short against the DSP's frame. Non-zero is
+ * the timeout either way. */
+#ifdef USE_CTRULIB_2
+#define ctr_dsp_audio_frame_wait(ctr, ns) \
+   LightEvent_WaitTimeout(&(ctr)->frame_event, (ns))
+#else
+#define CTR_DSP_AUDIO_POLL_SLICE_NS 500000LL
+
+static int ctr_dsp_audio_frame_wait(ctr_dsp_audio_t *ctr, s64 timeout_ns)
+{
+   s64 left = timeout_ns;
+
+   while (left > 0)
+   {
+      if (LightEvent_TryWait(&ctr->frame_event))
+         return 0;
+      svcSleepThread(CTR_DSP_AUDIO_POLL_SLICE_NS);
+      left -= CTR_DSP_AUDIO_POLL_SLICE_NS;
+   }
+   return 1;
+}
+#endif
 
 static ssize_t ctr_dsp_audio_write(void *data, const void *buf, size_t len)
 {
@@ -376,8 +404,7 @@ static size_t ctr_dsp_audio_wait_writable(void *data, size_t len)
       if (--laps < 0)
          break;
       /* Non-zero is the timeout. */
-      if (LightEvent_WaitTimeout(&ctr->frame_event,
-               CTR_DSP_AUDIO_STALL_TIMEOUT_NS))
+      if (ctr_dsp_audio_frame_wait(ctr, CTR_DSP_AUDIO_STALL_TIMEOUT_NS))
          break;
    }
    return 0;
@@ -395,9 +422,13 @@ static size_t ctr_dsp_audio_buffer_size(void *data)
 static bool ctr_dsp_audio_device_clock_ppm(void *data, double *ppm)
 {
    ctr_dsp_audio_t *ctr = (ctr_dsp_audio_t*)data;
-   if (!ctr || !retro_atomic_load_acquire_int(&ctr->clk_valid))
+   int v;
+   if (!ctr)
       return false;
-   *ppm = (double)retro_atomic_load_acquire_int(&ctr->clk_ppm);
+   v = retro_atomic_load_acquire_int(&ctr->clk_ppm);
+   if (v == AUDIO_CLOCK_PPM_NONE)
+      return false;
+   *ppm = (double)v;
    return true;
 }
 

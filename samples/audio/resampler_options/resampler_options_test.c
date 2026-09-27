@@ -80,6 +80,36 @@ static void sinc_cases(void)
    }
    driver->free(state);
 #endif
+#ifdef HAVE_CC_RESAMPLER
+   /* The blocks above leave state freed; realloc would free it again. */
+   state = NULL; driver = NULL;
+   /* CC reads neither quality nor the HQ request; both must still
+    * reach it as the named backend, and both must give one stream. */
+   CHECK(retro_resampler_realloc_hq(&state, &driver, "cc", RESAMPLER_QUALITY_NORMAL, 4, true));
+   CHECK(driver == &CC_resampler);
+   {
+      void *reference = CC_resampler.init(NULL, 4, RESAMPLER_QUALITY_HIGHEST, 0);
+      if (!reference || !state) exit(2);
+      compare(state, driver, reference, &CC_resampler, 4);
+      CC_resampler.free(reference);
+   }
+   driver->free(state);
+   /* A nominal ratio CC cannot serve is refused at init, as sinc
+    * refuses one its phase clock cannot advance on. */
+   state = NULL; driver = NULL;
+   CHECK(!retro_resampler_realloc(&state, &driver, "cc", RESAMPLER_QUALITY_NORMAL, 0.0));
+   CHECK(!state && !driver);
+   CHECK(!retro_resampler_realloc(&state, &driver, "cc", RESAMPLER_QUALITY_NORMAL, -1.5));
+   CHECK(!state && !driver);
+   CHECK(!retro_resampler_realloc(&state, &driver, "cc", RESAMPLER_QUALITY_NORMAL, 1.0e9));
+   CHECK(!state && !driver);
+   state = NULL; driver = NULL;
+   CHECK(retro_resampler_realloc(&state, &driver, "CC", RESAMPLER_QUALITY_LOWEST, 0.5));
+   CHECK(driver == &CC_resampler);
+   if (state)
+      driver->free(state);
+   state = NULL; driver = NULL;
+#endif
 }
 
 static void independent_instances(void)
@@ -101,10 +131,32 @@ static void independent_instances(void)
    on_driver->free(on);
 }
 
+/* What the frontend offers a control for. A name nothing is registered
+ * under reports the fallback's, as the realloc lookup does. */
+static void caps_cases(void)
+{
+   CHECK(sinc_resampler.caps
+         == (RESAMPLER_CAP_QUALITY | RESAMPLER_CAP_HQ_OVERSAMPLE));
+   CHECK(audio_resampler_driver_caps("sinc") == sinc_resampler.caps);
+   CHECK(audio_resampler_driver_caps("SINC") == sinc_resampler.caps);
+   CHECK(audio_resampler_driver_caps(NULL) == sinc_resampler.caps);
+   CHECK(audio_resampler_driver_caps("missing-backend") == sinc_resampler.caps);
+#ifdef HAVE_NEAREST_RESAMPLER
+   CHECK(nearest_resampler.caps == 0);
+   CHECK(audio_resampler_driver_caps("nearest") == 0);
+#endif
+#ifdef HAVE_CC_RESAMPLER
+   CHECK(CC_resampler.caps == 0);
+   CHECK(audio_resampler_driver_caps("cc") == 0);
+   CHECK(audio_resampler_driver_caps("CC") == 0);
+#endif
+}
+
 int main(void)
 {
    unsigned i;
    for (i = 0; i < 512 * 2; i++) input[i] = ((int)(i % 71) - 35) / 64.0f;
+   caps_cases();
    sinc_cases();
    independent_instances();
    printf("Resampler options: %u failures\n", failures);

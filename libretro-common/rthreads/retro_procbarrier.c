@@ -48,6 +48,8 @@
  *                      kick_process(), which is an IPI.
  */
 
+#include <retro_posix_source.h>
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -81,7 +83,7 @@
 #include <windows.h>
 #endif
 
-#if defined(PB_LINUX) || defined(PB_FREEBSD_MEMBARRIER) || defined(PB_DARWIN)
+#if defined(PB_LINUX) || defined(PB_FREEBSD) || defined(PB_DARWIN)
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>

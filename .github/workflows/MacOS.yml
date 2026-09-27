@@ -53,6 +53,37 @@ jobs:
         fi
         exit "$rc"
 
+    - name: iCloud Drive cloud sync driver
+      run: |
+        set -o pipefail
+        # Includes network/cloud_sync/icloud_drive.m, with the iCloud
+        # container redirected to a temporary directory. Cloud sync
+        # waits for every request to report exactly once: a read whose
+        # local file could not be created never reported (the sync
+        # hung), and a cloud file that could not be loaded or a local
+        # file that could not be read reported twice. With iCloud
+        # unavailable, read and delete reported success. Also covers
+        # the ordinary read, missing file, upload and delete paths.
+        cd samples/network/icloud_drive
+        make clean check SANITIZER=address,undefined
+
+    - name: iCloud (CloudKit) cloud sync driver
+      run: |
+        set -o pipefail
+        # Includes network/cloud_sync/icloud.m, with CloudKit replaced by
+        # an in-memory database (+[CKContainer defaultContainer] is
+        # overridden in a category; real CKRecord/CKAsset/CKQuery). A
+        # read whose local file could not be written, or whose record
+        # held no readable data, reported success; an upload whose
+        # lookup failed created a duplicate record; a delete reported
+        # success before its deletes were sent, whatever became of
+        # them; and non-destructive sync was ignored. Checks each case,
+        # that deletes and uploads keep <path>-<time> with destructive
+        # sync off (and not for destructive sync or the manifest), and
+        # that every request reports exactly once.
+        cd samples/network/icloud_cloudkit
+        make clean check SANITIZER=address,undefined
+
     - name: Compile RA
       run: |
         set -o pipefail

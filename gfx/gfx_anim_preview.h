@@ -39,11 +39,14 @@
  * time (gfx_thumbnail runs them on its worker; a companion on its
  * animation thread). audio_* run on the main thread (the mixer). */
 
+#include <retro_atomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <boolean.h>
 #include <formats/image.h>
 #include <retro_common_api.h>
+
+#include "video_defines.h"   /* VIDEO_SCALE_PACK */
 
 RETRO_BEGIN_DECLS
 
@@ -78,7 +81,8 @@ typedef struct gfx_anim_preview
    const uint8_t *base;          /* mapping base (dt) */
    size_t len;                   /* full logical file length */
    enum image_type_enum type;
-   unsigned width, height;
+   /* Both axes in one word, VIDEO_SCALE_PACK's layout. */
+   unsigned dims;
    int num_frames, loop_count;
    bool windowed;                /* dt is a sliding window (reserved) */
    /* Feed geometry for this session. The video types size these to
@@ -86,6 +90,12 @@ typedef struct gfx_anim_preview
     * the frame-indexed types keep the fixed constants. */
    size_t feed_ahead;
    size_t feed_back;
+   /* Where the resident window ended after the last feed: how far
+    * ahead of the decoder the feed still is, before this tick's. */
+   size_t feed_res_hi;
+   /* bytes the window holds, as of the last feed; any thread reads it */
+   retro_atomic_int_t resident_seen;
+   size_t feed_tell;    /* the decoder's position at the last feed */
    /* Whether the stream emits ARGB words (asked once at open; a stream
     * that honours it keeps that order for the whole animation, and
     * some - APNG - report "no" to a repeat request after the first
@@ -96,6 +106,7 @@ typedef struct gfx_anim_preview
    /* preview audio (WEBM / MP4), main thread */
    struct data_transfer *audio_dt;
    size_t audio_hi;
+   size_t audio_tell;   /* the decoder's position at the last feed */
    int    audio_slot;
 } gfx_anim_preview_t;
 

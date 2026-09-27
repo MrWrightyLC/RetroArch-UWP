@@ -414,7 +414,7 @@ typedef struct gfx_thumb_anim_job
                                         NULL when not windowed        */
    uint32_t *frame;                  /* a surface slot: upload-ready
                                         pixels, job i writes slot i   */
-   unsigned  width, height;
+   unsigned  dims;                   /* VIDEO_SCALE_PACK, the surface's */
    int       duration_ms;            /* of the READY frame             */
    int32_t   loops_left;             /* worker-maintained, -1 infinite */
    /* enum gfx_thumb_anim_job_status. Atomic: the per-vsync poll
@@ -534,7 +534,7 @@ static bool gfx_thumbnail_anim_job_step(gfx_thumb_anim_job_t *job)
          return false;
    }
 
-   n = (size_t)job->width * job->height;
+   n = (size_t)VIDEO_SCALE_W(job->dims) * VIDEO_SCALE_H(job->dims);
    GFX_INSTR_INC(GFX_INSTR_ANIM_FRAME);
    if (direct && frame == job->frame)
    {
@@ -632,10 +632,25 @@ fail:
    return false;
 }
 
+/* The threads the preview may use now: the setting, unless a core is
+ * running under the menu - content loaded and not paused - in which
+ * case one, so that a 4K preview does not take the cores the game is
+ * on. The preview then decodes as it did without the setting; the
+ * pool is torn down and remade as the count changes. */
+static int gfx_thumbnail_anim_threads_wanted(void)
+{
+   int wanted = (int)config_get_ptr()->uints.menu_thumbnail_preview_threads;
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   if (     (runloop_st->flags & RUNLOOP_FLAG_CORE_RUNNING)
+         && !(runloop_st->flags & RUNLOOP_FLAG_PAUSED))
+      return 1;
+   return wanted;
+}
+
 static void gfx_thumbnail_anim_job_enqueue(gfx_thumb_anim_job_t *job)
 {
    retro_atomic_store_relaxed_int(&gfx_thumb_blit_wanted,
-         (int)config_get_ptr()->uints.menu_thumbnail_preview_threads);
+         gfx_thumbnail_anim_threads_wanted());
    slock_lock(gfx_thumb_worker_lock);
    retro_atomic_store_relaxed_int(&job->status, GFX_THUMB_JOB_QUEUED);
    job->next   = NULL;
@@ -761,6 +776,8 @@ static void gfx_thumbnail_anim_close(gfx_thumbnail_t *thumbnail)
    thumbnail->anim_dt         = NULL;
    thumbnail->anim_buf_len    = 0;
    thumbnail->anim_next_us    = 0;
+   /* A new stream starts on the clock. */
+   thumbnail->flags          &= ~GFX_THUMB_FLAG_ANIM_BEHIND;
    thumbnail->anim_loops_left = 0;
    thumbnail->anim_type       = 0;
    thumbnail->anim_read_pending = 0;
@@ -1030,10 +1047,9 @@ static void gfx_thumbnail_anim_shown(gfx_thumbnail_t *thumbnail,
       thumbnail->flags |= GFX_THUMB_FLAG_TEX_SURFACE;
    }
    thumbnail->texture = s->handle;
-   thumbnail->width   = s->width;
-   thumbnail->height  = s->height;
+   thumbnail->dims    = s->dims;
    /* Release-store pairs with the acquire-load in the draw path:
-    * texture/width/height are visible before AVAILABLE is. */
+    * texture and dims are visible before AVAILABLE is. */
    if (GFX_THUMB_STATUS_LOAD(&thumbnail->status) ==
          GFX_THUMBNAIL_STATUS_PENDING)
    {
@@ -1103,11 +1119,11 @@ static void gfx_thumbnail_anim_slot_release(void *user, gfx_surface_t *s,
  * is replaced; its texture goes with it, so the caller only asks for
  * one when a frame is about to be shown. */
 static gfx_surface_t *gfx_thumbnail_anim_surface(gfx_thumbnail_t *thumbnail,
-      unsigned width, unsigned height, unsigned num_slots)
+      unsigned dims, unsigned num_slots)
 {
    gfx_surface_t *s = (gfx_surface_t*)thumbnail->anim_surface;
    if (     s
-         && (s->width != width || s->height != height
+         && (s->dims != dims
             || s->num_slots < num_slots
             || (!num_slots && s->num_slots)))
    {
@@ -1128,9 +1144,9 @@ static gfx_surface_t *gfx_thumbnail_anim_surface(gfx_thumbnail_t *thumbnail,
        * a surface with no storage of its own: a still, whose pixels
        * the load task owns until the upload has taken them. */
       s = num_slots
-         ? gfx_surface_new(width, height, num_slots, TEXTURE_FILTER_LINEAR,
+         ? gfx_surface_new(dims, num_slots, TEXTURE_FILTER_LINEAR,
                gfx_thumbnail_anim_slot_release, thumbnail)
-         : gfx_surface_new_static(width, height,
+         : gfx_surface_new_static(dims,
                gfx_display_texture_filter());
       thumbnail->anim_surface = s;
    }
@@ -1143,6 +1159,8 @@ static gfx_surface_t *gfx_thumbnail_anim_surface(gfx_thumbnail_t *thumbnail,
 static void gfx_thumbnail_anim_schedule(gfx_thumbnail_t *thumbnail,
       int duration_ms, int64_t now)
 {
+   int behind = 0;
+
    if (duration_ms <= 0)
       duration_ms = GFX_THUMB_ANIM_DUR_DEFAULT;
    else if (duration_ms < GFX_THUMB_ANIM_DUR_MIN)
@@ -1157,7 +1175,27 @@ static void gfx_thumbnail_anim_schedule(gfx_thumbnail_t *thumbnail,
    {
       thumbnail->anim_next_us += (int64_t)duration_ms * 1000;
       if (thumbnail->anim_next_us < now)
+      {
+         /* This frame landed after the next one was already due: the
+          * decode is slower than the file's rate. Rather than show
+          * every frame late - a 4K stream turned into slow motion -
+          * ask the stream to pass over the pictures nothing
+          * references until it is back on the clock. What is shown
+          * is decoded exactly as it would have been. */
+         behind = 1;
          thumbnail->anim_next_us = now + (int64_t)duration_ms * 1000;
+      }
+   }
+
+   if (behind != !!(thumbnail->flags & GFX_THUMB_FLAG_ANIM_BEHIND))
+   {
+      if (behind)
+         thumbnail->flags |= GFX_THUMB_FLAG_ANIM_BEHIND;
+      else
+         thumbnail->flags &= ~GFX_THUMB_FLAG_ANIM_BEHIND;
+      if (thumbnail->anim)
+         image_transfer_anim_stream_set_catchup(thumbnail->anim,
+               (enum image_type_enum)thumbnail->anim_type, behind);
    }
 }
 
@@ -1332,8 +1370,10 @@ void gfx_thumbnail_animate(gfx_thumbnail_t *thumbnail,
             /* The jobs decode straight into the surface's two slots,
              * which the video thread later uploads from where they
              * are; the block holds only the jobs. */
-            gfx_surface_t *s = gfx_thumbnail_anim_surface(thumbnail,
-                  anim_w, anim_h, 2);
+            gfx_surface_t *s = VIDEO_SCALE_FITS(anim_w, anim_h)
+               ? gfx_thumbnail_anim_surface(thumbnail,
+                  VIDEO_SCALE_PACK(anim_w, anim_h), 2)
+               : NULL;
             uint8_t *block   = s ? (uint8_t*)calloc(1,
                   2 * GFX_THUMB_ANIM_JOB_STRIDE) : NULL;
             /* Retry on a later vsync; the pair is all or nothing. */
@@ -1353,10 +1393,8 @@ void gfx_thumbnail_animate(gfx_thumbnail_t *thumbnail,
          j1->sess       = thumbnail->anim_sess;
          j0->type       = thumbnail->anim_type;
          j1->type       = thumbnail->anim_type;
-         j0->width      = anim_w;
-         j1->width      = anim_w;
-         j0->height     = anim_h;
-         j1->height     = anim_h;
+         j0->dims       = VIDEO_SCALE_PACK(anim_w, anim_h);
+         j1->dims       = j0->dims;
          j0->loops_left = thumbnail->anim_loops_left;
          j0->use_rgba   = gfx_thumbnail_use_rgba();
          retro_atomic_store_relaxed_int(&j1->status,
@@ -1483,8 +1521,9 @@ void gfx_thumbnail_animate(gfx_thumbnail_t *thumbnail,
       int num_frames  = 0, loop_count = 0;
       image_transfer_anim_stream_get_info(thumbnail->anim, type,
             &anim_w, &anim_h, &num_frames, &loop_count);
-      if (!(sync_surface = gfx_thumbnail_anim_surface(thumbnail,
-                  anim_w, anim_h, 1)))
+      if (     !VIDEO_SCALE_FITS(anim_w, anim_h)
+            || !(sync_surface = gfx_thumbnail_anim_surface(thumbnail,
+                  VIDEO_SCALE_PACK(anim_w, anim_h), 1)))
          return;
       if (sync_surface->inflight)
          return;
@@ -1545,7 +1584,7 @@ void gfx_thumbnail_animate(gfx_thumbnail_t *thumbnail,
       }
       else if (!sync_use_rgba && !sync_native_order)
       {
-         size_t i, n = (size_t)s->width * s->height;
+         size_t i, n = VIDEO_SCALE_AREA(s->dims);
          GFX_INSTR_INC(GFX_INSTR_ANIM_SWIZZLE);
          for (i = 0; i < n; i++)
          {
@@ -1614,8 +1653,10 @@ static void gfx_thumbnail_handle_upload(
     * animation below is opened either way, and its first frame
     * replaces the still if it arrives first. */
    {
-      gfx_surface_t *s = gfx_thumbnail_anim_surface(thumbnail_tag->thumbnail,
-            img->width, img->height, 0);
+      gfx_surface_t *s = VIDEO_SCALE_FITS(img->width, img->height)
+         ? gfx_thumbnail_anim_surface(thumbnail_tag->thumbnail,
+            VIDEO_SCALE_PACK(img->width, img->height), 0)
+         : NULL;
       enum gfx_surface_submit_result r = GFX_SURFACE_SUBMIT_FAILED;
 
       if (s)
@@ -1628,8 +1669,8 @@ static void gfx_thumbnail_handle_upload(
       if (r == GFX_SURFACE_SUBMIT_QUEUED)
       {
          /* Dimensions now, so layout does not wait for the handle. */
-         thumbnail_tag->thumbnail->width  = img->width;
-         thumbnail_tag->thumbnail->height = img->height;
+         thumbnail_tag->thumbnail->dims   = VIDEO_SCALE_PACK(
+               img->width, img->height);
          img = NULL;    /* the surface frees it from its release */
          goto open_anim;
       }
@@ -1855,9 +1896,8 @@ static bool gfx_thumbnail_get_path(
 static unsigned gfx_thumbnail_downscale_cap(void)
 {
    struct video_viewport vp;
-   unsigned cap = 0;
-   unsigned w   = 0;
-   unsigned h   = 0;
+   unsigned cap  = 0;
+   unsigned dims = 0;
    char desc[64];
 
    desc[0] = '\0';
@@ -1870,21 +1910,23 @@ static unsigned gfx_thumbnail_downscale_cap(void)
     * display costs nothing while windowed (the extra texels are
     * simply downsampled) and keeps the fullscreen view sharp at any
     * window size the display can reach. */
-   if (     video_driver_get_video_output_size(&w, &h, desc, sizeof(desc))
-         && (w > 0) && (h > 0))
-      cap = (w > h) ? w : h;
+   if (     video_driver_get_video_output_size(&dims, desc, sizeof(desc))
+         && (VIDEO_SCALE_W(dims) > 0) && (VIDEO_SCALE_H(dims) > 0))
+      cap = (VIDEO_SCALE_W(dims) > VIDEO_SCALE_H(dims))
+         ? VIDEO_SCALE_W(dims) : VIDEO_SCALE_H(dims);
 
    /* The display size is not always available - it depends on the
     * driver and display server - so fall back to the viewport, and
     * take the larger of the two when both are known rather than
     * assuming either bounds the other. */
-   vp.width  = 0;
-   vp.height = 0;
+   vp.dims   = 0;
 
    if (     video_driver_get_viewport_info(&vp)
-         && (vp.width > 0) && (vp.height > 0))
+         && (VIDEO_SCALE_W(vp.dims) > 0) && (VIDEO_SCALE_H(vp.dims) > 0))
    {
-      unsigned v = (vp.width > vp.height) ? vp.width : vp.height;
+      unsigned vp_w = VIDEO_SCALE_W(vp.dims);
+      unsigned vp_h = VIDEO_SCALE_H(vp.dims);
+      unsigned v    = (vp_w > vp_h) ? vp_w : vp_h;
 
       if (v > cap)
          cap = v;
@@ -2148,8 +2190,7 @@ void gfx_thumbnail_reset(gfx_thumbnail_t *thumbnail)
     * thread learn on delivery that this reset happened. */
    GFX_THUMB_STATUS_STORE(&thumbnail->status, GFX_THUMBNAIL_STATUS_UNKNOWN);
    thumbnail->texture     = 0;
-   thumbnail->width       = 0;
-   thumbnail->height      = 0;
+   thumbnail->dims        = 0;
    thumbnail->alpha       = 0.0f;
    thumbnail->delay_timer = 0.0f;
    thumbnail->flags       = 0;
@@ -2542,20 +2583,24 @@ void gfx_thumbnail_process_streams(
  * scaling within a rectangle of (width x height) */
 void gfx_thumbnail_get_draw_dimensions(
       gfx_thumbnail_t *thumbnail,
-      unsigned width, unsigned height, float scale_factor,
+      unsigned dims, float scale_factor,
       float *draw_width, float *draw_height)
 {
-   float core_aspect;
-   float display_aspect;
+   float width                    = (float)VIDEO_SCALE_W(dims);
+   float height                   = (float)VIDEO_SCALE_H(dims);
+   float thumb_w, thumb_h, dw, dh;
    float thumbnail_aspect;
+   /* thumbnail_aspect / core_aspect: 1 when the core's aspect is not
+    * applied, which leaves the sizes below as they are. */
+   float core_ratio               = 1.0f;
    video_driver_state_t *video_st = video_state_get_ptr();
 
    /* Sanity check */
    if (   !thumbnail
-       || (width             < 1)
-       || (height            < 1)
-       || (thumbnail->width  < 1)
-       || (thumbnail->height < 1))
+       || (width  < 1.0f)
+       || (height < 1.0f)
+       || (VIDEO_SCALE_W(thumbnail->dims) < 1)
+       || (VIDEO_SCALE_H(thumbnail->dims) < 1))
    {
       *draw_width  = 0.0f;
       *draw_height = 0.0f;
@@ -2564,47 +2609,35 @@ void gfx_thumbnail_get_draw_dimensions(
 
    /* Account for display/thumbnail/core aspect ratio
     * differences */
-   display_aspect   = (float)width            / (float)height;
-   thumbnail_aspect = (float)thumbnail->width / (float)thumbnail->height;
-   core_aspect      = ((thumbnail->flags & GFX_THUMB_FLAG_CORE_ASPECT)
-         && video_st && video_st->av_info.geometry.aspect_ratio > 0)
-               ? video_st->av_info.geometry.aspect_ratio
-               : thumbnail_aspect;
+   thumb_w          = (float)VIDEO_SCALE_W(thumbnail->dims);
+   thumb_h          = (float)VIDEO_SCALE_H(thumbnail->dims);
+   thumbnail_aspect = thumb_w / thumb_h;
+   if (thumbnail->flags & GFX_THUMB_FLAG_CORE_ASPECT)
+      core_ratio    = (video_st && video_st->av_info.geometry.aspect_ratio > 0)
+         ? thumbnail_aspect / video_st->av_info.geometry.aspect_ratio
+         : 1.0f;
 
-   if (thumbnail_aspect > display_aspect)
+   if (thumbnail_aspect > width / height)
    {
-      *draw_width  = (float)width;
-      *draw_height = (float)thumbnail->height * (*draw_width / (float)thumbnail->width);
-
-      if (thumbnail->flags & GFX_THUMB_FLAG_CORE_ASPECT)
+      dw = width;
+      dh = thumb_h * (dw / thumb_w) * core_ratio;
+      if ((thumbnail->flags & GFX_THUMB_FLAG_CORE_ASPECT) && dh > height)
       {
-         *draw_height = *draw_height * (thumbnail_aspect / core_aspect);
-
-         if (*draw_height > height)
-         {
-            *draw_height = (float)height;
-            *draw_width  = (float)thumbnail->width * (*draw_height / (float)thumbnail->height);
-            *draw_width  = *draw_width / (thumbnail_aspect / core_aspect);
-         }
+         dh = height;
+         dw = thumb_w * (dh / thumb_h) / core_ratio;
       }
    }
    else
    {
-      *draw_height = (float)height;
-      *draw_width  = (float)thumbnail->width * (*draw_height / (float)thumbnail->height);
-
-      if (thumbnail->flags & GFX_THUMB_FLAG_CORE_ASPECT)
-         *draw_width  = *draw_width / (thumbnail_aspect / core_aspect);
+      dh = height;
+      dw = thumb_w * (dh / thumb_h) / core_ratio;
    }
 
    /* Final overwidth check */
-   if (*draw_width > width)
+   if (dw > width)
    {
-      *draw_width  = (float)width;
-      *draw_height = (float)thumbnail->height * (*draw_width / (float)thumbnail->width);
-
-      if (thumbnail->flags & GFX_THUMB_FLAG_CORE_ASPECT)
-         *draw_height = *draw_height * (thumbnail_aspect / core_aspect);
+      dw = width;
+      dh = thumb_h * (dw / thumb_w) * core_ratio;
    }
 
    /* Account for scale factor
@@ -2614,8 +2647,8 @@ void gfx_thumbnail_get_draw_dimensions(
     *   that extends beyond the bounding box. But even if
     *   it didn't, we can't get real screen dimensions
     *   without scaling manually... */
-   *draw_width  *= scale_factor;
-   *draw_height *= scale_factor;
+   *draw_width  = dw * scale_factor;
+   *draw_height = dh * scale_factor;
 }
 
 /* Draws specified thumbnail with specified alignment
@@ -2630,14 +2663,17 @@ void gfx_thumbnail_get_draw_dimensions(
 
 void gfx_thumbnail_draw(
       void *userdata,
-      unsigned video_width,
-      unsigned video_height,
+      unsigned video_dims,
       gfx_thumbnail_t *thumbnail,
-      float x, float y, unsigned width, unsigned height,
+      float x, float y, unsigned dims,
       enum gfx_thumbnail_alignment alignment,
       float alpha, float scale_factor,
       gfx_thumbnail_shadow_t *shadow)
 {
+   unsigned video_width              = VIDEO_SCALE_W(video_dims);
+   unsigned video_height             = VIDEO_SCALE_H(video_dims);
+   unsigned width                    = VIDEO_SCALE_W(dims);
+   unsigned height                   = VIDEO_SCALE_H(dims);
    gfx_display_t            *p_disp  = disp_get_ptr();
    gfx_display_ctx_driver_t *dispctx = p_disp->dispctx;
    /* Sanity check */
@@ -2671,8 +2707,8 @@ void gfx_thumbnail_draw(
        * the live struct concurrently (upload callback, reset, or
        * animation tick on alpha), but these locals are stable. */
       uintptr_t thumb_texture = thumbnail->texture;
-      unsigned  thumb_width   = thumbnail->width;
-      unsigned  thumb_height  = thumbnail->height;
+      unsigned  thumb_width   = VIDEO_SCALE_W(thumbnail->dims);
+      unsigned  thumb_height  = VIDEO_SCALE_H(thumbnail->dims);
       float     thumb_alpha   = thumbnail->alpha;
       uint8_t   thumb_flags   = thumbnail->flags;
 
@@ -2697,8 +2733,7 @@ void gfx_thumbnail_draw(
       {
          gfx_thumbnail_t thumb_snapshot;
          thumb_snapshot.texture = thumb_texture;
-         thumb_snapshot.width   = thumb_width;
-         thumb_snapshot.height  = thumb_height;
+         thumb_snapshot.dims    = VIDEO_SCALE_PACK(thumb_width, thumb_height);
          thumb_snapshot.alpha   = thumb_alpha;
          thumb_snapshot.flags   = thumb_flags;
          /* Local snapshot: initialise the atomic-typed status
@@ -2709,7 +2744,7 @@ void gfx_thumbnail_draw(
          retro_atomic_int_init(&thumb_snapshot.status, GFX_THUMBNAIL_STATUS_AVAILABLE);
          thumb_snapshot.delay_timer = 0.0f;
          gfx_thumbnail_get_draw_dimensions(
-               &thumb_snapshot, width, height, scale_factor,
+               &thumb_snapshot, dims, scale_factor,
                &draw_width, &draw_height);
       }
 
@@ -2828,29 +2863,26 @@ void gfx_thumbnail_draw(
 
             /* Apply shadow draw object configuration */
             coords.color = (const float*)shadow_color;
-            draw.width   = (unsigned)shadow_width;
-            draw.height  = (unsigned)shadow_height;
-            draw.x       = shadow_x;
-            draw.y       = shadow_y;
+            draw.dims    = VIDEO_SCALE_PACK((unsigned)shadow_width, (unsigned)shadow_height);
+            draw.pos     = VIDEO_POS_PACK(VIDEO_PX(shadow_x),
+                  VIDEO_PX(shadow_y));
 
             /* Draw shadow */
-            if (draw.height > 0 && draw.width > 0)
+            if (VIDEO_SCALE_H(draw.dims) > 0 && VIDEO_SCALE_W(draw.dims) > 0)
                gfx_display_draw(dispctx, &draw, userdata,
-                        video_width, video_height);
+                        VIDEO_SCALE_PACK(video_width, video_height));
          }
       }
 
       /* Final thumbnail draw object configuration */
       coords.color = (const float*)thumbnail_color;
-      draw.width   = (unsigned)draw_width;
-      draw.height  = (unsigned)draw_height;
-      draw.x       = draw_x;
-      draw.y       = draw_y;
+      draw.dims    = VIDEO_SCALE_PACK((unsigned)draw_width, (unsigned)draw_height);
+      draw.pos     = VIDEO_POS_PACK(VIDEO_PX(draw_x), VIDEO_PX(draw_y));
 
       /* Draw thumbnail */
-      if (draw.height > 0 && draw.width > 0)
+      if (VIDEO_SCALE_H(draw.dims) > 0 && VIDEO_SCALE_W(draw.dims) > 0)
          gfx_display_draw(dispctx, &draw, userdata,
-               video_width, video_height);
+               VIDEO_SCALE_PACK(video_width, video_height));
 
       gfx_display_blend_end(dispctx, userdata);
    }

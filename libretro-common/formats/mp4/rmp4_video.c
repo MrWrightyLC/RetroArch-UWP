@@ -90,6 +90,7 @@ struct rmp4_video_stream
    int          rndr_kind;     /* 0 none, 1 vp8, 2 vp9, 3 h264, 4 h265 */
    int          rndr_vp9_show; /* fbs index of the vp9 picture       */
    int          wait_key;   /* a reference failed; hold out for a key */
+   int          catchup;    /* dropping droppable pictures to catch up */
    int          track;      /* index of the chosen video track        */
    unsigned     matrix;     /* colr matrix_coefficients; 0 untagged   */
    unsigned     transfer;   /* colr transfer_characteristics          */
@@ -511,6 +512,9 @@ static bool rmp4_video_stream_open_decoder(rmp4_video_stream_t *s)
          const rmp4_track *t = rmp4_get_track(s->demux, s->track);
          if (!(s->h264 = rh264_video_open()))
             return false;
+         rh264_video_set_skip_nonref(s->h264, s->catchup);
+         if (s->blit_pool && s->blit_bands > 1)
+            rh264_video_set_thread_pool(s->h264, s->blit_pool, (int)s->blit_bands);
          if (t && t->codec_private && t->codec_private_size)
             rh264_video_set_extradata(s->h264, t->codec_private,
                   t->codec_private_size);
@@ -525,6 +529,7 @@ static bool rmp4_video_stream_open_decoder(rmp4_video_stream_t *s)
             rh265_video_set_extradata(s->h265, t->codec_private,
                   t->codec_private_size);
          rh265_video_set_thread_pool(s->h265, s->blit_pool, s->blit_bands);
+         rh265_video_set_skip_nonref(s->h265, s->catchup);
          return true;
       }
       default:
@@ -881,7 +886,14 @@ static int rmp4_video_decode_packet(rmp4_video_stream_t *s,
          }
          s->wait_key = 0;
          if (dec == 0)   /* consumed; picture held for display reordering */
+         {
+            /* Unless it was passed over to catch up: then its slot on
+             * the timeline has gone by, like a refused picture's, and
+             * the durations of what follows are read from theirs. */
+            if (rh264_video_dropped(s->h264))
+               s->disp_idx++;
             return 0;
+         }
       }
       /* Planes stay valid until the next decode; defer conversion. */
       if (!rh264_video_plane(s->h264, 0, NULL, NULL, NULL))
@@ -913,7 +925,11 @@ static int rmp4_video_decode_packet(rmp4_video_stream_t *s,
       }
       s->wait_key = 0;
       if (dec == 0)   /* consumed; picture held for display reordering */
+      {
+         if (rh265_video_dropped(s->h265))
+            s->disp_idx++; /* passed over: its slot has gone by */
          return 0;
+      }
       /* Planes stay valid until the next decode; defer conversion. */
       if (!rh265_video_plane(s->h265, 0, NULL, NULL, NULL))
          return -1;
@@ -1010,6 +1026,27 @@ void rmp4_video_stream_set_output(rmp4_video_stream_t *s, uint32_t *out)
       s->out = out;
 }
 
+void *rmp4_video_stream_h264(rmp4_video_stream_t *s)
+{
+   return s ? (void*)s->h264 : NULL;
+}
+
+void *rmp4_video_stream_h265(rmp4_video_stream_t *s)
+{
+   return s ? (void*)s->h265 : NULL;
+}
+
+void rmp4_video_stream_set_catchup(rmp4_video_stream_t *s, int behind)
+{
+   if (!s)
+      return;
+   s->catchup = behind ? 1 : 0;
+   if (s->h264)
+      rh264_video_set_skip_nonref(s->h264, s->catchup);
+   if (s->h265)
+      rh265_video_set_skip_nonref(s->h265, s->catchup);
+}
+
 void rmp4_video_stream_set_blit_pool(rmp4_video_stream_t *s,
       void *pool, unsigned bands)
 {
@@ -1025,6 +1062,11 @@ void rmp4_video_stream_set_blit_pool(rmp4_video_stream_t *s,
    /* H.265 WPP rows likewise. */
    if (s->h265)
       rh265_video_set_thread_pool(s->h265, pool, bands);
+   /* H.264 has no rows to split; its pictures decode concurrently
+    * instead, one per thread, each waiting on the rows of the ones it
+    * predicts from. */
+   if (s->h264)
+      rh264_video_set_thread_pool(s->h264, pool, (int)bands);
 }
 
 /* The blit as a row-band job (image_blit_bands): every parameter of
@@ -1469,6 +1511,8 @@ void rmp4_video_set_want_10bit(rmp4_video_t *mp4, int want)
    if (mp4)
       mp4->want10 = want ? 1 : 0;
 }
+
+
 
 void rmp4_video_set_avail(rmp4_video_t *mp4, size_t avail)
 {

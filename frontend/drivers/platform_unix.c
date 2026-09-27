@@ -30,10 +30,6 @@
 
 #ifdef __linux__
 #include <linux/version.h>
-#if __STDC_VERSION__ >= 199901L && !defined(ANDROID)
-#include "../../deps/feralgamemode/gamemode_client.h"
-#define FERAL_GAMEMODE
-#endif
 #endif
 
 #include <signal.h>
@@ -41,6 +37,14 @@
 
 #ifdef HAVE_CONFIG_H
 #include "../../config.h"
+#endif
+
+/* Builds without config.h keep GameMode; configure builds follow
+ * --enable/--disable-gamemode. */
+#if defined(__linux__) && !defined(ANDROID) && __STDC_VERSION__ >= 199901L \
+      && (!defined(HAVE_CONFIG_H) || defined(HAVE_GAMEMODE))
+#include "../../deps/feralgamemode/gamemode_client.h"
+#define FERAL_GAMEMODE
 #endif
 
 #ifdef ANDROID
@@ -572,13 +576,11 @@ static void onContentRectChanged(ANativeActivity *activity,
    int width                    = rect->right  - rect->left;
    int height                   = rect->bottom - rect->top;
 
-   /* Store the dimensions before publishing the flag, so a reader that
-    * observes @changed cannot still see the previous size and build a
-    * swapchain at the wrong resolution. The old code set @changed first
-    * and used plain stores, leaving both the ordering and the visibility
-    * to chance. */
-   retro_atomic_store_release_int(&instance->content_rect.width,  width);
-   retro_atomic_store_release_int(&instance->content_rect.height, height);
+   /* The size before the flag, so a reader that observes @changed
+    * cannot still see the previous size and build a swapchain at the
+    * wrong resolution. */
+   retro_atomic_store_release_int(&instance->content_rect.dims,
+         (int)VIDEO_SCALE_PACK(width, height));
    retro_atomic_store_release_int(&instance->content_rect.changed, 1);
 }
 
@@ -3273,11 +3275,16 @@ static bool frontend_unix_set_gamemode(bool on)
     * not change for the lifetime of the process, and each probe emits
     * a warning. Latch the unavailable state and short-circuit. */
    static bool gamemode_unavailable = false;
+   /* Only leave GameMode if this process entered it, so shutdown
+    * with the setting off never loads libgamemode. */
+   static bool gamemode_entered     = false;
    int gamemode_status;
    bool gamemode_active;
 
    if (gamemode_unavailable)
       return false;
+   if (!on && !gamemode_entered)
+      return true;
 
    gamemode_status  = gamemode_query_status();
    gamemode_active  = (gamemode_status == 2);
@@ -3294,7 +3301,10 @@ static bool frontend_unix_set_gamemode(bool on)
    }
 
    if (gamemode_active == on)
+   {
+      gamemode_entered = on;
       return true;
+   }
 
    if (on)
    {
@@ -3303,6 +3313,7 @@ static bool frontend_unix_set_gamemode(bool on)
          RARCH_WARN("[GameMode] Failed to enter GameMode: %s.\n", gamemode_error_string());
          return false;
       }
+      gamemode_entered = true;
    }
    else
    {
@@ -3311,6 +3322,7 @@ static bool frontend_unix_set_gamemode(bool on)
          RARCH_WARN("[GameMode] Failed to exit GameMode: %s.\n", gamemode_error_string());
          return false;
       }
+      gamemode_entered = false;
    }
 
    return true;
@@ -3419,6 +3431,8 @@ static void frontend_unix_init(void *data)
          "isAndroidTV", "()Z");
    GET_METHOD_ID(env, android_app->getRefreshRate, class,
          "getRefreshRate", "()F");
+   GET_METHOD_ID(env, android_app->getHdrMaxLuminance, class,
+         "getHdrMaxLuminance", "()F");
    GET_METHOD_ID(env, android_app->getDisplayModes, class,
          "getDisplayModes", "()[I");
    GET_METHOD_ID(env, android_app->getCurrentDisplayModeId, class,
@@ -3529,6 +3543,7 @@ static int frontend_unix_parse_drive_list(void *data, bool load_content)
    jstring jstr          = NULL;
 
    int volume_count = 0;
+   int i;
    /* The shared-storage path already appended below, so the volume
     * loop does not list the primary volume a second time. */
    const char *listed_storage_path = "";
@@ -3613,7 +3628,7 @@ static int frontend_unix_parse_drive_list(void *data, bool load_content)
             msg_hash_to_str(MSG_APPLICATION_DIR),
             enum_idx,
             FILE_TYPE_DIRECTORY, 0, 0, NULL);
-   for (unsigned i=0; i < volume_count; i++)
+   for (i = 0; i < volume_count; i++)
    {
       static char aux_path[PATH_MAX_LENGTH];
       char index[2];

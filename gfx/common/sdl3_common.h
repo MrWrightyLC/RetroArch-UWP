@@ -76,13 +76,13 @@ void sdl3_pump_window_events(bool *quit, bool *resize);
 
 /* Creates or resizes the window, or toggles fullscreen. */
 bool sdl3_window_set_video_mode(SDL_Window **win,
-      unsigned width, unsigned height, bool fullscreen,
+      unsigned dims, bool fullscreen,
       SDL_WindowFlags backend_flags);
 
 /* Retrieves the window size in pixels, or the desktop mode when the
  * window doesn't exist yet. */
 void sdl3_window_get_video_size(SDL_Window *win,
-      unsigned *width, unsigned *height);
+      unsigned *dims);
 
 /* Get the refresh rate of the display the window is on, in Hz.
  * Returns 0.0f when there is no window or when we can't tell. */
@@ -111,12 +111,12 @@ void sdl3_ctx_input_driver(void *data, const char *name,
  * as the context driver. */
 bool sdl3_ctx_enabled(const char *ctx_ident);
 
-void sdl3_ctx_get_video_size(void *data, unsigned *width, unsigned *height);
+void sdl3_ctx_get_video_size(void *data, unsigned *dims);
 float sdl3_ctx_get_refresh_rate(void *data);
 void sdl3_ctx_update_title(void *data);
 bool sdl3_ctx_has_focus(void *data);
 void sdl3_ctx_check_window(void *data, bool *quit, bool *resize,
-      unsigned *width, unsigned *height);
+      unsigned *dims);
 
 /* Retrieve the DISPLAY_METRIC_DPI for the window's display scale.
  * This usually ends up being scale * 96 DPI, or false otherwise. */

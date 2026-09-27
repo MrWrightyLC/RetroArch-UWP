@@ -25,6 +25,7 @@
 #include <streams/file_stream.h>
 #include <string/stdstring.h>
 #include <features/features_cpu.h>
+#include <formats/rh265.h>
 
 #define BANDS 8
 
@@ -74,6 +75,20 @@ static void vs_pool(vstream *v, void *pool, unsigned bands)
 {
    if (v->mp4)  rmp4_video_stream_set_blit_pool(v->mp4, pool, bands);
    else         rwebm_video_stream_set_blit_pool(v->webm, pool, bands);
+   /* the banded decode also rotates the HEVC decoder's contexts: the
+    * pictures still decode one after the other, so the frames must
+    * match the one-thread decode to the byte - a difference is
+    * picture state left in the decoder rather than the context */
+   if (v->mp4 && bands > 1)
+   {
+      void *h265 = rmp4_video_stream_h265(v->mp4);
+      if (h265)
+         rh265_video_set_contexts((rh265_video*)h265, 4);
+      /* and, RH265_PUBLISH_DELAY set, every row's publication held
+       * back at random so the readers wait for their rows */
+      if (getenv("RH265_PUBLISH_DELAY"))
+         rh265_video_set_publish_delay(atoi(getenv("RH265_PUBLISH_DELAY")));
+   }
 }
 static const uint32_t *vs_next(vstream *v, int *dur)
 {
@@ -208,6 +223,17 @@ int main(int argc, char **argv)
    free(a);
    free(b);
    free(buf);
+   /* The HEVC row counter every reference read consults: on one thread
+    * and on the wavefront a reference is complete before it is read, so
+    * no read may find its rows short. A short read would be a wrong
+    * counter or a wrong bound, and a decoder with pictures in flight
+    * would then wait for a row it had been handed already. */
+   if (rh265_video_ref_wait_misses())
+   {
+      printf("[FAIL] %d HEVC reference reads short of their rows\n",
+            rh265_video_ref_wait_misses());
+      bad = 1;
+   }
    printf(bad ? "FAIL\n" : "PASS\n");
    return bad;
 }

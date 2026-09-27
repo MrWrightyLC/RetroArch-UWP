@@ -36,10 +36,12 @@
 #include "../verbosity.h"
 #include <compat/strl.h>
 
+#include "task_cloudsync_path.h"
+
 #define CSPFX "[CloudSync] "
 
 #define MANIFEST_FILENAME_LOCAL  "manifest.local"
-#define MANIFEST_FILENAME_SERVER "manifest.server"
+#define MANIFEST_FILENAME_SERVER CLOUD_SYNC_SERVER_MANIFEST
 
 #define CS_FILE_HASH(item_file) ((char*)((item_file) ? ((item_file)->userdata) : (NULL)))
 #define CS_FILE_KEY(item_file) ((item_file) ? ((item_file)->alt) : (NULL))
@@ -74,6 +76,12 @@ typedef struct
    /* Manifest present on the server (may be modified by other clients)*/
    file_list_t *server_manifest;
    size_t server_idx;
+   /* Server entries under a directory this sync does not cover (its
+    * toggle is off), counted once when the diff starts, and how many of
+    * them the diff has stepped over so far.  Progress leaves both out:
+    * they are carried into the updated manifest, not synced. */
+   size_t server_out_of_scope;
+   size_t server_skipped;
    /* Last-known state to compare agasint.*/
    file_list_t *local_manifest;
    size_t local_idx;
@@ -85,6 +93,7 @@ typedef struct
    bool need_manifest_uploaded;
    bool failures;
    bool conflicts;
+   const char *fatal_error;
    /* Conflict resolution mode: 0=none, 1=keep_local, 2=keep_server */
    int conflict_resolution;
    uint32_t uploads;
@@ -198,7 +207,12 @@ static void task_cloud_sync_begin_handler(void *user_data, const char *path, boo
 static bool tcs_object_member_handler(void *ctx, const char *s, size_t len)
 {
    file_list_t      *list = (file_list_t *)ctx;
-   struct item_file *item = &list->list[list->size - 1];
+   struct item_file *item;
+
+   if (!list->size)
+      return false;
+
+   item = &list->list[list->size - 1];
    if (string_is_equal(s, "path"))
       item->type = 1;
    else
@@ -209,8 +223,14 @@ static bool tcs_object_member_handler(void *ctx, const char *s, size_t len)
 static bool tcs_string_handler(void *ctx, const char *s, size_t len)
 {
    file_list_t      *list = (file_list_t *)ctx;
-   size_t            idx = list->size - 1;
-   struct item_file *item = &list->list[idx];
+   size_t            idx;
+   struct item_file *item;
+
+   if (!list->size)
+      return false;
+
+   idx  = list->size - 1;
+   item = &list->list[idx];
    if (item->type)
       file_list_set_alt_at_offset(list, idx, s);
    else
@@ -221,16 +241,20 @@ static bool tcs_string_handler(void *ctx, const char *s, size_t len)
 static bool tcs_start_object_handler(void *ctx)
 {
    file_list_t *list = (file_list_t *)ctx;
-   file_list_append(list, NULL, NULL, 0, 0, 0);
-   return true;
+   return file_list_append(list, NULL, NULL, 0, 0, 0);
 }
 
 static bool tcs_end_object_handler(void *ctx)
 {
    file_list_t      *list = (file_list_t *)ctx;
-   struct item_file *item = &list->list[list->size - 1];
+   struct item_file *item;
+
+   if (!list->size)
+      return false;
+
+   item = &list->list[list->size - 1];
    if (!CS_FILE_KEY(item))
-      list->size--;
+      file_list_pop(list, NULL);
    else
       item->type = 0;
    return true;
@@ -238,8 +262,9 @@ static bool tcs_end_object_handler(void *ctx)
 
 static file_list_t *task_cloud_sync_create_manifest(RFILE *file)
 {
-   file_list_t  *list = NULL;
-   rjson_t      *json = NULL;
+   file_list_t    *list         = NULL;
+   rjson_t        *json         = NULL;
+   enum rjson_type parse_result = RJSON_ERROR;
 
    if (!(list = (file_list_t *)calloc(1, sizeof(file_list_t))))
       return NULL;
@@ -250,7 +275,7 @@ static file_list_t *task_cloud_sync_create_manifest(RFILE *file)
       return NULL;
    }
 
-   rjson_parse(json, list,
+   parse_result = rjson_parse(json, list,
                tcs_object_member_handler,
                tcs_string_handler,
                NULL,
@@ -260,6 +285,18 @@ static file_list_t *task_cloud_sync_create_manifest(RFILE *file)
                NULL,
                NULL,
                NULL);
+
+   if (parse_result != RJSON_DONE)
+   {
+      const char *error = rjson_get_error(json);
+      RARCH_ERR(CSPFX "Invalid manifest at line %u, column %u: %s\n",
+            (unsigned)rjson_get_source_line(json),
+            (unsigned)rjson_get_source_column(json),
+            string_is_empty(error) ? "invalid structure" : error);
+      rjson_free(json);
+      file_list_free(list);
+      return NULL;
+   }
 
    rjson_free(json);
 
@@ -296,11 +333,26 @@ static void task_cloud_sync_manifest_handler(void *user_data, const char *path,
    }
 
    RARCH_LOG(CSPFX "Server manifest fetch succeeded.\n");
+   /* An empty body is no manifest too: rjson rejects empty input,
+    * and the drivers now hand back an empty file as an open RFILE. */
+   if (file && filestream_get_size(file) == 0)
+   {
+      filestream_close(file);
+      file = NULL;
+   }
    /* it is valid for there not to be a server manifest */
    if (file)
    {
       sync_state->server_manifest = task_cloud_sync_create_manifest(file);
       filestream_close(file);
+      if (!sync_state->server_manifest)
+      {
+         sync_state->failures    = true;
+         sync_state->fatal_error = "Invalid server manifest";
+         task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
+         task_cloud_sync_waiting_set(sync_state, 0);
+         return;
+      }
    }
    task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_READ_LOCAL_MANIFEST);
    task_cloud_sync_waiting_set(sync_state, 0);
@@ -334,11 +386,30 @@ static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_st
    {
       RFILE *rfile = filestream_open(manifest_path,
             RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
-      if (rfile)
+      if (!rfile)
+      {
+         RARCH_ERR(CSPFX "Could not open local manifest.\n");
+         sync_state->failures    = true;
+         sync_state->fatal_error = "Cannot read local manifest";
+         task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
+         return;
+      }
+      else
       {
          RARCH_WARN(CSPFX "Opened local manifest.\n");
          sync_state->local_manifest = task_cloud_sync_create_manifest(rfile);
          filestream_close(rfile);
+         /* The local manifest is rewritten in place, so an interrupted
+          * write can leave it empty or truncated. Treating that as fatal
+          * would block every later sync with no way out from the UI.
+          * Drop it and continue as a first sync instead: files that
+          * differ between local and server become conflicts rather
+          * than being overwritten. */
+         if (!sync_state->local_manifest)
+         {
+            RARCH_WARN(CSPFX "Discarding invalid local manifest.\n");
+            filestream_delete(manifest_path);
+         }
       }
    }
 
@@ -515,6 +586,36 @@ error:
    return NULL;
 }
 
+/* True when @key lies under one of the directories this sync covers. */
+static bool task_cloud_sync_key_in_scope(const struct string_list *dirlist,
+      const char *key)
+{
+   size_t i;
+   for (i = 0; i < dirlist->size; i++)
+      if (string_starts_with(key, dirlist->elems[i].data))
+         return true;
+   return false;
+}
+
+static size_t task_cloud_sync_count_out_of_scope(
+      const task_cloud_sync_state_t *sync_state)
+{
+   const struct string_list *dirlist = sync_state->dirlist;
+   const file_list_t        *server  = sync_state->server_manifest;
+   size_t                    count   = 0;
+   size_t                    i;
+
+   if (!dirlist || !server)
+      return 0;
+
+   for (i = 0; i < server->size; i++)
+      if (!task_cloud_sync_key_in_scope(dirlist,
+               CS_FILE_KEY(&server->list[i])))
+         count++;
+
+   return count;
+}
+
 /**
  * task_cloud_sync_build_current_manifest:
  * @sync_state       : pointer to the current sync state
@@ -568,6 +669,8 @@ static void task_cloud_sync_build_current_manifest(task_cloud_sync_state_t *sync
    }
 
    file_list_sort_on_alt(sync_state->current_manifest);
+   sync_state->server_out_of_scope =
+      task_cloud_sync_count_out_of_scope(sync_state);
    task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_DIFF);
    RARCH_LOG(CSPFX "Created in-memory manifest of current disk state with %d files.\n", sync_state->current_manifest->size);
 }
@@ -594,10 +697,15 @@ static void task_cloud_sync_update_progress(retro_task_t *task)
    if (!(sync_state = (task_cloud_sync_state_t *)task->state))
       return;
 
-   val = sync_state->server_idx + sync_state->current_idx;
+   /* Entries of a directory whose sync toggle is off are stepped over
+    * in one go, so counting them would leave the bar short of 100 when
+    * they sort last - and stuck below the in-scope share otherwise. */
+   val = (sync_state->server_idx - sync_state->server_skipped)
+       + sync_state->current_idx;
 
    if (sync_state->server_manifest)
-      count += sync_state->server_manifest->size;
+      count += sync_state->server_manifest->size
+             - sync_state->server_out_of_scope;
    if (sync_state->current_manifest)
       count += sync_state->current_manifest->size;
 
@@ -848,13 +956,21 @@ static void task_cloud_sync_fetch_cb(void *user_data, const char *path, bool suc
          sync_state->need_manifest_uploaded = true;
       sync_state->downloads++;
    }
+   else if (success)
+   {
+      /* The drivers report success with no file only when the server
+       * does not have it.  Keeping it in the server manifest would fail
+       * the same fetch on every sync, so drop it there and leave the
+       * local copy and local manifest alone: if this device has the
+       * file, the next sync sees it as new here and uploads it. */
+      RARCH_WARN(CSPFX "\"%s\" is in the server manifest but missing on the server, removing it from the manifest.\n", path);
+      sync_state->need_manifest_uploaded = true;
+      sync_state->failures               = true;
+   }
    else
    {
       /* on failure, don't add it to local manifest, that will cause a fetch again next time */
-      if (!success)
-         RARCH_WARN(CSPFX "Failed to fetch \"%s\".\n", path);
-      else
-         RARCH_WARN(CSPFX "Failed to write file from server: \"%s\".\n", path);
+      RARCH_WARN(CSPFX "Failed to fetch \"%s\".\n", path);
       task_cloud_sync_add_to_updated_manifest(sync_state, path, CS_FILE_HASH(server_file), true);
       sync_state->failures = true;
    }
@@ -872,9 +988,24 @@ static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_stat
    struct string_list            *dirlist     = sync_state->dirlist;
    struct item_file              *server_file = &sync_state->server_manifest->list[sync_state->server_idx];
    const char                    *key         = CS_FILE_KEY(server_file);
-   /* the key from the server file is in "portable" format, use '/' */
-   const char                    *path        = strchr(key, '/') + 1;
+   /* The key from the server file is in "portable" format, use '/'.
+    * Server-supplied; treat as untrusted. cloud_sync_manifest_key_path()
+    * returns the relative path portion, or NULL for a malformed/traversal
+    * key (NULL, no '/', empty, absolute, or containing "..") that would
+    * otherwise let a hostile manifest write outside the cloud-sync base
+    * directory via fill_pathname_join_special. Regression coverage:
+    * samples/tasks/cloudsync/cloudsync_path_safety_test.c. */
+   const char                    *path        = cloud_sync_manifest_key_path(key);
    task_cloud_sync_fetch_state_t *fetch_state;
+
+   if (!path)
+   {
+      RARCH_WARN(CSPFX "Refusing malformed/traversal key from server: %s\n",
+            key ? key : "(null)");
+      task_cloud_sync_add_to_updated_manifest(sync_state, key, CS_FILE_HASH(server_file), true);
+      sync_state->failures = true;
+      return;
+   }
 
    /* there is a weird thing that can happen, where the server file changes but
     * the manifest does not have the updated hash. in that case when the file is
@@ -1020,7 +1151,7 @@ static void task_cloud_sync_upload_cb(void *user_data, const char *path, bool su
 }
 
 /**
- * task_cloud_sync_update_progress:
+ * task_cloud_sync_upload_current_file:
  * @sync_state 	: pointer to the current sync task
  *
  * Uploads the current file to the cloud. The current file is defined
@@ -1212,7 +1343,6 @@ static void task_cloud_sync_delete_server_file(task_cloud_sync_state_t *sync_sta
 static void task_cloud_sync_maybe_ignore(task_cloud_sync_state_t *sync_state)
 {
    struct string_list *dirlist = sync_state->dirlist;
-   size_t i;
    bool found;
 
    if (!dirlist)
@@ -1224,8 +1354,7 @@ static void task_cloud_sync_maybe_ignore(task_cloud_sync_state_t *sync_state)
       {
          struct item_file *local_file  = &sync_state->local_manifest->list[sync_state->local_idx];
          const char *key = CS_FILE_KEY(local_file);
-         for (i = 0; !found && i < dirlist->size; i++)
-            found = string_starts_with(key, dirlist->elems[i].data);
+         found = task_cloud_sync_key_in_scope(dirlist, key);
          /* we have a record of doing a sync for this file but now no longer
           * wish to sync it. keep the record? might as well, in case the option
           * gets turned back on later. */
@@ -1243,13 +1372,13 @@ static void task_cloud_sync_maybe_ignore(task_cloud_sync_state_t *sync_state)
       {
          struct item_file *server_file  = &sync_state->server_manifest->list[sync_state->server_idx];
          const char *key = CS_FILE_KEY(server_file);
-         for (i = 0; !found && i < dirlist->size; i++)
-            found = string_starts_with(key, dirlist->elems[i].data);
+         found = task_cloud_sync_key_in_scope(dirlist, key);
          /* must keep the server's manifest complete */
          if (!found)
          {
             task_cloud_sync_add_to_updated_manifest(sync_state, key, CS_FILE_HASH(server_file), true);
             sync_state->server_idx++;
+            sync_state->server_skipped++;
          }
       }
    }
@@ -1509,19 +1638,40 @@ static RFILE *task_cloud_sync_write_updated_manifest(file_list_t *manifest, char
 static void task_cloud_sync_commit_local_manifest(task_cloud_sync_state_t *sync_state)
 {
    char   manifest_path[PATH_MAX_LENGTH];
+   char   tmp_path[PATH_MAX_LENGTH];
    RFILE *file;
 
    task_cloud_sync_manifest_filename(manifest_path, sizeof(manifest_path), false,
          sync_state->dir_core_assets);
 
-   if ((file = task_cloud_sync_write_updated_manifest(
-               sync_state->updated_local_manifest, manifest_path)))
+   /* Write the new manifest beside the old one and rename it into
+    * place.  Written in place, a crash, full disk or power cut part
+    * way through left an empty or truncated manifest.local, which the
+    * next sync can only throw away (see
+    * task_cloud_sync_read_local_manifest()).  With the rename, the old
+    * manifest stays intact until the new one is complete, and keeping
+    * the old one is the safe outcome described above. */
+   if (strlcpy(tmp_path, manifest_path, sizeof(tmp_path)) >= sizeof(tmp_path)
+         || strlcat(tmp_path, ".tmp", sizeof(tmp_path)) >= sizeof(tmp_path))
    {
-      filestream_close(file);
+      RARCH_ERR(CSPFX "Local manifest path too long.\n");
+      sync_state->failures = true;
       return;
    }
 
-   RARCH_ERR(CSPFX "Failed to write local manifest to \"%s\".\n", manifest_path);
+   if ((file = task_cloud_sync_write_updated_manifest(
+               sync_state->updated_local_manifest, tmp_path)))
+   {
+      filestream_close(file);
+      if (filestream_rename(tmp_path, manifest_path) == 0)
+         return;
+      RARCH_ERR(CSPFX "Failed to replace \"%s\" with \"%s\".\n",
+            manifest_path, tmp_path);
+   }
+   else
+      RARCH_ERR(CSPFX "Failed to write local manifest to \"%s\".\n", tmp_path);
+
+   filestream_delete(tmp_path);
    sync_state->failures = true;
 }
 
@@ -1582,15 +1732,23 @@ static void task_cloud_sync_end_handler(void *user_data, const char *path, bool 
    if ((sync_state = (task_cloud_sync_state_t *)task->state))
    {
       char title[128];
-      size_t _len = strlcpy_lit(title, "Cloud Sync finished", sizeof(title));
-      if (sync_state->failures || sync_state->conflicts)
-         _len += strlcpy_lit(title + _len, " with ", sizeof(title) - _len);
-      if (sync_state->failures)
-         _len += strlcpy_lit(title + _len, "failures", sizeof(title) - _len);
-      if (sync_state->failures && sync_state->conflicts)
-         _len += strlcpy_lit(title + _len, " and ", sizeof(title) - _len);
-      if (sync_state->conflicts)
-         strlcpy_lit(title + _len, "conflicts", sizeof(title) - _len);
+      if (sync_state->fatal_error)
+      {
+         strlcpy(title, sync_state->fatal_error, sizeof(title));
+         task_set_error(task, strdup(sync_state->fatal_error));
+      }
+      else
+      {
+         size_t _len = strlcpy_lit(title, "Cloud Sync finished", sizeof(title));
+         if (sync_state->failures || sync_state->conflicts)
+            _len += strlcpy_lit(title + _len, " with ", sizeof(title) - _len);
+         if (sync_state->failures)
+            _len += strlcpy_lit(title + _len, "failures", sizeof(title) - _len);
+         if (sync_state->failures && sync_state->conflicts)
+            _len += strlcpy_lit(title + _len, " and ", sizeof(title) - _len);
+         if (sync_state->conflicts)
+            strlcpy_lit(title + _len, "conflicts", sizeof(title) - _len);
+      }
       task_free_title(task);
       task_set_title(task, strdup(title));
 
@@ -1652,8 +1810,11 @@ static void task_cloud_sync_task_handler(retro_task_t *task)
          task_cloud_sync_build_current_manifest(sync_state);
          break;
       case CLOUD_SYNC_PHASE_DIFF:
-         task_cloud_sync_update_progress(task);
+         /* After the step, not before: the step that finishes the diff
+          * moves on to UPDATE_MANIFESTS, and a figure taken ahead of it
+          * would be the last one the bar ever shows. */
          task_cloud_sync_diff_next(sync_state);
+         task_cloud_sync_update_progress(task);
          break;
       case CLOUD_SYNC_PHASE_UPDATE_MANIFESTS:
          task_cloud_sync_update_manifests(sync_state);

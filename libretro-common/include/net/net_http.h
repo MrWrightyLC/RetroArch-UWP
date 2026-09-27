@@ -158,7 +158,9 @@ bool net_http_error(struct http_t *state);
  * Where a transfer that never produced a status failed: the transport
  * stage, as a literal ("dns_lookup_failed", "ssl_connect_failed",
  * ...), and through @code the library's own error for it when there
- * is one - the TLS library's for the ssl stages, 0 otherwise.  NULL
+ * is one - the TLS library's for the ssl stages (negative), the OS
+ * socket error (errno, or WSAGetLastError on Windows; positive) for
+ * socket_create/connect/send, 0 otherwise.  NULL
  * when the transport did not fail.  For turning "HTTP -1" into a
  * message that says what went wrong.
  **/
@@ -177,6 +179,20 @@ const char *net_http_failure(struct http_t *state, int *code);
  **/
 struct string_list *net_http_headers(struct http_t *state);
 struct string_list *net_http_headers_ex(struct http_t *state, bool accept_error);
+
+/**
+ * net_http_body_is_framed:
+ * @headers : response headers as net_http_headers() returns them
+ *
+ * True when the response frames its body with Content-Length or
+ * "Transfer-Encoding: chunked", tested exactly as the receiver picks
+ * the body type. A transfer that ends short of either framing fails,
+ * but a body delimited only by the connection closing cannot be told
+ * apart from one cut off mid-transfer, so callers that must not act
+ * on a truncated body (writing a downloaded file over a local one)
+ * check this first.
+ **/
+bool net_http_body_is_framed(const struct string_list *headers);
 
 /**
  * net_http_data:

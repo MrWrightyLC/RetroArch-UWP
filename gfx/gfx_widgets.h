@@ -268,8 +268,8 @@ typedef struct dispgfx_widget
     * type is not exposed in this header. */
 #endif
 
-   unsigned last_video_width;
-   unsigned last_video_height;
+   /* Both axes in one word, VIDEO_SCALE_PACK's layout. */
+   unsigned last_video_dims;
    unsigned msg_queue_kill;
    /* Count of messages bound to a task in current_msgs */
    unsigned msg_queue_tasks_count;
@@ -297,8 +297,7 @@ typedef struct dispgfx_widget
    float msg_queue_bg[16];
    float pure_white[16];
 #ifdef HAVE_TRANSLATE
-   unsigned ai_service_overlay_width;
-   unsigned ai_service_overlay_height;
+   unsigned ai_service_overlay_dims;
 #endif
 
    uint8_t flags;
@@ -360,7 +359,7 @@ struct gfx_widget
    /* called when the graphics context is reset
     * -> (re)load the textures here */
    void (*context_reset)(bool is_threaded,
-      unsigned width, unsigned height, bool fullscreen,
+      unsigned dims, bool fullscreen,
       const char *dir_assets, char *font_path,
       char* menu_png_path,
       char* widgets_png_path);
@@ -377,7 +376,7 @@ struct gfx_widget
    /* called every frame on the main thread
     * -> update the widget logic here */
    void (*iterate)(void *user_data,
-      unsigned width, unsigned height, bool fullscreen,
+      unsigned dims, bool fullscreen,
       const char *dir_assets, char *font_path,
       bool is_threaded);
 
@@ -395,16 +394,13 @@ struct gfx_widget
 };
 
 float gfx_widgets_get_thumbnail_scale_factor(
-      const float dst_width, const float dst_height,
-      const float image_width, const float image_height);
+      unsigned dst_dims, unsigned image_dims);
 
 void gfx_widgets_draw_icon(
       void *userdata,
       void *data_disp,
-      unsigned video_width,
-      unsigned video_height,
-      unsigned icon_width,
-      unsigned icon_height,
+      unsigned video_dims,
+      unsigned icon_dims,
       uintptr_t texture,
       float x, float y,
       float radians,
@@ -412,17 +408,19 @@ void gfx_widgets_draw_icon(
       float sine,
       float *color);
 
+/* @dims: the output size, both axes in one word,
+ * VIDEO_SCALE_PACK's layout. */
 void gfx_widgets_draw_text(
       gfx_widget_font_data_t* font_data,
       const char *text,
       float x, float y,
-      int width, int height,
+      unsigned dims,
       uint32_t color,
       enum text_alignment text_align,
       bool draw_outside);
 
 void gfx_widgets_flush_text(
-      unsigned video_width, unsigned video_height,
+      unsigned video_dims,
       gfx_widget_font_data_t* font_data);
 
 typedef struct gfx_widget gfx_widget_t;
@@ -433,7 +431,7 @@ bool gfx_widgets_init(
       void *settings_data,
       uintptr_t widgets_active_ptr,
       bool video_is_threaded,
-      unsigned width, unsigned height, bool fullscreen,
+      unsigned dims, bool fullscreen,
       const char *dir_assets, char *font_path);
 
 void gfx_widgets_deinit(bool widgets_persisting);
@@ -454,7 +452,7 @@ void gfx_widget_volume_update_and_show(float new_volume,
 void gfx_widgets_iterate(
       void *data_disp,
       void *settings_data,
-      unsigned width, unsigned height, bool fullscreen,
+      unsigned dims, bool fullscreen,
       const char *dir_assets, char *font_path,
       bool is_threaded);
 
@@ -542,7 +540,7 @@ void gfx_widgets_status_text_to_frame(void *data, char *status_text);
 void gfx_widgets_iterate_layout(
       void *data_disp,
       void *settings_data,
-      unsigned width, unsigned height, bool fullscreen,
+      unsigned dims, bool fullscreen,
       const char *dir_assets, char *font_path,
       bool is_threaded);
 #endif

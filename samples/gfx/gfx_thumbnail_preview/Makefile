@@ -1,7 +1,17 @@
+# HAVE_MMAP means POSIX mmap: the VFS and memmap take the Win32
+# mapping calls without it, the way the tree's own Windows build does.
+ifeq ($(OS),Windows_NT)
+MMAP_DEF :=
+else
+MMAP_DEF := -DHAVE_MMAP
+endif
+
 TARGET := gfx_thumbnail_preview_test
 DECODE_TARGET          := preview_audio_decode_test
 DECODE_TARGET_NORWEBM  := preview_audio_decode_test_norwebm
 ANIM_WINDOW_TARGET     := preview_anim_window_test
+CATCHUP_TARGET         := preview_catchup_test
+BENCH_TARGET           := preview_decode_bench
 
 # Links the REAL gfx/gfx_thumbnail.c and the REAL
 # libretro-common/audio/audio_mixer.c.  Stubbing either is what let
@@ -29,6 +39,7 @@ SOURCES := gfx_thumbnail_preview_test.c \
            stubs_retroarch.c \
            $(REPO_ROOT)/libretro-common/audio/audio_mixer.c \
            $(LIBRETRO_COMM_DIR)/audio/resampler/audio_resampler.c \
+ $(LIBRETRO_COMM_DIR)/audio/resampler/audio_resampler_int16.c \
            $(LIBRETRO_COMM_DIR)/audio/resampler/drivers/sinc_resampler.c \
            $(LIBRETRO_COMM_DIR)/audio/resampler/drivers/sinc_resampler_int16.c \
            $(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
@@ -66,7 +77,7 @@ SOURCES := gfx_thumbnail_preview_test.c \
 CFLAGS  += -Wall -std=gnu99 -g -O1 \
            -DHAVE_RMP4 -DHAVE_RWEBM -DHAVE_RAAC -DHAVE_RH264 -DHAVE_RWEBP \
            -DHAVE_AUDIOMIXER \
-           -DHAVE_MMAP -D_GNU_SOURCE -DMEMMAP_TEST_NO_RESERVE \
+           $(MMAP_DEF) -D_GNU_SOURCE -DMEMMAP_TEST_NO_RESERVE \
            -I. -I$(REPO_ROOT) -I$(LIBRETRO_COMM_DIR)/include
 
 UUT_CFLAGS := $(CFLAGS) -O0 -fno-inline -DHAVE_MENU -DRARCH_INTERNAL \
@@ -94,6 +105,7 @@ OBJS := $(SOURCES:.c=.o)
 DECODE_SOURCES := preview_audio_decode_test.c \
            $(REPO_ROOT)/libretro-common/audio/audio_mixer.c \
            $(LIBRETRO_COMM_DIR)/audio/resampler/audio_resampler.c \
+           $(LIBRETRO_COMM_DIR)/audio/resampler/audio_resampler_int16.c \
            $(LIBRETRO_COMM_DIR)/audio/resampler/drivers/sinc_resampler.c \
            $(LIBRETRO_COMM_DIR)/audio/resampler/drivers/sinc_resampler_int16.c \
            $(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
@@ -119,7 +131,7 @@ DECODE_SOURCES_WEBM := $(DECODE_SOURCES) \
 
 DECODE_CFLAGS_COMMON := -Wall -std=gnu99 -g -O1 \
            -DHAVE_RMP4 -DHAVE_RAAC -DHAVE_AUDIOMIXER \
-           -DHAVE_MMAP -D_GNU_SOURCE \
+           $(MMAP_DEF) -D_GNU_SOURCE \
            -I$(LIBRETRO_COMM_DIR)/include $(EXTRA_CFLAGS)
 ifneq ($(SANITIZER),)
 DECODE_CFLAGS_COMMON += -fsanitize=$(SANITIZER) -fno-omit-frame-pointer
@@ -174,7 +186,7 @@ ANIM_WINDOW_SOURCES := preview_anim_window_test.c \
 
 ANIM_WINDOW_CFLAGS := -Wall -std=gnu99 -g -O1 \
            -DHAVE_RPNG -DHAVE_RWEBP -DHAVE_RMP4 -DHAVE_RH264 -DHAVE_RWEBM -DRARCH_INTERNAL \
-           -DHAVE_MMAP -D_GNU_SOURCE \
+           $(MMAP_DEF) -D_GNU_SOURCE \
            -I$(REPO_ROOT) -I$(LIBRETRO_COMM_DIR)/include $(EXTRA_CFLAGS)
 ifneq ($(SANITIZER),)
 ANIM_WINDOW_CFLAGS += -fsanitize=$(SANITIZER) -fno-omit-frame-pointer
@@ -182,10 +194,45 @@ endif
 
 BLIT_BANDS_TARGET  := preview_blit_bands_test
 
-all: $(TARGET) $(DECODE_TARGET) $(DECODE_TARGET_NORWEBM) $(ANIM_WINDOW_TARGET) $(BLIT_BANDS_TARGET)
+# The windowed-open oracle measures residency through madvise and
+# /proc/self/statm: it is a Linux oracle and is built on Linux. The
+# rest of the sample - the decoders, the bench, the catch-up and
+# blit-band oracles - builds anywhere with a C compiler.
+ifeq ($(OS),Windows_NT)
+PLATFORM_TARGETS :=
+else
+PLATFORM_TARGETS := $(ANIM_WINDOW_TARGET)
+endif
+
+
+# Defined ahead of all: a prerequisite list expands when make reads it,
+# and a variable set below it is empty there.
+THREADED_TARGET := gfx_thumbnail_preview_test_threaded
+AUDIO_ORACLE_TARGET := preview_audio_oracle_test
+CATCHUP_THREADED_TARGET := $(CATCHUP_TARGET)_threaded
+THREADED_DEFS   := -DHAVE_THREADS -DPREVIEW_THREADED
+THREADED_EXTRA  := $(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
+                   $(LIBRETRO_COMM_DIR)/rthreads/tpool.c \
+                   $(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c
+THREADED_OBJS   := $(SOURCES:.c=.t.o) $(THREADED_EXTRA:.c=.t.o)
+
+all: $(TARGET) $(DECODE_TARGET) $(DECODE_TARGET_NORWEBM) $(PLATFORM_TARGETS) $(BLIT_BANDS_TARGET) $(CATCHUP_TARGET) $(CATCHUP_THREADED_TARGET) $(AUDIO_ORACLE_TARGET) $(THREADED_TARGET)
 
 $(ANIM_WINDOW_TARGET): $(ANIM_WINDOW_SOURCES)
 	$(CC) -o $@ $(ANIM_WINDOW_SOURCES) $(ANIM_WINDOW_CFLAGS) $(LDFLAGS) -lz
+
+# Same tree the windowed oracle links, with its own main.
+CATCHUP_SOURCES := preview_catchup_test.c $(filter-out preview_anim_window_test.c,$(ANIM_WINDOW_SOURCES))
+$(CATCHUP_TARGET): $(CATCHUP_SOURCES)
+	$(CC) -o $@ $(CATCHUP_SOURCES) $(ANIM_WINDOW_CFLAGS) $(LDFLAGS) -lz
+
+# The same oracle with four pictures decoding concurrently on a pool:
+# catching up drops pictures at submit, and what remains must still
+# be the full decode to the byte. (CATCHUP_THREADED_TARGET is set with
+# the other names ahead of all:.)
+$(CATCHUP_THREADED_TARGET): $(CATCHUP_SOURCES) $(THREADED_EXTRA)
+	$(CC) -o $@ $(CATCHUP_SOURCES) $(THREADED_EXTRA) $(ANIM_WINDOW_CFLAGS) $(THREADED_DEFS) $(LDFLAGS) -lz -lpthread
+
 
 $(DECODE_TARGET): $(DECODE_SOURCES_WEBM) preview_audio_decode_test.c
 	$(CC) -o $@ $(DECODE_SOURCES_WEBM) \
@@ -193,6 +240,13 @@ $(DECODE_TARGET): $(DECODE_SOURCES_WEBM) preview_audio_decode_test.c
 
 $(DECODE_TARGET_NORWEBM): $(DECODE_SOURCES) preview_audio_decode_test.c
 	$(CC) -o $@ $(DECODE_SOURCES) $(DECODE_CFLAGS_COMMON) $(LDFLAGS)
+
+# The preview's audio chain against ffmpeg's decode of the same track,
+# at the track's rate and through the mixer's resampler.
+AUDIO_ORACLE_SOURCES := preview_audio_oracle_test.c $(filter-out preview_audio_decode_test.c,$(DECODE_SOURCES_WEBM)) \
+                        $(LIBRETRO_COMM_DIR)/file/file_path_io.c
+$(AUDIO_ORACLE_TARGET): $(AUDIO_ORACLE_SOURCES)
+	$(CC) -o $@ $(AUDIO_ORACLE_SOURCES) $(DECODE_CFLAGS_COMMON) -DHAVE_RWEBM $(LDFLAGS) -lm
 
 # The banded colour conversion against the single-threaded one, frame
 # for frame, through the real rmp4_video stream on a real tpool.
@@ -206,6 +260,7 @@ BLIT_BANDS_SOURCES := preview_blit_bands_test.c \
            $(LIBRETRO_COMM_DIR)/formats/h264/rh264.c \
            $(LIBRETRO_COMM_DIR)/formats/h265/rh265.c \
            $(LIBRETRO_COMM_DIR)/formats/image/image_blit_bands.c \
+           $(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c \
            $(LIBRETRO_COMM_DIR)/formats/image/image_hdr_blit.c \
            $(LIBRETRO_COMM_DIR)/formats/mp4/rmp4.c \
            $(LIBRETRO_COMM_DIR)/formats/mp4/rmp4_video.c \
@@ -224,10 +279,31 @@ BLIT_BANDS_SOURCES := preview_blit_bands_test.c \
            $(LIBRETRO_COMM_DIR)/time/rtime.c \
            $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
 
+# Not a test: frames per second per codec and thread count. Built by
+# `make bench`, never by check, and meaningless under a sanitizer.
+BENCH_SOURCES := preview_decode_bench.c $(filter-out preview_blit_bands_test.c,$(BLIT_BANDS_SOURCES)) \
+                 $(LIBRETRO_COMM_DIR)/formats/image_transfer.c \
+                 $(LIBRETRO_COMM_DIR)/formats/png/rpng.c \
+                 $(LIBRETRO_COMM_DIR)/formats/png/rpng_apng.c \
+                 $(LIBRETRO_COMM_DIR)/encodings/encoding_deflate.c \
+                 $(LIBRETRO_COMM_DIR)/encodings/encoding_crc32.c \
+                 $(LIBRETRO_COMM_DIR)/streams/trans_stream.c \
+                 $(LIBRETRO_COMM_DIR)/streams/trans_stream_deflate.c \
+                 $(LIBRETRO_COMM_DIR)/streams/trans_stream_pipe.c
+$(BENCH_TARGET): $(BENCH_SOURCES)
+	$(CC) -o $@ $(BENCH_SOURCES) \
+	      -Wall -std=gnu99 -O2 -DHAVE_RMP4 -DHAVE_RWEBM -DHAVE_RH264 -DHAVE_RH265 -DHAVE_RVP9 -DHAVE_RPNG -DHAVE_THREADS \
+	      $(MMAP_DEF) -D_GNU_SOURCE -I$(LIBRETRO_COMM_DIR)/include \
+	      $(EXTRA_CFLAGS) $(LDFLAGS) -lpthread
+
+bench: $(BENCH_TARGET) fixtures
+	./$(BENCH_TARGET) fixtures/long_video.mp4 fixtures/hevc_wpp.mp4 fixtures/vp9_tiles.webm fixtures/bframes_h264.mp4
+	./$(BENCH_TARGET) --catchup fixtures/bframes_h264.mp4 fixtures/bframes_hevc.mp4
+
 $(BLIT_BANDS_TARGET): $(BLIT_BANDS_SOURCES)
 	$(CC) -o $@ $(BLIT_BANDS_SOURCES) \
 	      -Wall -std=gnu99 -g -O1 -DHAVE_RMP4 -DHAVE_RWEBM -DHAVE_RH264 -DHAVE_RH265 -DHAVE_RVP9 -DHAVE_THREADS \
-	      -DHAVE_MMAP -D_GNU_SOURCE -I$(LIBRETRO_COMM_DIR)/include \
+	      $(MMAP_DEF) -D_GNU_SOURCE -I$(LIBRETRO_COMM_DIR)/include \
 	      $(EXTRA_CFLAGS) $(LDFLAGS) -lpthread
 
 $(UUT_OBJ): $(UUT_SRC)
@@ -248,17 +324,48 @@ $(LAYOUT_OBJ): settings_layout_uut.c
 $(TARGET): $(OBJS) $(UUT_OBJ) $(LAYOUT_OBJ) $(ANIM_PREVIEW_OBJ) $(SURFACE_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+# The same test with HAVE_THREADS: the thumbnail decodes on its worker
+# thread and, for THREADS above one, on the pool - the app's own path,
+# which the single-threaded build above cannot show. rthreads, the
+# pool and the eventcount are the real ones; the stubs' thread shims
+# are compiled out under PREVIEW_THREADED. Objects carry .t.o so the
+# two builds never share one.
+
+%.t.o: %.c
+	$(CC) -c -o $@ $< $(CFLAGS) $(THREADED_DEFS)
+
+gfx_thumbnail_uut.t.o: $(UUT_SRC)
+	$(CC) -c -o $@ $< $(UUT_CFLAGS) $(THREADED_DEFS)
+gfx_anim_preview_uut.t.o: $(ANIM_PREVIEW_SRC)
+	$(CC) -c -o $@ $< $(UUT_CFLAGS) $(THREADED_DEFS)
+gfx_surface_uut.t.o: $(SURFACE_SRC)
+	$(CC) -c -o $@ $< $(UUT_CFLAGS) $(THREADED_DEFS)
+settings_layout_uut.t.o: settings_layout_uut.c
+	$(CC) -c -o $@ $< $(UUT_CFLAGS) $(THREADED_DEFS)
+
+$(THREADED_TARGET): $(THREADED_OBJS) gfx_thumbnail_uut.t.o settings_layout_uut.t.o \
+                    gfx_anim_preview_uut.t.o gfx_surface_uut.t.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 # The fixtures are container layouts, not clips: see mkfixtures.py.
 # Sparse, so the 7.28 GB ones cost ~40 MB of disk.
 fixtures:
 	python3 mkfixtures.py fixtures
 
-check: $(TARGET) $(DECODE_TARGET) $(DECODE_TARGET_NORWEBM) $(ANIM_WINDOW_TARGET) $(BLIT_BANDS_TARGET) fixtures
+check: $(TARGET) $(THREADED_TARGET) $(DECODE_TARGET) $(DECODE_TARGET_NORWEBM) $(PLATFORM_TARGETS) $(BLIT_BANDS_TARGET) $(CATCHUP_TARGET) $(CATCHUP_THREADED_TARGET) $(AUDIO_ORACLE_TARGET) fixtures
 	./$(TARGET) fixtures/*.mp4 fixtures/anim_lossless.webp
+ifneq ($(OS),Windows_NT)
 	./$(ANIM_WINDOW_TARGET) fixtures
+endif
+	./$(CATCHUP_TARGET) fixtures/bframes_h264.mp4 fixtures/bframes_hevc.mp4
+	./$(CATCHUP_THREADED_TARGET) fixtures/bframes_h264.mp4 fixtures/bframes_hevc.mp4
+	./$(AUDIO_ORACLE_TARGET) fixtures/trailing_small.mp4 fixtures/trailing_large.mp4
+	FRAMES=180 PACE_HZ=60 PACE_MAX_STALL_MS=500 NOAUDIO=1 ./$(TARGET) fixtures/bframes_h264.mp4 fixtures/bframes_hevc.mp4
+	THREADS=4 FRAMES=180 PACE_HZ=60 PACE_MAX_STALL_MS=500 NOAUDIO=1 ./$(THREADED_TARGET) fixtures/bframes_h264.mp4 fixtures/bframes_hevc.mp4
 	./$(BLIT_BANDS_TARGET) fixtures/long_video.mp4
 	./$(BLIT_BANDS_TARGET) fixtures/vp9_tiles.webm
-	./$(BLIT_BANDS_TARGET) fixtures/hevc_wpp.mp4
+	./$(BLIT_BANDS_TARGET) fixtures/hevc_wpp.mp4 fixtures/bframes_hevc.mp4 fixtures/hevc_nowpp.mp4 fixtures/mbaff_h264.mp4
+	RH265_PUBLISH_DELAY=200 ./$(BLIT_BANDS_TARGET) fixtures/hevc_wpp.mp4 fixtures/bframes_hevc.mp4 fixtures/hevc_nowpp.mp4
 	./$(DECODE_TARGET) fixtures/trailing_large.mp4 1024   island
 	./$(DECODE_TARGET) fixtures/trailing_large.mp4 262144 island
 	./$(DECODE_TARGET_NORWEBM) fixtures/trailing_large.mp4 1024 island
@@ -268,11 +375,14 @@ check: $(TARGET) $(DECODE_TARGET) $(DECODE_TARGET_NORWEBM) $(ANIM_WINDOW_TARGET)
 # a different SANITIZER=, and a clean that took the fixtures with it
 # left the following run globbing nothing.  Use distclean to drop them.
 clean:
-	rm -f $(TARGET) $(DECODE_TARGET) $(DECODE_TARGET_NORWEBM) \
-	      $(ANIM_WINDOW_TARGET) $(BLIT_BANDS_TARGET) \
+	rm -f $(TARGET) $(THREADED_TARGET) $(THREADED_TARGET).exe $(THREADED_OBJS) \
+	      gfx_thumbnail_uut.t.o settings_layout_uut.t.o gfx_anim_preview_uut.t.o gfx_surface_uut.t.o \
+	      $(DECODE_TARGET) $(DECODE_TARGET_NORWEBM) \
+	      $(ANIM_WINDOW_TARGET) $(BLIT_BANDS_TARGET) $(CATCHUP_TARGET) $(CATCHUP_THREADED_TARGET) $(AUDIO_ORACLE_TARGET) $(BENCH_TARGET) \
+	      $(TARGET).exe $(CATCHUP_TARGET).exe $(BENCH_TARGET).exe $(BLIT_BANDS_TARGET).exe \
 	      $(OBJS) $(UUT_OBJ) $(LAYOUT_OBJ) $(ANIM_PREVIEW_OBJ) $(SURFACE_OBJ)
 
 distclean: clean
 	rm -rf fixtures
 
-.PHONY: all check fixtures clean distclean
+.PHONY: bench all check fixtures clean distclean

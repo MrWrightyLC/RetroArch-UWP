@@ -16,6 +16,8 @@ SOURCES_C := \
 	../../../audio/audio_pipeline_stretch.c \
 	../../../audio/audio_speed_lpf.c \
 	../../../audio/audio_thread_wrapper.c \
+	../../../frontend/thread_elevation.c \
+	../../../frontend/thread_elevation/eevdf.c \
 	../../../audio/audio_binaural.c \
 	stubs_retroarch.c \
 	$(LIBRETRO_COMM_DIR)/lists/string_list.c \
@@ -30,6 +32,7 @@ SOURCES_C := \
 	$(LIBRETRO_COMM_DIR)/audio/conversion/float_to_s16.c \
 	$(LIBRETRO_COMM_DIR)/audio/conversion/s16_to_float.c \
 	$(LIBRETRO_COMM_DIR)/audio/resampler/audio_resampler.c \
+ $(LIBRETRO_COMM_DIR)/audio/resampler/audio_resampler_int16.c \
 	$(LIBRETRO_COMM_DIR)/audio/resampler/drivers/sinc_resampler_int16.c \
 	$(LIBRETRO_COMM_DIR)/audio/resampler/drivers/nearest_resampler_int16.c \
 	$(LIBRETRO_COMM_DIR)/features/features_cpu.c \

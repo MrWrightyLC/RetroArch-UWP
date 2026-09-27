@@ -206,7 +206,11 @@ enum gfx_thumbnail_flags
    GFX_THUMB_FLAG_ANIM_ACTIVE = (1 << 3),
    /* 'texture' is the animation surface's, which owns and unloads it;
     * clear while it is a still the thumbnail unloads itself. */
-   GFX_THUMB_FLAG_TEX_SURFACE = (1 << 4)
+   GFX_THUMB_FLAG_TEX_SURFACE = (1 << 4),
+   /* The animation's decode is behind the file's rate and the stream
+    * has been asked to pass over droppable pictures until it catches
+    * up. Cleared the moment a frame lands on time. */
+   GFX_THUMB_FLAG_ANIM_BEHIND = (1 << 5)
 };
 
 /* Holds all runtime parameters associated with
@@ -272,8 +276,8 @@ typedef struct
     * waited on. */
    uint64_t list_id;
    int32_t anim_loops_left; /* remaining loops, -1 = infinite */
-   unsigned width;
-   unsigned height;
+   /* Both axes in one word, VIDEO_SCALE_PACK's layout. */
+   unsigned dims;
    float alpha;
    float delay_timer;
    retro_atomic_int_t status;
@@ -323,8 +327,7 @@ static INLINE void gfx_thumbnail_init_blank(gfx_thumbnail_t *t)
    t->anim_next_us    = 0;
    t->list_id         = 0;
    t->anim_loops_left = 0;
-   t->width           = 0;
-   t->height          = 0;
+   t->dims            = 0;
    t->alpha           = 0.0f;
    t->delay_timer     = 0.0f;
    retro_atomic_int_init(&t->status, 0 /* GFX_THUMBNAIL_STATUS_UNKNOWN */);
@@ -595,7 +598,7 @@ void gfx_thumbnail_process_streams(
  * scaling within a rectangle of (width x height) */
 void gfx_thumbnail_get_draw_dimensions(
       gfx_thumbnail_t *thumbnail,
-      unsigned width, unsigned height, float scale_factor,
+      unsigned dims, float scale_factor,
       float *draw_width, float *draw_height);
 
 /* Draws specified thumbnail with specified alignment
@@ -607,12 +610,14 @@ void gfx_thumbnail_get_draw_dimensions(
  *       size of the thumbnail beyond the limits of the
  *       (width x height) rectangle (alignment + aspect
  *       correct scaling is preserved). Use with caution */
+/* @video_dims and @dims: the output size and the rectangle the
+ * thumbnail is fitted into, each with both axes in one word,
+ * VIDEO_SCALE_PACK's layout. */
 void gfx_thumbnail_draw(
       void *userdata,
-      unsigned video_width,
-      unsigned video_height,
+      unsigned video_dims,
       gfx_thumbnail_t *thumbnail,
-      float x, float y, unsigned width, unsigned height,
+      float x, float y, unsigned dims,
       enum gfx_thumbnail_alignment alignment,
       float alpha, float scale_factor,
       gfx_thumbnail_shadow_t *shadow);

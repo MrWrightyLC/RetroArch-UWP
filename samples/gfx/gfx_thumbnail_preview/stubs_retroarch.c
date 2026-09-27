@@ -16,6 +16,8 @@
 
 #include <formats/image.h>
 
+#include "../../../gfx/video_defines.h"
+
 #include "harness.h"
 
 harness_probe_t hp;
@@ -43,8 +45,8 @@ bool video_driver_texture_can_update(void) { return false; }
 bool video_driver_texture_update(uintptr_t id, void *data)
 { (void)id; (void)data; return false; }
 unsigned video_driver_get_disp_flags(void) { return 0; }
-void video_driver_get_video_output_size(unsigned *w, unsigned *h, char *d, size_t l)
-{ *w = 1920; *h = 1080; (void)d; (void)l; }
+void video_driver_get_video_output_size(unsigned *dims, char *d, size_t l)
+{ *dims = VIDEO_SCALE_PACK(1920, 1080); (void)d; (void)l; }
 void video_driver_get_viewport_info(void *vp) { (void)vp; }
 void *video_state_get_ptr(void) { static char b[4096]; return b; }
 unsigned gfx_display_texture_filter(void) { return 0; }
@@ -58,8 +60,11 @@ unsigned gfx_display_texture_filter(void) { return 0; }
  * with those declarations; C linkage does not carry parameter types,
  * so the symbol matches what gfx_thumbnail.c calls either way. */
 void gfx_display_draw(void *dispctx, void *draw, void *data,
-      unsigned video_width, unsigned video_height)
-{ (void)dispctx; (void)draw; (void)data;
+      unsigned video_dims)
+{
+   unsigned video_width  = VIDEO_SCALE_W(video_dims);
+   unsigned video_height = VIDEO_SCALE_H(video_dims);
+ (void)dispctx; (void)draw; (void)data;
   (void)video_width; (void)video_height; }
 
 void gfx_display_rotate_z(void *a, void *b) { (void)a; (void)b; }
@@ -112,6 +117,7 @@ void task_set_flags(void *t, uint32_t f, bool s) { (void)t; (void)f; (void)s; }
  * disturbed. */
 extern const size_t settings_layout_sizeof;
 extern const size_t settings_layout_preview_audio_off;
+extern const size_t settings_layout_preview_threads_off;
 static char g_settings[1 << 20];
 void *config_get_ptr(void)
 {
@@ -119,6 +125,14 @@ void *config_get_ptr(void)
       abort();
    g_settings[settings_layout_preview_audio_off] =
          hp.force_preview_audio ? 1 : 0;
+   {
+      /* THREADS: the preview's thread count, as the menu setting
+       * would set it; the threaded build decodes on the worker and
+       * the pool for anything above one. */
+      const char *te = getenv("THREADS");
+      unsigned t = te ? (unsigned)atoi(te) : 1;
+      memcpy(g_settings + settings_layout_preview_threads_off, &t, sizeof(t));
+   }
    return g_settings;
 }
 
@@ -138,7 +152,9 @@ void playlist_get_db_name(void *p, size_t i, const char **n)
 int playlist_get_thumbnail_mode(void *p, unsigned id) { (void)p; (void)id; return 0; }
 const char *msg_hash_to_str(unsigned id) { (void)id; return ""; }
 
-/* ---- threads: single-threaded harness, real locks not needed ---- */
+/* ---- threads: single-threaded harness, real locks not needed.
+ * The threaded build links rthreads itself and has none of these. ---- */
+#ifndef PREVIEW_THREADED
 void *slock_new(void) { return malloc(1); }
 void slock_free(void *l) { free(l); }
 void slock_lock(void *l) { (void)l; }
@@ -150,6 +166,13 @@ void scond_signal(void *c) { (void)c; }
 void scond_broadcast(void *c) { (void)c; }
 void *sthread_create(void *f, void *ud) { (void)f; (void)ud; return NULL; }
 void sthread_join(void *t) { (void)t; }
+#else
+/* The threaded build of gfx_surface asks whether the video thread
+ * wrapper is up before handing a load to it; the harness has no
+ * video thread, so the surface takes its direct path. */
+bool video_driver_thread_wrapper_active(void) { return false; }
+bool video_thread_async_post(void *n) { (void)n; return false; }
+#endif
 
 bool path_is_directory(const char *p)
 { struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }

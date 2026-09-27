@@ -32,8 +32,9 @@ jobs:
           # All three packages ship on the stock ubuntu-latest image, so
           # this step is a no-op there and apt is only contacted if the
           # image ever drops one of them.
-          # ffmpeg (with libx264): formats/h264/rh264_lossless_test builds
-          # its lossless corpus and its reference decodes with it.
+          # ffmpeg (with libx264 and libx265): formats/h264/rh264_lossless_test
+          # and formats/h265/rh265_lossless_test build their corpora and
+          # their reference decodes with it.
           if dpkg -s build-essential zlib1g-dev clang ffmpeg >/dev/null 2>&1; then
             echo "All packages already present on runner image; skipping apt."
             exit 0
@@ -113,6 +114,9 @@ jobs:
             audio_transfer_window_test
             rjpeg_test
             rh264_lossless_test
+            rh264_lossless_test_nothreads
+            rh265_lossless_test
+            rh265_lossless_test_nothreads
             r7z_lzma_props_test
             vcdiff_test
             net_ifinfo
@@ -135,6 +139,11 @@ jobs:
             rtga_test
             rbmp_test
             rbmp_encode_test
+            # Every 16-bit input through each pixconv converter, with
+            # SSE2, with MMX only, and with no SIMD at all.
+            pixconv_test
+            pixconv_test_nosimd
+            pixconv_test_scalar
             rpng_chunk_overflow_test
             rpng_roundtrip_test
             rpng_decode_corpus_test
@@ -150,7 +159,12 @@ jobs:
             # Stops the worker with a bound when a detachable
             # handler is stuck; waits ~1.5 s by design.
             task_queue_detach_test
+            task_queue_budget_test
+            image_blit_bands_test
             tpool_wait_test
+            # Four CPU-burning jobs on a pool of four must overlap;
+            # on a one-core runner it notes that and still passes.
+            tpool_parallel_test
             data_transfer_pool_scrub_test
             retro_atomic_test
             retro_atomic_extern_c_linkage_test
@@ -166,13 +180,12 @@ jobs:
             # microsecond clock; the late bound is loose for a loaded
             # runner.
             retro_sleep_until_test
-            # Runs its natural tier only here; Makefile.test's
-            # threads-samples forces each tier in turn.  On the
-            # runner's cores the fence check is load-bearing, which
-            # this box cannot make it.
+            # Runs its natural tier only here; procbarrier-tiers.yml
+            # forces every tier on Linux, Windows and macOS runners.
             retro_procbarrier_test
             retro_asym_eventcount_test
             sthread_ex_test
+            fast_cores_test
             memshm_test
             fastjmp_test
             rdds_block_test
@@ -979,6 +992,27 @@ jobs:
           set -u
           set -o pipefail
           ${{ matrix.qemu }} -L ${{ matrix.sysroot }} ./crc32_test
+
+      - name: Build and run pixconv_test under qemu-user
+        shell: bash
+        working-directory: libretro-common/samples/gfx/pixconv
+        run: |
+          set -euo pipefail
+          # The ARM legs are the only place the NEON converters run;
+          # PowerPC runs the scalar paths big-endian.  The armhf
+          # toolchain defaults to VFP without NEON, so armv7 builds a
+          # second time with NEON on.
+          make clean
+          CC="${{ matrix.cc }}" CFLAGS="${{ matrix.cflags }}" make all
+          for t in pixconv_test pixconv_test_nosimd pixconv_test_scalar; do
+             ${{ matrix.qemu }} -L ${{ matrix.sysroot }} ./$t
+          done
+          if [ "${{ matrix.name }}" = armv7 ]; then
+             make clean
+             CC="${{ matrix.cc }}" CFLAGS="-mfpu=neon" make all
+             ${{ matrix.qemu }} -L ${{ matrix.sysroot }} ./pixconv_test
+          fi
+          make clean
 
       - name: Run vfs_mapped_ptr_test without mappings (MMAP=0)
         shell: bash

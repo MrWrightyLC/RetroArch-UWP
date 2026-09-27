@@ -28,6 +28,7 @@
 #include <streams/file_stream.h>
 #include <formats/image.h>
 #include <formats/data_transfer.h>
+#include <retro_atomic.h>
 #include <memory/mem_stats.h>
 #ifdef HAVE_RPNG
 #include <formats/rpng.h>
@@ -336,8 +337,14 @@ gfx_anim_preview_t *gfx_anim_preview_open(const char *path, int png_probe)
    p->windowed   = reserved;
    p->audio_slot = -1;
    p->path       = strldup(path, strlen(path) + 1);
-   image_transfer_anim_stream_get_info(stream, type, &p->width, &p->height,
-         &p->num_frames, &p->loop_count);
+   {
+      /* The stream fills the axes separately; they are one word here. */
+      unsigned sw = 0;
+      unsigned sh = 0;
+      image_transfer_anim_stream_get_info(stream, type, &sw, &sh,
+            &p->num_frames, &p->loop_count);
+      p->dims    = VIDEO_SCALE_PACK(sw, sh);
+   }
    /* Ask for ARGB once, before any frame: the answer holds for the
     * animation's life (a repeat ask after the first frame is refused by
     * APNG even though the order stands - deciding per frame here once
@@ -389,13 +396,17 @@ static void gfx_anim_preview_size_feed(gfx_anim_preview_t *p)
 
 /* --- feeding --------------------------------------------------------------- */
 
+/* The feeder is the decode's thread; this is anyone's. The window's
+ * extent is read by the feeder after each feed and kept where any
+ * thread may read it, rather than the window's own bookkeeping being
+ * read while the feeder moves it. */
 size_t gfx_anim_preview_resident_bytes(const gfx_anim_preview_t *p)
 {
    if (!p)
       return 0;
    if (!p->windowed || !p->dt)
       return p->len;
-   return data_transfer_window_resident(p->dt);
+   return (size_t)retro_atomic_load_acquire_int(&p->resident_seen);
 }
 
 bool gfx_anim_preview_feed(gfx_anim_preview_t *p)
@@ -438,10 +449,55 @@ bool gfx_anim_preview_feed(gfx_anim_preview_t *p)
          ahead  = span_hi - anchor;
          budget = 0;
       }
-      hi = anchor + ahead;
+      /* The paced budget is sized for a decoder that takes one sample
+       * a tick. One catching up takes three or four - it passes the
+       * pictures nothing references over - and a fast one takes them
+       * at whatever rate it decodes; either can eat through the
+       * lookahead faster than half a megabyte a tick refills it, and
+       * then it stands at the wall for the forty ticks the refill
+       * takes. So the pacing holds only while the feed is comfortably
+       * ahead: once the resident lookahead is below half its target,
+       * the tick extends unpaced, the burst a lap or an open already
+       * pays, and the decoder never sees the wall. */
+      else
+      {
+         /* The budget follows the decoder's appetite: at least twice
+          * what it took since the last feed, so a decoder taking four
+          * samples a tick - pictures decoding concurrently take them
+          * in bursts - is kept ahead of without the lookahead ever
+          * running down. And when it has run down, the shortfall is
+          * made up over a few ticks rather than in one read: a burst
+          * of two seconds of 4K from disk on the decoding thread is
+          * itself the pause it was meant to prevent. Only a decoder
+          * already past the frontier gets the unpaced extend, since
+          * its next read faults otherwise. */
+         size_t took = (anchor > p->feed_tell) ? anchor - p->feed_tell : 0;
+         /* file-derived sizes: saturate rather than wrap, or a
+          * decoder that took past half the address space would be
+          * budgeted next to nothing */
+         size_t twice = (took > (size_t)-1 / 2) ? (size_t)-1 : took * 2;
+         if (budget < twice)
+            budget = twice;
+         if (p->feed_res_hi > anchor && p->feed_res_hi - anchor < ahead / 2)
+         {
+            size_t shortfall = ahead - (p->feed_res_hi - anchor);
+            if (budget < shortfall / 4)
+               budget = shortfall / 4;
+         }
+         else if (p->feed_res_hi <= anchor)
+            budget = 0;
+      }
+      p->feed_tell = anchor;
+      hi = (ahead > (size_t)-1 - anchor) ? (size_t)-1 : anchor + ahead;
       if (!data_transfer_window_feed_budget(p->dt, anchor,
                ahead, margin, budget, &res_hi))
          return false;
+      p->feed_res_hi = res_hi;
+      {
+         size_t r = data_transfer_window_resident(p->dt);
+         retro_atomic_store_release_int(&p->resident_seen,
+               r > (size_t)0x7fffffff ? 0x7fffffff : (int)r);
+      }
       /* The demuxer's bound follows what the feed made resident, both
        * ways (a loop's rewind drops the frontier back to the head). */
       if (hi > res_hi)
@@ -551,6 +607,7 @@ static void gfx_anim_preview_audio_stop_slot(gfx_anim_preview_t *p)
    /* the mixer owns (and frees) the audio window through buf_owner */
    p->audio_dt   = NULL;
    p->audio_hi   = 0;
+   p->audio_tell = 0;
    p->audio_slot = -1;
 }
 #endif
@@ -676,10 +733,14 @@ void gfx_anim_preview_audio_begin(gfx_anim_preview_t *p)
       p->audio_dt   = w->dt;
       p->audio_slot = out_slot;
       if (island_hi)
-      {
          p->audio_hi = (keep < blen) ? keep : blen;
-         audio_driver_mixer_stream_set_avail((unsigned)out_slot, p->audio_hi);
-      }
+      /* Every windowed stream decodes under a bound from its first
+       * read: without one the decoder trusts the demuxer's offsets
+       * outright, and the first lap's end shows why that cannot be -
+       * it loops and reads the head at once, before the feeder's next
+       * tick has brought the head back, into pages given up long ago.
+       * The bound is what makes it stand at the wall instead. */
+      audio_driver_mixer_stream_set_avail((unsigned)out_slot, p->audio_hi);
    }
 #else
    (void)p;
@@ -698,10 +759,17 @@ bool gfx_anim_preview_audio_feed(gfx_anim_preview_t *p)
    if (tell >= 0)
    {
       size_t anchor = (size_t)tell;
-      size_t hi     = anchor + GFX_ANIM_PREVIEW_AUDIO_LOOKAHEAD;
+      size_t hi     = (anchor > (size_t)-1 - GFX_ANIM_PREVIEW_AUDIO_LOOKAHEAD)
+                    ? (size_t)-1 : anchor + GFX_ANIM_PREVIEW_AUDIO_LOOKAHEAD;
       size_t res_hi = 0;
       if (hi > p->len)
          hi = p->len;
+      /* The decoder looped: it stands at the wall until this tick has
+       * brought the head back and published a bound for the new lap,
+       * so the bound published for the old lap counts for nothing. */
+      if (anchor < p->audio_tell)
+         p->audio_hi = 0;
+      p->audio_tell = anchor;
       if (!data_transfer_window_feed_budget(p->audio_dt, anchor,
                GFX_ANIM_PREVIEW_AUDIO_LOOKAHEAD, GFX_ANIM_PREVIEW_AUDIO_MARGIN,
                GFX_ANIM_PREVIEW_AUDIO_FEED_BUDGET, &res_hi))
@@ -755,8 +823,14 @@ gfx_anim_preview_t *gfx_anim_preview_wrap(void *stream,
    p->windowed   = windowed;
    p->audio_slot = -1;
    p->path       = path ? strldup(path, strlen(path) + 1) : NULL;
-   image_transfer_anim_stream_get_info(stream, type, &p->width, &p->height,
-         &p->num_frames, &p->loop_count);
+   {
+      /* The stream fills the axes separately; they are one word here. */
+      unsigned sw = 0;
+      unsigned sh = 0;
+      image_transfer_anim_stream_get_info(stream, type, &sw, &sh,
+            &p->num_frames, &p->loop_count);
+      p->dims    = VIDEO_SCALE_PACK(sw, sh);
+   }
    /* gfx_thumbnail's worker asks the stream itself per job; the answer
     * recorded here is for callers that draw through the session. */
    p->native_argb = image_transfer_anim_stream_set_argb(stream, type, 1);

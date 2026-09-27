@@ -98,8 +98,8 @@ int main(void)
    params.samplerate                 = RATE;
    params.filename                   = OUT;
    params.audio_resampler            = "sinc";
-   params.out_width  = params.fb_width  = W;
-   params.out_height = params.fb_height = H;
+   params.out_dims                   = VIDEO_SCALE_PACK(W, H);
+   params.fb_dims                    = VIDEO_SCALE_PACK(W, H);
    params.channels                   = 2;
    params.video_record_scale_factor  = 1;
    params.video_stream_scale_factor  = 1;
@@ -121,8 +121,7 @@ int main(void)
    {
       paint(fb, n);
       vid.data    = fb;
-      vid.width   = W;
-      vid.height  = H;
+      vid.dims    = VIDEO_SCALE_PACK(W, H);
       vid.pitch   = W * sizeof(uint32_t);
       vid.is_dupe = false;
       if (!record_ffmpeg.push_video(rec, &vid))

@@ -16,6 +16,7 @@
  * frame drew at zero opacity.
  */
 #include <features/features_cpu.h>
+#include <retro_timers.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,10 +92,67 @@ static void run(const char *path, const char *label, int expect_video)
 
    {
       const char *fe = getenv("FRAMES");
+      const char *pe = getenv("PACE_HZ");
       int nf = fe ? atoi(fe) : 12;
+      int pace_hz = pe ? atoi(pe) : 0;
       double after_open = rss_mib();
+      int64_t next_us = cpu_features_get_time_usec();
+      int64_t last_change_us = next_us;
+      int64_t worst_gap_us = 0;
+      int last_frames = 0;
       for (i = 0; i < nf; i++)
+      {
+         int64_t now;
+         /* PACE_HZ: run the poll at a display's cadence rather than
+          * flat out, which is how the thumbnail is actually driven,
+          * and record the longest run of polls in which the picture
+          * did not change - the stall a viewer would see. */
+         if (pace_hz > 0)
+         {
+            next_us += 1000000 / pace_hz;
+            now = cpu_features_get_time_usec();
+            if (next_us > now)
+               retro_sleep((unsigned)((next_us - now) / 1000));
+         }
+         now = cpu_features_get_time_usec();
+         gfx_thumbnail_animate(&th, now);
+         if (hp.texture_uploads != last_frames)
+         {
+            int64_t gap = now - last_change_us;
+            if (gap > worst_gap_us)
+               worst_gap_us = gap;
+            if (getenv("PACE_LOG") && gap > 150000)
+               fprintf(stderr, "      stall %6.0f ms before picture %d\n",
+                     (double)gap / 1000.0, hp.texture_uploads);
+            last_change_us = now;
+            last_frames = hp.texture_uploads;
+         }
+      }
+      if (pace_hz > 0)
+      {
+         const char *ms = getenv("PACE_MAX_STALL_MS");
+         printf("      paced at %d Hz: %d picture changes in %d polls, "
+               "longest stall %.0f ms\n", pace_hz, last_frames, nf,
+               (double)worst_gap_us / 1000.0);
+         /* With a bound, the stall is a check: a small fixture decodes
+          * in well under a frame, so a run of polls with the picture
+          * unchanged is the scheduler's doing, not the decoder's. */
+         if (ms)
+            check(label, "P1 no stall past the bound",
+                  worst_gap_us <= (int64_t)atoi(ms) * 1000);
+      }
+      /* The frames above are the measurement window; whether the
+       * first picture has landed by then is a matter of how loaded
+       * the worker is - under a sanitizer, with other fixtures' jobs
+       * still draining, it may not have. What the checks below ask is
+       * whether it lands at all, so keep animating, yielding to the
+       * worker, until it does or a generous bound says it never will. */
+      for (i = 0; i < 2000 && !th.texture
+            && th.status != GFX_THUMBNAIL_STATUS_MISSING; i++)
+      {
          gfx_thumbnail_animate(&th, cpu_features_get_time_usec());
+         retro_sleep(1);
+      }
       peak = rss_mib();
       printf("      RSS after open=%.1f MiB, after %d frames=%.1f MiB\n",
             after_open, nf, peak);
@@ -163,10 +221,11 @@ static void run(const char *path, const char *label, int expect_video)
          check(label, "A6 no preview audio for an animated WEBP",
                hp.audio_streams == 0);
       }
-      else
+      else if (hp.force_preview_audio)
       {
          /* No cap: the window costs its slide, not the file, so even
-          * a 7 GB recording gets audio. */
+          * a 7 GB recording gets audio. Not asked for under NOAUDIO,
+          * which the paced runs use: they are about the pictures. */
          check(label, "A6 preview audio started", hp.audio_streams > 0);
          check(label, "A7 mixer got the whole container",
                hp.last_audio_bytes == (size_t)file_len(path));
@@ -181,6 +240,23 @@ static void run(const char *path, const char *label, int expect_video)
    }
 
    gfx_thumbnail_reset(&th);
+}
+
+
+/* setenv/unsetenv are POSIX; the MSVCRT that MinGW builds against has
+ * _putenv, where "NAME=" removes the variable. getenv sees both. */
+static void env_set(const char *name, const char *value)
+{
+#ifdef _WIN32
+   char buf[256];
+   snprintf(buf, sizeof(buf), "%s=%s", name, value ? value : "");
+   _putenv(buf);
+#else
+   if (value)
+      setenv(name, value, 1);
+   else
+      unsetenv(name);
+#endif
 }
 
 int main(int argc, char **argv)
@@ -199,14 +275,14 @@ int main(int argc, char **argv)
     * file mapping path is exercised: the windowed flag must be false
     * and RSS must not balloon to the file size on the huge sparse
     * fixtures. This is the path the companion-UI merge regressed. */
-   setenv("MEMMAP_NO_RESERVE", "1", 1);
+   env_set("MEMMAP_NO_RESERVE", "1");
    for (i = 1; i < argc; i++)
    {
       char lbl[512];
       snprintf(lbl, sizeof(lbl), "%s [noreserve]", argv[i]);
       run(argv[i], lbl, 2);
    }
-   unsetenv("MEMMAP_NO_RESERVE");
+   env_set("MEMMAP_NO_RESERVE", NULL);
 
    printf("\n%s (%d failure%s)\n", fails ? "FAIL" : "PASS", fails,
          fails == 1 ? "" : "s");

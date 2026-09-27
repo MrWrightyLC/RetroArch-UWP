@@ -592,25 +592,9 @@ static bool audio_driver_resampler_realloc(audio_driver_state_t *audio_st,
          audio_st->resampler_quality, audio_st->src_ratio_orig, hq_oversampling);
    audio_st->resampler_hq = initialized && hq_oversampling
       && audio_st->src_ratio_orig >= 2.0
-      && audio_st->resampler == &sinc_resampler;
+      && audio_st->resampler
+      && (audio_st->resampler->caps & RESAMPLER_CAP_HQ_OVERSAMPLE);
    return initialized;
-}
-
-/* Map the shared resampler quality enum onto the integer sinc driver's own
- * quality enum (they use different orderings). */
-static enum sinc_int16_quality audio_sinc_int16_quality_map(
-      enum resampler_quality q)
-{
-   switch (q)
-   {
-      case RESAMPLER_QUALITY_LOWEST:  return SINC_INT16_QUALITY_LOWEST;
-      case RESAMPLER_QUALITY_LOWER:   return SINC_INT16_QUALITY_LOWER;
-      case RESAMPLER_QUALITY_HIGHER:  return SINC_INT16_QUALITY_HIGHER;
-      case RESAMPLER_QUALITY_HIGHEST: return SINC_INT16_QUALITY_HIGHEST;
-      case RESAMPLER_QUALITY_NORMAL:
-      case RESAMPLER_QUALITY_DONTCARE:
-      default:                        return SINC_INT16_QUALITY_NORMAL;
-   }
 }
 
 size_t audio_driver_get_underruns(void)
@@ -654,21 +638,13 @@ static void audio_driver_extra_free(audio_driver_state_t *audio_st)
 /* An int16 resampler instance of the kind the front pair uses. */
 static void *audio_driver_int16_resampler_new(audio_driver_state_t *audio_st)
 {
-   const char *rs_ident = (audio_st->resampler && audio_st->resampler->short_ident)
-         ? audio_st->resampler->short_ident : "";
-   if (string_is_equal(rs_ident, "sinc"))
-      return sinc_resampler_int16_init_hq(audio_st->src_ratio_orig,
-            audio_sinc_int16_quality_map(audio_st->resampler_quality),
-            audio_st->resampler_hq);
-#ifdef HAVE_NEAREST_RESAMPLER
-   if (string_is_equal(rs_ident, "nearest"))
-      return nearest_resampler_int16_init();
-#endif
-#ifdef HAVE_CC_RESAMPLER
-   if (string_is_equal(rs_ident, "cc"))
-      return cc_resampler_int16_init(audio_st->src_ratio_orig);
-#endif
-   return NULL;
+   retro_resampler_int16_t rs;
+   retro_resampler_int16_new(&rs,
+         (audio_st->resampler && audio_st->resampler->short_ident)
+               ? audio_st->resampler->short_ident : NULL,
+         audio_st->resampler_quality, audio_st->src_ratio_orig,
+         audio_st->resampler_hq);
+   return rs.data;
 }
 
 /* Room for a batch of extras: the buffers, and resampler instances of
@@ -989,12 +965,50 @@ static INLINE bool audio_driver_pipe_ahead(const audio_driver_state_t *audio_st,
    return d && d <= audio_st->pipe_ring.capacity;
 }
 
-/* The ring's positions restart with it; so do the marks in them. */
+/* The main thread's side of the resume mark: a new sequence, armed at
+ * @at or not armed at all. The main thread is the mark's only writer. */
+static void audio_driver_pipe_fade_publish(audio_driver_state_t *audio_st,
+      bool armed, size_t at)
+{
+   unsigned seq = ((unsigned)retro_atomic_load_relaxed_int(
+            &audio_st->pipe_fade_in_mark) >> 1) + 1;
+   if (armed)
+      retro_atomic_store_release_size(&audio_st->pipe_fade_in_at, at);
+   retro_atomic_store_release_int(&audio_st->pipe_fade_in_mark,
+         (int)((seq << 1) | (armed ? 1u : 0u)));
+}
+
+/* The consumer's side: the resume point a mark still asks for, and the
+ * mark's sequence to record once it is acted on. The position is taken
+ * between two reads of the mark that agree, so it is that mark's. */
+static bool audio_driver_pipe_fade_pending(audio_driver_state_t *audio_st,
+      size_t *at, unsigned *seq)
+{
+   for (;;)
+   {
+      unsigned mark = (unsigned)retro_atomic_load_acquire_int(
+            &audio_st->pipe_fade_in_mark);
+      if (!(mark & 1u) || (mark >> 1) == audio_st->pipe_fade_in_seen)
+         return false;
+      *at = retro_atomic_load_acquire_size(&audio_st->pipe_fade_in_at);
+      if ((unsigned)retro_atomic_load_acquire_int(
+               &audio_st->pipe_fade_in_mark) == mark)
+      {
+         *seq = mark >> 1;
+         return true;
+      }
+   }
+}
+
+/* The ring's positions restart with it; so do the marks in them. Both
+ * owners are parked. */
 static void audio_driver_pipe_marks_clear(audio_driver_state_t *audio_st)
 {
    audio_st->pipe_discard_seen =
          retro_atomic_load_acquire_int(&audio_st->pipe_discard_gen);
-   retro_atomic_store_release_int(&audio_st->pipe_fade_in_set, 0);
+   audio_st->pipe_fade_in_seen =
+         (unsigned)retro_atomic_load_acquire_int(
+               &audio_st->pipe_fade_in_mark) >> 1;
    audio_st->pipe_arm_fade     = false;
 }
 #endif
@@ -3408,18 +3422,14 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
     * batch.  The resampler sees identical bytes either way, so output is
     * bit-exact.
     *
-    * The pointer must still be suitably aligned: the CC resampler's ARM
-    * NEON assembly loads its input with an explicit alignment hint
-    * (`vld1.f32 d16, [r1, :64]!` in cc_resampler_neon.S), which faults on
-    * an under-aligned address.  input_data is memalign_alloc(64); a
-    * core-owned buffer carries no such guarantee, so fall back to the copy
-    * unless the pointer is at least 16-byte aligned. */
+    * Nothing downstream requires the pointer to be aligned: every
+    * resampler reads data_in scalar-wise or with unaligned loads, and so
+    * does the bypass clamp. */
    {
       bool synth_on   = midi_driver_synth_active() && audio_st->synth_buf;
       bool copy_input = !is_float
             || (audio_volume_gain != 1.0f)
             || synth_on
-            || (((uintptr_t)data & 0xf) != 0)
 #ifdef HAVE_DSP_FILTER
             || (audio_st->dsp != NULL)
 #endif
@@ -4472,35 +4482,14 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
          && audio_driver_st.resampler->short_ident)
    {
       const char *rs_ident = audio_driver_st.resampler->short_ident;
-      if (string_is_equal(rs_ident, "sinc"))
-      {
-         audio_driver_st.resampler_data_int16 = sinc_resampler_int16_init_hq(
-               audio_driver_st.src_ratio_orig,
-               audio_sinc_int16_quality_map(audio_driver_st.resampler_quality),
-               audio_driver_st.resampler_hq);
-         audio_driver_st.resampler_int16_process = sinc_resampler_int16_process;
-         audio_driver_st.resampler_int16_free    = sinc_resampler_int16_free;
-         audio_driver_st.resampler_int16_reset   = sinc_resampler_int16_reset;
-      }
-#ifdef HAVE_NEAREST_RESAMPLER
-      else if (string_is_equal(rs_ident, "nearest"))
-      {
-         audio_driver_st.resampler_data_int16 = nearest_resampler_int16_init();
-         audio_driver_st.resampler_int16_process = nearest_resampler_int16_process;
-         audio_driver_st.resampler_int16_free    = nearest_resampler_int16_free;
-         audio_driver_st.resampler_int16_reset   = nearest_resampler_int16_reset;
-      }
-#endif
-#ifdef HAVE_CC_RESAMPLER
-      else if (string_is_equal(rs_ident, "cc"))
-      {
-         audio_driver_st.resampler_data_int16 = cc_resampler_int16_init(
-               audio_driver_st.src_ratio_orig);
-         audio_driver_st.resampler_int16_process = cc_resampler_int16_process;
-         audio_driver_st.resampler_int16_free    = cc_resampler_int16_free;
-         audio_driver_st.resampler_int16_reset   = cc_resampler_int16_reset;
-      }
-#endif
+      retro_resampler_int16_t rs;
+      retro_resampler_int16_new(&rs, rs_ident,
+            audio_driver_st.resampler_quality,
+            audio_driver_st.src_ratio_orig, audio_driver_st.resampler_hq);
+      audio_driver_st.resampler_data_int16    = rs.data;
+      audio_driver_st.resampler_int16_process = rs.process;
+      audio_driver_st.resampler_int16_free    = rs.free;
+      audio_driver_st.resampler_int16_reset   = rs.reset;
       if (audio_driver_st.resampler_int16_process)
          RARCH_LOG("[Audio] %s resampler: integer s16 path %s.\n",
                rs_ident,
@@ -4566,18 +4555,7 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
                ? (double)audio_driver_st.buffer_size / frame_bytes
                   * 1000.0 / out_rate
                : 0.0;
-         const char *ident     = audio_driver_st.current_audio->ident;
-#ifdef HAVE_THREADS
-         /* Name the driver the user chose, not the wrapper it runs
-          * under. */
-         if (string_is_equal(ident, "audio-thread"))
-         {
-            const audio_driver_t *inner = audio_thread_wrapped_driver(
-                  audio_driver_st.context_audio_data);
-            if (inner)
-               ident           = inner->ident;
-         }
-#endif
+         const char *ident     = audio_driver_get_ident();
          RARCH_LOG("[Audio] Driver \"%s\" reports a %u-byte buffer: "
                "%.1f ms of %u-channel %s at %u Hz against a %u ms latency setting%s; "
                "rate control %s it near %.1f ms.\n",
@@ -5026,7 +5004,7 @@ void audio_driver_pause_fade(bool paused)
    retro_atomic_store_release_size(&audio_st->pipe_discard_to,
          retro_atomic_load_acquire_size(&audio_st->pipe_ring.head));
    retro_atomic_fetch_add_int(&audio_st->pipe_discard_gen, 1);
-   retro_atomic_store_release_int(&audio_st->pipe_fade_in_set, 0);
+   audio_driver_pipe_fade_publish(audio_st, false, 0);
 #endif
 
    /* Only when something was playing is there a step to smooth. */
@@ -5552,9 +5530,8 @@ static void audio_driver_submit_width(audio_driver_state_t *audio_st,
        * whatever the consumer flushes next: mark where that starts. */
       if (from_core && audio_st->fade_in_pending)
       {
-         retro_atomic_store_release_size(&audio_st->pipe_fade_in_at,
+         audio_driver_pipe_fade_publish(audio_st, true,
                retro_atomic_load_relaxed_size(&audio_st->pipe_ring.head));
-         retro_atomic_store_release_int(&audio_st->pipe_fade_in_set, 1);
          audio_st->fade_in_pending = false;
       }
 
@@ -6198,20 +6175,23 @@ static void audio_driver_transport_consume(audio_driver_state_t *st)
       /* Never across the point the core's audio resumes at: there the
        * stage drops the silence it holds and the ramp is armed for what
        * it renders next. */
-      if (retro_atomic_load_acquire_int(&st->pipe_fade_in_set))
       {
-         size_t at = retro_atomic_load_acquire_size(&st->pipe_fade_in_at);
-         if (audio_driver_pipe_ahead(st, tail, at))
+         size_t   at;
+         unsigned seq;
+         if (audio_driver_pipe_fade_pending(st, &at, &seq))
          {
-            size_t upto = (at - tail) / st->pipe_frame_bytes;
-            if (input_budget > upto)
-               input_budget = upto;
-         }
-         else
-         {
-            audio_driver_transport_discard(0, false);
-            st->pipe_arm_fade = true;
-            retro_atomic_store_release_int(&st->pipe_fade_in_set, 0);
+            if (audio_driver_pipe_ahead(st, tail, at))
+            {
+               size_t upto = (at - tail) / st->pipe_frame_bytes;
+               if (input_budget > upto)
+                  input_budget = upto;
+            }
+            else
+            {
+               audio_driver_transport_discard(0, false);
+               st->pipe_arm_fade     = true;
+               st->pipe_fade_in_seen = seq;
+            }
          }
       }
    }
@@ -6473,19 +6453,22 @@ static void audio_driver_pipeline_consume(audio_driver_state_t *audio_st)
       }
       /* Never across the point the core's audio resumes at: the ramp is
        * armed for the chunk that starts there. */
-      if (retro_atomic_load_acquire_int(&audio_st->pipe_fade_in_set))
       {
-         size_t at = retro_atomic_load_acquire_size(&audio_st->pipe_fade_in_at);
-         if (audio_driver_pipe_ahead(audio_st, tail, at))
+         size_t   at;
+         unsigned seq;
+         if (audio_driver_pipe_fade_pending(audio_st, &at, &seq))
          {
-            size_t upto = (at - tail) / audio_st->pipe_frame_bytes;
-            if (have > upto)
-               have = upto;
-         }
-         else
-         {
-            audio_st->pipe_arm_fade = true;
-            retro_atomic_store_release_int(&audio_st->pipe_fade_in_set, 0);
+            if (audio_driver_pipe_ahead(audio_st, tail, at))
+            {
+               size_t upto = (at - tail) / audio_st->pipe_frame_bytes;
+               if (have > upto)
+                  have = upto;
+            }
+            else
+            {
+               audio_st->pipe_arm_fade     = true;
+               audio_st->pipe_fade_in_seen = seq;
+            }
          }
       }
    }
@@ -7773,6 +7756,7 @@ bool audio_driver_mixer_add_stream(audio_mixer_stream_params_t *params)
          if (audio_driver_mixer_use_s16(audio_driver_st.stat_core_is_float))
             voice = audio_mixer_play_s16(handle, looped,
                   GAIN_TO_Q16(params->volume),
+                  audio_driver_st.resampler_ident,
                   audio_driver_st.resampler_quality, stop_cb);
          else
             voice = audio_mixer_play(handle, looped, params->volume,
@@ -7863,6 +7847,7 @@ static void audio_driver_mixer_play_stream_internal(
                audio_mixer_play_s16(audio_driver_st.mixer_streams[i].handle,
                   (type == AUDIO_STREAM_STATE_PLAYING_LOOPED) ? true : false,
                   AUDIO_MIXER_GAIN_UNITY,
+                  audio_driver_st.resampler_ident,
                   audio_driver_st.resampler_quality,
                   audio_driver_st.mixer_streams[i].stop_cb);
          else
@@ -8308,7 +8293,7 @@ bool audio_driver_start(bool is_shutdown)
    }
 
    RARCH_DBG("[Audio] Started audio driver \"%s\" (is_shutdown=%s)\n",
-         audio->ident, is_shutdown ? "true" : "false");
+         audio_driver_get_ident(), is_shutdown ? "true" : "false");
 
    return true;
 
@@ -8742,7 +8727,8 @@ bool audio_driver_stop(void)
          audio_driver_state_unlock();
       }
       AUDIO_FLAGS_CLEAR(audio_st, AUDIO_FLAG_STARTED);
-      RARCH_DBG("[Audio] Stopped audio driver \"%s\".\n", audio->ident);
+      RARCH_DBG("[Audio] Stopped audio driver \"%s\".\n",
+            audio_driver_get_ident());
    }
 
    return stopped;
@@ -9429,32 +9415,12 @@ static bool mic_driver_open_mic_internal(retro_microphone_t* microphone)
          &&   microphone->resampler
          &&   microphone->resampler->short_ident)
    {
-      const char *rs_ident = microphone->resampler->short_ident;
-      if (string_is_equal(rs_ident, "sinc"))
-      {
-         microphone->resampler_data_int16 = sinc_resampler_int16_init(
-               microphone->orig_ratio,
-               audio_sinc_int16_quality_map(mic_st->resampler_quality));
-         microphone->resampler_int16_process = sinc_resampler_int16_process;
-         microphone->resampler_int16_free    = sinc_resampler_int16_free;
-      }
-#ifdef HAVE_NEAREST_RESAMPLER
-      else if (string_is_equal(rs_ident, "nearest"))
-      {
-         microphone->resampler_data_int16 = nearest_resampler_int16_init();
-         microphone->resampler_int16_process = nearest_resampler_int16_process;
-         microphone->resampler_int16_free    = nearest_resampler_int16_free;
-      }
-#endif
-#ifdef HAVE_CC_RESAMPLER
-      else if (string_is_equal(rs_ident, "cc"))
-      {
-         microphone->resampler_data_int16 = cc_resampler_int16_init(
-               microphone->orig_ratio);
-         microphone->resampler_int16_process = cc_resampler_int16_process;
-         microphone->resampler_int16_free    = cc_resampler_int16_free;
-      }
-#endif
+      retro_resampler_int16_t rs;
+      retro_resampler_int16_new(&rs, microphone->resampler->short_ident,
+            mic_st->resampler_quality, microphone->orig_ratio, false);
+      microphone->resampler_data_int16    = rs.data;
+      microphone->resampler_int16_process = rs.process;
+      microphone->resampler_int16_free    = rs.free;
       if (!microphone->resampler_data_int16)
       {
          microphone->resampler_int16_process = NULL;

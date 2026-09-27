@@ -2,6 +2,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <audio/sinc_resampler.h>
+#include <file/config_file_userdata.h>
+
+/* audio_resampler.c's resampler_config points at these. Nothing here
+ * passes backend config userdata, so a call is a bug. Visible despite
+ * -fwhole-program: audio_resampler.o links against them. */
+#define CU_STUB __attribute__((externally_visible))
+CU_STUB int config_userdata_get_float(void *u, const char *k, float *v, float d) { abort(); return 0; }
+CU_STUB int config_userdata_get_int(void *u, const char *k, int *v, int d) { abort(); return 0; }
+CU_STUB int config_userdata_get_float_array(void *u, const char *k, float **v, unsigned *n, const float *d, unsigned c) { abort(); return 0; }
+CU_STUB int config_userdata_get_int_array(void *u, const char *k, int **v, unsigned *n, const int *d, unsigned c) { abort(); return 0; }
+CU_STUB int config_userdata_get_string(void *u, const char *k, char **v, const char *d) { abort(); return 0; }
+CU_STUB void config_userdata_free(void *p) { abort(); }
 #ifndef EXTRA_TEST_SIMD
 #define EXTRA_TEST_SIMD 0
 #endif
@@ -71,6 +83,24 @@ static void *tracked_realloc(void *ptr, size_t bytes)
 #undef realloc
 
 /* Only the resampler factory is stubbed; preparation and processing are real. */
+/* As with retro_resampler_realloc_hq() below: the harness supplies the
+ * resampler layer rather than linking it, and the lanes here drive sinc. */
+bool retro_resampler_int16_new(retro_resampler_int16_t *out,
+      const char *short_ident, enum resampler_quality quality,
+      double bw_ratio, bool hq_oversampling)
+{
+   (void)short_ident;
+   (void)quality;
+   memset(out, 0, sizeof(*out));
+   if (!(out->data = sinc_resampler_int16_init_hq(bw_ratio,
+               SINC_INT16_QUALITY_NORMAL, hq_oversampling)))
+      return false;
+   out->process = sinc_resampler_int16_process;
+   out->reset   = sinc_resampler_int16_reset;
+   out->free    = sinc_resampler_int16_free;
+   return true;
+}
+
 bool retro_resampler_realloc_hq(void **re, const retro_resampler_t **backend,
       const char *ident, enum resampler_quality quality, double ratio, bool hq)
 {
@@ -82,7 +112,10 @@ bool retro_resampler_realloc_hq(void **re, const retro_resampler_t **backend,
    *backend = &sinc_resampler;
    if (ident && strcmp(ident, "other") == 0)
    {
+      /* A backend that does not offer HQ oversampling, which is what
+       * the policy reads now rather than the identity of sinc. */
       alternate = sinc_resampler;
+      alternate.caps &= ~RESAMPLER_CAP_HQ_OVERSAMPLE;
       *backend = &alternate;
       hq = false;
    }
