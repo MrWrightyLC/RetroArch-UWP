@@ -82,11 +82,11 @@ jobs:
               }
           }
           if ("${{ matrix.config }}" -eq "ReleaseANGLE") {
-              curl.exe -L "https://github.com/TheRhysWyrill/RA-Xbox-Files/raw/main/Angle%20Cores.zip" --output Angle_Cores.zip
+              curl.exe -L "https://github.com/MrWrightyLC/RA-Xbox-Files/raw/main/Angle%20Cores.zip" --output Angle_Cores.zip
               7z x Angle_Cores.zip -aoa -o"pkg\msvc-uwp\RetroArch-msvcUWP\cores\x64\cores" *.* -r -y
           }
-          curl.exe -L "https://github.com/TheRhysWyrill/RA-Xbox-Files/raw/main/DLLs.zip.001" --output DLLs.zip.001
-          curl.exe -L "https://github.com/TheRhysWyrill/RA-Xbox-Files/raw/main/DLLs.zip.002" --output DLLs.zip.002
+          curl.exe -L "https://github.com/MrWrightyLC/RA-Xbox-Files/raw/main/DLLs.zip.001" --output DLLs.zip.001
+          curl.exe -L "https://github.com/MrWrightyLC/RA-Xbox-Files/raw/main/DLLs.zip.002" --output DLLs.zip.002
           7z x DLLs.zip.001 -o"pkg\msvc-uwp\RetroArch-msvcUWP\cores\x64" *.* -r -y
           
           # Clean up unneeded files securely
