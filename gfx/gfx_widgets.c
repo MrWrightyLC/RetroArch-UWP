@@ -185,8 +185,7 @@ static void msg_widget_msg_transition_animation_done(void *userdata)
 
    if (msg->msg_new)
    {
-      msg->msg     = strdup(msg->msg_new);
-      free(msg->msg_new);
+      msg->msg     = msg->msg_new;
       msg->msg_new = NULL;
    }
 
@@ -314,6 +313,7 @@ static void gfx_widgets_msg_measure(dispgfx_widget_t *p_dispwidget,
 
 static void gfx_widgets_msg_queue_push_state(
       retro_task_t *task,
+      task_progress_snapshot_t *snapshot,
       const char *msg,
       size_t len,
       unsigned duration,
@@ -400,6 +400,9 @@ static void gfx_widgets_msg_queue_push_state(
       {
          const char *msg_title                  = msg;
 
+         if (task && !snapshot->title)
+            return;
+
          msg_widget                             = (disp_widget_msg_t*)malloc(sizeof(*msg_widget));
 
          if (!msg_widget)
@@ -415,11 +418,7 @@ static void gfx_widgets_msg_queue_push_state(
 
          msg_widget->offset_y                   = 0;
          msg_widget->alpha                      = 1.0f;
-         /* Set while the task is being built, before task_queue_push()
-          * hands it to the queue, and never changed after - so this is
-          * the one task property readable here without the queue's
-          * property lock, which the push no longer holds. */
-         msg_widget->alternative_look           = task && (task->flags & RETRO_TASK_FLG_ALTERNATIVE_LOOK);
+         msg_widget->alternative_look           = task && (snapshot->flags & RETRO_TASK_FLG_ALTERNATIVE_LOOK);
 
          msg_widget->width                      = 0;
 
@@ -446,27 +445,29 @@ static void gfx_widgets_msg_queue_push_state(
 
          if (task)
          {
+            char **text = (snapshot->error && *snapshot->error)
+               ? &snapshot->error : &snapshot->title;
             msg_widget->flags                  |= DISPWIDG_FLAG_TASK;
 
-            if (task->error && *task->error)
-            {
+            if (snapshot->error && *snapshot->error)
                msg_widget->flags               |= DISPWIDG_FLAG_TASK_ERROR;
-               len                              = strlen(task->error);
-               msg_title = msg_widget->msg      = strdup(task->error);
-            }
-            else
+
+            msg_widget->msg_new                 = strdup(*text);
+            if (!msg_widget->msg_new)
             {
-               len                              = strlen(task->title);
-               msg_title = msg_widget->msg      = strdup(task->title);
+               free(msg_widget);
+               return;
             }
-            msg_widget->msg_new                 = strdup(msg_title);
+            msg_title = msg_widget->msg         = *text;
+            *text                              = NULL;
+            len                                = strlen(msg_title);
             msg_widget->msg_len                 = len;
 
-            if ((task->flags & RETRO_TASK_FLG_CANCELLED) != 0)
+            if ((snapshot->flags & RETRO_TASK_FLG_CANCELLED) != 0)
                msg_widget->flags               |= DISPWIDG_FLAG_TASK_CANCELLED;
-            if ((task->flags & RETRO_TASK_FLG_FINISHED) != 0)
+            if ((snapshot->flags & RETRO_TASK_FLG_FINISHED) != 0)
                msg_widget->flags               |= DISPWIDG_FLAG_TASK_FINISHED;
-            msg_widget->task_progress           = task->progress;
+            msg_widget->task_progress           = snapshot->progress;
             msg_widget->task_ident              = task->ident;
 
             if (task->style == TASK_STYLE_POSITIVE)
@@ -565,11 +566,16 @@ static void gfx_widgets_msg_queue_push_state(
             msg_widget->flags &= ~DISPWIDG_FLAG_EXPIRATION_TIMER_STARTED;
          }
 
-         if (!string_is_equal(task->title, msg_widget->msg_new))
+         if (snapshot->title &&
+               !string_is_equal(snapshot->title, msg_widget->msg_new
+                  ? msg_widget->msg_new : msg_widget->msg))
          {
+            uintptr_t title_tag = (uintptr_t)&msg_widget->msg_transition_animation;
             size_t _len;
             unsigned new_width;
             const char *new_title;
+
+            gfx_animation_kill_widget_by_tag(&title_tag);
 
             if (msg_widget->msg_new)
             {
@@ -577,7 +583,8 @@ static void gfx_widgets_msg_queue_push_state(
                msg_widget->msg_new                 = NULL;
             }
 
-            new_title   = msg_widget->msg_new      = strdup(task->title);
+            new_title   = msg_widget->msg_new      = snapshot->title;
+            snapshot->title                       = NULL;
 
             _len        = strlen(new_title);
             new_width   = font_driver_get_message_width(
@@ -594,7 +601,7 @@ static void gfx_widgets_msg_queue_push_state(
                gfx_animation_ctx_entry_t entry;
 
                entry.easing_enum    = EASING_OUT_QUAD;
-               entry.tag            = (uintptr_t)msg_widget;
+               entry.tag            = title_tag;
                entry.duration       = MSG_QUEUE_ANIMATION_DURATION;
                entry.target_value   = p_dispwidget->msg_queue_height / 2.0f;
                entry.subject        = &msg_widget->msg_transition_animation;
@@ -609,13 +616,13 @@ static void gfx_widgets_msg_queue_push_state(
             msg_widget->width = new_width;
          }
 
-         if (task->error && *task->error)
+         if (snapshot->error && *snapshot->error)
             msg_widget->flags               |= DISPWIDG_FLAG_TASK_ERROR;
-         if ((task->flags & RETRO_TASK_FLG_CANCELLED) != 0)
+         if ((snapshot->flags & RETRO_TASK_FLG_CANCELLED) != 0)
             msg_widget->flags               |= DISPWIDG_FLAG_TASK_CANCELLED;
-         if ((task->flags & RETRO_TASK_FLG_FINISHED) != 0)
+         if ((snapshot->flags & RETRO_TASK_FLG_FINISHED) != 0)
             msg_widget->flags               |= DISPWIDG_FLAG_TASK_FINISHED;
-         msg_widget->task_progress     = task->progress;
+         msg_widget->task_progress     = snapshot->progress;
       }
    }
 }
@@ -631,18 +638,25 @@ void gfx_widgets_msg_queue_push(
       unsigned prio, bool flush,
       bool menu_is_alive)
 {
+   task_progress_snapshot_t snapshot;
+
    /* A plain message touches only the queue, under its own lock, and
     * the widget it allocates, which the consumer measures; a task's
     * reads and updates the widget it may already have on screen */
    if (!task)
    {
-      gfx_widgets_msg_queue_push_state(task, msg, len, duration, title,
+      gfx_widgets_msg_queue_push_state(task, NULL, msg, len, duration, title,
             icon, category, prio, flush, menu_is_alive);
       return;
    }
+   /* Publish terminal flags even if copying a string fails. */
+   task_get_progress_snapshot(task, &snapshot);
    gfx_widgets_state_lock();
-   gfx_widgets_msg_queue_push_state(task, msg, len, duration, title, icon, category, prio, flush, menu_is_alive);
+   gfx_widgets_msg_queue_push_state(task, &snapshot, msg, len, duration,
+         title, icon, category, prio, flush, menu_is_alive);
    gfx_widgets_state_unlock();
+   free(snapshot.title);
+   free(snapshot.error);
 }
 
 static void gfx_widgets_move_end(void *userdata)
@@ -709,6 +723,7 @@ static void gfx_widgets_msg_queue_free(
 {
    uintptr_t tag = (uintptr_t)msg;
    uintptr_t hourglass_timer_tag = (uintptr_t)&msg->hourglass_timer;
+   uintptr_t title_tag = (uintptr_t)&msg->msg_transition_animation;
 
    /* Remove the reference the task has of ourself, so that its next
     * progress push spawns a fresh widget instead of dereferencing the
@@ -744,6 +759,7 @@ static void gfx_widgets_msg_queue_free(
    }
 
    /* Kill all animations */
+   gfx_animation_kill_widget_by_tag(&title_tag);
    gfx_animation_kill_widget_by_tag(&hourglass_timer_tag);
    gfx_animation_kill_widget_by_tag(&tag);
 
@@ -1517,10 +1533,6 @@ static void gfx_widgets_draw_task_msg(
    {
       if (msg->flags & DISPWIDG_FLAG_TASK_ERROR)
          _len = strlcpy(task_percentage, msg_hash_to_str(MSG_ERROR), sizeof(task_percentage));
-
-      /* Not finished yet really */
-      if (msg->task_progress > 0 && msg->task_progress < 100)
-         msg->flags &= ~DISPWIDG_FLAG_TASK_FINISHED;
    }
    else if (msg->task_progress >= 0 && msg->task_progress <= 100)
       _len = snprintf(task_percentage, sizeof(task_percentage),

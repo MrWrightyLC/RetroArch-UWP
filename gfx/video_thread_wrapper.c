@@ -1841,6 +1841,7 @@ static void video_thread_loop(void *data)
          thr->frame.tail    = slot ^ 1;
          thr->frame.pending--;
          thr->frame.busy    = true;
+         video_thread_hw_note_claim(thr, thr->frame.slot[slot].hw_slot);
          /* The paced wait in video_thread_frame() blocks on pending
           * dropping, which just happened; tell it now rather than a
           * whole render later at completion. */
@@ -1987,6 +1988,12 @@ static void video_thread_loop(void *data)
                             + thr->frame.slot[slot].offset;
                   unsigned fdims    = thr->frame.slot[slot].dims;
                   unsigned fpitch   = thr->frame.slot[slot].pitch;
+                  /* A dupe of a hardware frame draws the last presented
+                   * HW slot again, so it is installed and fenced like
+                   * the frame that first drew it: the core's wait on
+                   * the slot then covers this read as well. */
+                  int dupe_hw_slot  = thr->frame.slot[slot].dupe
+                     ? video_thread_hw_dupe_slot(thr) : -1;
                   if (fdata && thr->frame.slot[slot].convert)
                      video_thread_convert(thr, thr->frame.slot[slot].convert,
                            &fdata, fdims, &fpitch);
@@ -1994,6 +2001,8 @@ static void video_thread_loop(void *data)
                   if (fdata && thr->frame.slot[slot].filter_bpp)
                      video_thread_filter(thr, &fdata, &fdims, &fpitch);
 #endif
+                  if (dupe_hw_slot >= 0)
+                     video_thread_hw_before_frame(thr, dupe_hw_slot);
                   ret = thr->driver->frame(thr->driver_data,
                      fdata, fdims,
                      thr->frame.slot[slot].count,
@@ -2001,6 +2010,8 @@ static void video_thread_loop(void *data)
                      *thr->frame.slot[slot].msg
                         ? thr->frame.slot[slot].msg : NULL,
                      video_info);
+                  if (dupe_hw_slot >= 0)
+                     video_thread_hw_after_frame(thr, dupe_hw_slot);
                }
 
                ret_frame  = ret;
@@ -2432,7 +2443,9 @@ static bool video_thread_frame(void *data, const void *frame_,
    unsigned slot       = 0;
    int hw_slot         = -1;
    bool dropped        = false;
+   bool dupe_dropped   = false;
    bool zero_copy      = false;
+   bool spare_in       = false;
    bool waited         = false;
    size_t lent_off     = 0;
 #ifdef HAVE_VIDEO_FILTER
@@ -2577,24 +2590,37 @@ static bool video_thread_frame(void *data, const void *frame_,
        * dupe, rather than read as pixels. */
    }
 
-   /* A frame rendered straight into the lent slot: publish that slot,
-    * no copy. The loan kept it free, so it is still neither pending nor
-    * being rendered. The frame may start anywhere inside the slot and
-    * carry any pitch: a core that renders a whole surface into the loan
-    * and crops by pointer offset, or keeps its own stride, is still in
-    * place. Any other push means the core rendered elsewhere; the loan
-    * lapses and the slot is picked as usual. */
+   /* A frame rendered straight into the lent buffer: publish it, no
+    * copy. A lent ring slot was kept free by the loan, so it is still
+    * neither pending nor being rendered, and it is the slot. A lent
+    * spare goes to whichever slot the pick below chooses, swapped in by
+    * pointer; the buffer it displaces is the next spare. The frame may
+    * start anywhere inside the buffer and carry any pitch: a core that
+    * renders a whole surface into the loan and crops by pointer offset,
+    * or keeps its own stride, is still in place. Any other push means
+    * the core rendered elsewhere; the loan lapses and the slot is
+    * picked as usual. */
    if (thr->frame.lent >= 0)
    {
       unsigned l = (unsigned)thr->frame.lent;
-      const uint8_t *f = (const uint8_t*)frame_;
-      const uint8_t *b = thr->frame.slot[l].buffer;
+      /* Compared as integers: a core that rendered elsewhere pushes a
+       * pointer into some other object, and ordering two pointers into
+       * different objects with < is undefined in C. The subtraction
+       * cannot wrap once the address is known to be at or past the
+       * buffer's start. */
+      uintptr_t f = (uintptr_t)frame_;
+      uintptr_t b = (l == VIDEO_THREAD_LEND_SPARE)
+         ? (uintptr_t)thr->frame.spare
+         : (uintptr_t)thr->frame.slot[l].buffer;
       thr->frame.lent = -1;
-      if (f && f >= b && f < b + thr->frame.buffer_size)
+      if (f && f >= b && f - b < thr->frame.buffer_size)
       {
          zero_copy = true;
-         slot      = l;
          lent_off  = (size_t)(f - b);
+         if (l == VIDEO_THREAD_LEND_SPARE)
+            spare_in = true;
+         else
+            slot   = l;
       }
       else
          thr->handoff.lapsed++;
@@ -2604,7 +2630,7 @@ static bool video_thread_frame(void *data, const void *frame_,
     * claims tail next, so a slot is free when it is neither. When both
     * are taken, the newest unclaimed frame is replaced rather than the
     * new one dropped, and the worker keeps rendering what it holds. */
-   if (zero_copy)
+   if (zero_copy && !spare_in)
       ;
    else if (!thr->frame.pending)
       slot = thr->frame.tail;
@@ -2613,9 +2639,28 @@ static bool video_thread_frame(void *data, const void *frame_,
    else
    {
       slot = (thr->frame.pending == 2) ? (thr->frame.tail ^ 1) : thr->frame.tail;
-      thr->frame.pending--;
       thr->miss_count++;
       dropped = true;
+      /* A dupe carries no image. Letting it replace a real frame the
+       * worker has not claimed yet would throw away the only new image
+       * the core produced (a 30 fps game sends real, dupe, real, dupe)
+       * and show the frame before it for two periods. Without the
+       * wrapper a NULL push never loses a frame; here the dupe is what
+       * gets dropped, and the real frame stays queued. */
+      if (!frame_ && hw_slot < 0 && !thr->frame.slot[slot].dupe)
+         dupe_dropped = true;
+      else
+         thr->frame.pending--;
+   }
+
+   /* The picked slot is unclaimed, so the worker holds no pointer into
+    * its buffer; it reads the new one after claiming it under this
+    * lock. */
+   if (spare_in)
+   {
+      uint8_t *displaced             = thr->frame.slot[slot].buffer;
+      thr->frame.slot[slot].buffer   = thr->frame.spare;
+      thr->frame.spare               = displaced;
    }
 
    slock_unlock(thr->lock);
@@ -2624,6 +2669,7 @@ static bool video_thread_frame(void *data, const void *frame_,
    if (((video_thread_private_t*)thr)->rec_retired)
       video_thread_rec_reap(thr);
 
+   if (!dupe_dropped)
    {
       const uint8_t *src   = (const uint8_t*)frame_;
       uint8_t       *dst   = thr->frame.slot[slot].buffer;
@@ -2666,8 +2712,16 @@ static bool video_thread_frame(void *data, const void *frame_,
          thr->frame.zero_copy_count++;
          if (pitch)
             copy_stride = (unsigned)pitch;
-         if (lent_off + (size_t)height * copy_stride > thr->frame.buffer_size)
-            height = (unsigned)((thr->frame.buffer_size - lent_off) / copy_stride);
+         /* Rows that fit between the offset and the end of the slot,
+          * without forming height * stride, which can wrap. */
+         if (copy_stride)
+         {
+            size_t room = (thr->frame.buffer_size - lent_off) / copy_stride;
+            if ((size_t)height > room)
+               height = (unsigned)room;
+         }
+         else
+            height = 0;
       }
       else if (src)
       {
@@ -2774,7 +2828,10 @@ static bool video_thread_frame(void *data, const void *frame_,
    }
 
    slock_lock(thr->lock);
-   thr->frame.pending++;
+   /* Nothing was queued for a dropped dupe; the real frame it would
+    * have replaced is still pending. */
+   if (!dupe_dropped)
+      thr->frame.pending++;
    scond_signal(thr->cond_thread);
 
    if (timed)
@@ -3092,9 +3149,12 @@ static void video_thread_free(void *data)
 #ifdef _3DS
       linearFree(thr->frame.slot[0].buffer);
       linearFree(thr->frame.slot[1].buffer);
+      if (thr->frame.spare)
+         linearFree(thr->frame.spare);
 #else
       memalign_free(thr->frame.slot[0].buffer);
       memalign_free(thr->frame.slot[1].buffer);
+      memalign_free(thr->frame.spare);
 #endif
       free((void*)thr->alpha_mod);
       free(thr->alpha_applied);
@@ -3485,13 +3545,28 @@ static void thread_set_texture_frame(void *data, const void *frame,
    slock_unlock(thr->frame.lock);
 }
 
+/* The spare buffer, allocated the first time a loan needs it. Sized and
+ * aligned as the ring slots are, since a push swaps it into one. */
+static bool video_thread_spare_alloc(thread_video_t *thr)
+{
+#ifdef _3DS
+   thr->frame.spare = (uint8_t*)linearMemAlign(thr->frame.buffer_size, 0x80);
+#else
+   thr->frame.spare = (uint8_t*)memalign_alloc(64, thr->frame.buffer_size);
+#endif
+   if (!thr->frame.spare)
+      return false;
+   memset(thr->frame.spare, 0x80, thr->frame.buffer_size);
+   return true;
+}
+
 /* The core asks for a buffer to render the next frame into. Lend it a
- * ring slot that neither side holds, so the frame lands where the video
- * thread will read it and the push copies nothing. Declined when no
- * slot is free (the push then copies as before), when the core wants
- * to read back (the slot last held the frame before the previous one,
- * not the previous one, so the contents are not what a reading core
- * expects), or when the geometry does not fit the slot. A core that
+ * ring slot that neither side holds, or the spare when both slots are
+ * taken, so the frame lands where the video thread will read it and
+ * the push copies nothing. Declined when the geometry does not fit a
+ * slot, or when the spare cannot be allocated (the push then copies).
+ * The buffers are ordinary cached host memory, so a core that reads
+ * its frame back - a wipe, a screenshot - can have it. A core that
  * never asks is unaffected. */
 static bool thread_get_current_software_framebuffer(void *data,
       struct retro_framebuffer *fb)
@@ -3503,8 +3578,6 @@ static bool thread_get_current_software_framebuffer(void *data,
    if (!thr || !fb)
       return false;
 
-   /* The slots are ordinary cached host memory, so a core that wants
-    * to read its frame back - a wipe, a screenshot - can have it */
    thr->handoff.asked++;
    bpp  = thr->info.rgb32 ? sizeof(uint32_t) : sizeof(uint16_t);
    need = (size_t)fb->width * bpp * fb->height;
@@ -3520,16 +3593,26 @@ static bool thread_get_current_software_framebuffer(void *data,
    else if (thr->frame.pending == 1 && !thr->frame.busy)
       slot = thr->frame.tail ^ 1;
    else
+      slot = VIDEO_THREAD_LEND_SPARE;
+   if (slot == VIDEO_THREAD_LEND_SPARE && !thr->frame.spare)
    {
+      bool ok;
       slock_unlock(thr->lock);
-      thr->handoff.declined_ring++;
-      return false;
+      ok = video_thread_spare_alloc(thr);
+      slock_lock(thr->lock);
+      if (!ok)
+      {
+         slock_unlock(thr->lock);
+         thr->handoff.declined_ring++;
+         return false;
+      }
    }
    thr->frame.lent        = (int)slot;
    slock_unlock(thr->lock);
    thr->handoff.lent++;
 
-   fb->data         = thr->frame.slot[slot].buffer;
+   fb->data         = (slot == VIDEO_THREAD_LEND_SPARE)
+      ? thr->frame.spare : thr->frame.slot[slot].buffer;
    fb->pitch        = (size_t)fb->width * bpp;
    fb->format       = thr->info.rgb32
       ? RETRO_PIXEL_FORMAT_XRGB8888 : RETRO_PIXEL_FORMAT_RGB565;

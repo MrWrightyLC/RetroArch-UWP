@@ -2722,6 +2722,158 @@ static void lane_zero_copy(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Lane: the pacing flag a driver sees follows the presenter            */
+/*   video_frame_info_t::threaded_display_pacing tells a driver its     */
+/*   pushes are being held to the display's vblank; Metal takes its     */
+/*   next drawable late on it. Set with the setting on only while the  */
+/*   wrapper runs - with threaded video off nothing holds the push, and */
+/*   a driver relying on its own blocking present must be told so.     */
+/* ------------------------------------------------------------------ */
+
+static void lane_pacing_flag_follows_wrapper(void)
+{
+   unsigned had         = failures;
+   settings_t *settings = config_get_ptr();
+   bool saved           = settings->bools.video_threaded_display_pacing;
+   video_frame_info_t info;
+
+   settings->bools.video_threaded_display_pacing = true;
+
+   set_threaded_via_setting(false);
+   run_frames(2);
+   expect_wrapper(false, "pacing-flag lane");
+   memset(&info, 0, sizeof(info));
+   video_driver_build_info(&info);
+   CHECK(!info.threaded_display_pacing,
+         "pacing-flag lane: set with threaded video off");
+
+   set_threaded_via_setting(true);
+   run_frames(2);
+   expect_wrapper(true, "pacing-flag lane");
+   memset(&info, 0, sizeof(info));
+   video_driver_build_info(&info);
+   CHECK(info.threaded_display_pacing,
+         "pacing-flag lane: clear with the wrapper running and the setting on");
+
+   settings->bools.video_threaded_display_pacing = false;
+   memset(&info, 0, sizeof(info));
+   video_driver_build_info(&info);
+   CHECK(!info.threaded_display_pacing,
+         "pacing-flag lane: set with the setting off");
+
+   settings->bools.video_threaded_display_pacing = saved;
+   set_threaded_via_setting(false);
+
+   if (failures == had)
+      fprintf(stderr, "[pass] pacing-flag lane\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Lane: zero-copy with the ring full                                  */
+/*   A driver whose present blocks for longer than a display period -  */
+/*   a Metal drawable or a FIFO swapchain acquire waiting on vblank -   */
+/*   keeps the ring two-deep: one frame queued, one being rendered,     */
+/*   every time the core asks. The loan must still be granted and the   */
+/*   frames published without a copy, and every frame the driver draws */
+/*   must be the one the core pushed, never an older buffer.            */
+/* ------------------------------------------------------------------ */
+
+static video_driver_t        fulllane_driver;
+static const video_driver_t *fulllane_inner;
+static uint16_t              fulllane_prev;
+static bool                  fulllane_have_prev;
+static unsigned              fulllane_drawn;
+static unsigned              fulllane_stale;
+
+static bool fulllane_frame(void *data, const void *frame,
+      unsigned dims, uint64_t frame_count,
+      unsigned pitch, const char *msg, video_frame_info_t *video_info)
+{
+   if (frame && VIDEO_SCALE_H(dims) == 240)
+   {
+      /* The harness core writes (run + i): the first pixel is the
+       * core's run number, which must move forward frame to frame */
+      uint16_t cur = ((const uint16_t*)frame)[0];
+      if (fulllane_have_prev)
+      {
+         uint16_t step = (uint16_t)(cur - fulllane_prev);
+         if (!step || step >= 0x8000)
+            fulllane_stale++;
+      }
+      fulllane_prev      = cur;
+      fulllane_have_prev = true;
+      fulllane_drawn++;
+   }
+   /* The present that waits on vblank */
+   retro_sleep(30);
+   return fulllane_inner->frame(data, frame, dims, frame_count,
+         pitch, msg, video_info);
+}
+
+static void lane_zero_copy_ring_full(void)
+{
+   const char *name = "zero-copy lane, ring full";
+   unsigned had = failures;
+   dylib_t lib = runloop_state_get_ptr()->lib_handle;
+   void (*use_fb)(int) = lib ? (void (*)(int))dylib_proc(lib, "harness_core_use_framebuffer") : NULL;
+   unsigned (*granted)(void) = lib ? (unsigned (*)(void))dylib_proc(lib, "harness_core_fb_granted") : NULL;
+   thread_video_t *thr;
+   unsigned g0, g1, zc0, zc1;
+
+   CHECK(use_fb && granted, "harness core lacks the framebuffer exports");
+   if (!use_fb || !granted)
+      return;
+
+   set_threaded_via_setting(true);
+   if (menu_is_up())
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   run_frames(10);
+   expect_wrapper(true, name);
+   video_thread_wait_idle();
+
+   thr                     = (thread_video_t*)video_state_get_ptr()->data;
+   fulllane_inner          = thr->driver;
+   fulllane_driver         = *thr->driver;
+   fulllane_driver.frame   = fulllane_frame;
+   fulllane_have_prev      = false;
+   fulllane_drawn          = 0;
+   fulllane_stale          = 0;
+   thr->driver             = &fulllane_driver;
+
+   use_fb(1);
+   /* Let the queue fill behind the slow present first */
+   run_frames(6);
+   g0  = granted();
+   slock_lock(thr->lock); zc0 = (unsigned)thr->frame.zero_copy_count; slock_unlock(thr->lock);
+   run_frames(60);
+   video_thread_wait_idle();
+   g1  = granted();
+   slock_lock(thr->lock); zc1 = (unsigned)thr->frame.zero_copy_count; slock_unlock(thr->lock);
+   use_fb(0);
+
+   thr->driver = fulllane_inner;
+
+   /* Every ask is granted but the oversize frame's, which does not
+    * ask; every third frame is a dupe whose loan lapses. */
+   CHECK(g1 - g0 >= 55, "%s: only %u of 60 asks granted", name, g1 - g0);
+   CHECK(zc1 - zc0 >= 35, "%s: only %u frames published zero-copy for %u grants",
+         name, zc1 - zc0, g1 - g0);
+   CHECK(zc1 - zc0 <= g1 - g0, "%s: %u zero-copy frames for %u grants",
+         name, zc1 - zc0, g1 - g0);
+   CHECK(fulllane_drawn >= 10, "%s: the driver drew only %u frames", name, fulllane_drawn);
+   CHECK(!fulllane_stale, "%s: %u of %u drawn frames were not newer than the one before",
+         name, fulllane_stale, fulllane_drawn);
+
+   if (!menu_is_up())
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   set_threaded_via_setting(false);
+
+   if (failures == had)
+      fprintf(stderr, "[pass] %s (%u grants, %u zero-copy frames, %u drawn)\n",
+            name, g1 - g0, zc1 - zc0, fulllane_drawn);
+}
+
+/* ------------------------------------------------------------------ */
 
 
 /* ------------------------------------------------------------------ */
@@ -4415,6 +4567,8 @@ int main(int argc, char *argv[])
       lane_pacing_queue_drain();
    }
    lane_zero_copy();
+   lane_zero_copy_ring_full();
+   lane_pacing_flag_follows_wrapper();
    lane_surface_update();
    if (real_driver())
       lane_surface_4k();
