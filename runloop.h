@@ -198,6 +198,10 @@ struct runloop
     * at 59.94 Hz, which the schedule would carry into every frame. */
    int64_t      frame_limit_minimum_time_ns;
    int64_t      frame_limit_anchor_ns;
+   /* When the core running behind the menu at Menu Frame Rate
+    * 'Display Rate' is next due a frame, on the content's own clock;
+    * 0 = not running it on that clock. */
+   int64_t      menu_core_due_ns;
    /* How early the gap limiter's sleep is asked to return, so the
     * remainder can be spun to the deadline: the sleep's observed
     * overshoot, tracked by runloop_pace_margin_update(). */
@@ -211,6 +215,12 @@ struct runloop
    retro_time_t pace_iter_last;
    retro_time_t pace_period_usec;
    unsigned     pace;                           /* enum runloop_pace_source bits */
+   /* Optional products with a per-frame hook in runloop_iterate().
+    * Each bit is raised when its product comes up and dropped when it
+    * goes down, so a build that has the product compiled in but not
+    * in use pays one bit test on this hot word - not a call into the
+    * product's own translation unit to find out it is idle. */
+   unsigned     frame_work;                     /* RUNLOOP_WORK_* bits */
    retro_usec_t frame_time_last;                /* int64_t alignment */
 
    /* Per-frame scalar state. Kept adjacent to the timing block above so the
@@ -235,6 +245,12 @@ struct runloop
    struct retro_core_t        current_core;     /* uint64_t alignment */
 #if defined(HAVE_RUNAHEAD)
    uint64_t runahead_last_frame_count;          /* uint64_t alignment */
+   /* Measured cost of one core step inside runahead_run() (a core
+    * run plus its share of the save/load), IIR-averaged in usec; 0
+    * until the first sample. runahead_count_used is the frame count
+    * actually run last frame after the budget gate clamped it. */
+   retro_time_t runahead_unit_usec;
+   int runahead_count_used;
 #if defined(HAVE_DYNAMIC) || defined(HAVE_DYLIB)
    struct retro_core_t secondary_core;          /* uint64_t alignment */
 #endif
@@ -290,6 +306,9 @@ struct runloop
 
    retro_keyboard_event_t key_event;             /* ptr alignment */
    retro_keyboard_event_t frontend_key_event;    /* ptr alignment */
+   /* Run-ahead's second instance's keyboard callback: an event bound
+    * for the core goes to both instances */
+   retro_keyboard_event_t secondary_key_event;   /* ptr alignment */
 
    rarch_system_info_t system;                   /* ptr alignment */
    struct retro_frame_time_callback frame_time;  /* ptr alignment */
@@ -359,22 +378,26 @@ struct runloop
    bool perfcnt_enable;
    bool paused_hotkey;
 
-   /* True from the moment closing content starts tearing the core
-    * down until the teardown is finished.
+   /* content_closing: true while the core is being torn down, from
+    * the first step of closing until the last.
     *
-    * Set and cleared around the existing synchronous teardown, so at
-    * present nothing can observe it as true: the main thread is
-    * inside that teardown for its whole duration and no frame runs.
-    * It is introduced separately, and deliberately inert, because
-    * the work that makes it observable - returning to the frame loop
-    * instead of blocking - is a lifecycle change, and this is the
-    * piece everything else will key off.
+    * content_switching: true while content is being replaced in
+    * stages from the frame loop (tasks/task_content.c): the old core
+    * is closed with the drivers left up, the new one is brought up
+    * behind them, and one driver reinit follows.  Core deinit keeps
+    * the drivers and a reinit the core asks for defers to that stage
+    * while this is set, and the frame loop presents instead of
+    * running a core.
     *
-    * A plain bool rather than a RUNLOOP_FLAG bit: bits 0-30 of that
+    * Plain bools rather than RUNLOOP_FLAG bits: bits 0-30 of that
     * word are taken and bit 31 was deliberately vacated to avoid a
-    * cross-thread race, so reusing it would undo that reasoning for
-    * no gain. This is main-thread only. */
+    * cross-thread race.  Both are main-thread only. */
    bool content_closing;
+   bool content_switching;
+   /* The core running behind the menu was not due a frame this
+    * iteration (see menu_core_due_ns), so nothing that counts the
+    * core's frames - achievements - steps either. Main thread only. */
+   bool menu_core_skipped;
 };
 
 /* Frame pacing sources.
@@ -639,9 +662,9 @@ enum runloop_pace_fact
    PACE_FACT_PAUSED          = (1 << 4),  /* RUNLOOP_FLAG_PAUSED */
    PACE_FACT_FOCUSED         = (1 << 5),  /* RUNLOOP_FLAG_FOCUSED */
    PACE_FACT_MENU_ALIVE      = (1 << 6),
-   PACE_FACT_MENU_EARLY_EXIT = (1 << 7),  /* VRR on, menu throttle off: the
-                                             menu path returns before the
-                                             pace block */
+   PACE_FACT_MENU_CONTENT_RATE = (1 << 7),/* the menu is up over a paused
+                                             core with content loaded, at
+                                             Menu Frame Rate 'Content Rate' */
    PACE_FACT_VRR             = (1 << 8),  /* Sync to Exact Content Framerate */
    PACE_FACT_WRAPPER         = (1 << 9),  /* threaded video wrapper installed */
    PACE_FACT_DISPLAY_PACING  = (1 << 10), /* Threaded Video Display Pacing */
@@ -651,6 +674,8 @@ enum runloop_pace_fact
    PACE_FACT_SCANLINE_LOCKED = (1 << 13), /* a target scanline exists */
    PACE_FACT_RATE_CONTROL    = (1 << 14), /* audio rate control */
    PACE_FACT_PRESENTABLE     = (1 << 15), /* the context has a surface */
+   PACE_FACT_MENU_DISPLAY_RATE = (1 << 16),/* the menu is up at Menu Frame
+                                             Rate 'Display Rate' */
    PACE_FACT_FRAME_LIMIT     = (1 << 17)  /* frame_limit_minimum_time != 0 */
 };
 
@@ -658,8 +683,8 @@ typedef unsigned runloop_pace_facts_t;
 
 /* The pace decision as one pure function of those facts: which sources
  * hold the loop this iteration, as RUNLOOP_PACE_* bits. It reproduces,
- * bit for bit, what runloop_iterate() decides across its paths - the
- * menu path's early return included - so that the decision can be
+ * bit for bit, what runloop_iterate() decides across its paths, so
+ * that the decision can be
  * tested as a table (samples/runloop/pacing) and, once the paths defer
  * to it, made in one place. Until then runloop_iterate() computes
  * both and asserts they agree in debug builds. */
@@ -674,11 +699,6 @@ static INLINE unsigned runloop_pace_sources(runloop_pace_facts_t f)
                       && !(f & PACE_FACT_NONBLOCKING)
                       && !(f & PACE_FACT_FORCE_NONBLOCK);
 
-   /* The menu path's early return: vsync if it is blocking, nothing
-    * else, and no timer. */
-   if ((f & PACE_FACT_MENU_ALIVE) && (f & PACE_FACT_MENU_EARLY_EXIT))
-      return vsync_holds ? RUNLOOP_PACE_VSYNC : RUNLOOP_PACE_NONE;
-
    if (vsync_holds)
       pace |= RUNLOOP_PACE_VSYNC;
    if ((f & PACE_FACT_WRAPPER) && (f & PACE_FACT_DISPLAY_PACING)
@@ -691,11 +711,26 @@ static INLINE unsigned runloop_pace_sources(runloop_pace_facts_t f)
       pace |= RUNLOOP_PACE_SCANLINE;
    {
       bool display_paces = (pace & RUNLOOP_PACE_DISPLAY) != 0;
+      /* The menu at the content's rate is held there by audio when
+       * audio blocks, by the display pacing hold - which then keeps the
+       * content's period - when that holds, and by the timer at the
+       * content's period when neither does; never by two of them, which
+       * would be two clocks beating. At the
+       * display's rate behind the threaded video wrapper, vsync blocks
+       * the video thread and not this one, so without the display
+       * pacing hold the timer holds the menu to the display's period. */
+      bool menu_content  = (f & PACE_FACT_MENU_CONTENT_RATE) != 0;
       if ((f & PACE_FACT_FRAME_LIMIT)
-            && (   (f & PACE_FACT_VRR)
+            && (   ((f & PACE_FACT_VRR)
+                     && !(f & PACE_FACT_MENU_DISPLAY_RATE))
                 || (f & PACE_FACT_FASTMOTION)
-                || (!display_paces && (f & PACE_FACT_MENU_ALIVE)
-                    && (!(f & PACE_FACT_VSYNC) || !(f & PACE_FACT_FOCUSED)))
+                || (menu_content && !(pace & RUNLOOP_PACE_AUDIO)
+                    && !display_paces)
+                || (!display_paces && !menu_content
+                    && (f & PACE_FACT_MENU_ALIVE)
+                    && (   !(f & PACE_FACT_VSYNC) || !(f & PACE_FACT_FOCUSED)
+                        || (   (f & PACE_FACT_MENU_DISPLAY_RATE)
+                            && (f & PACE_FACT_WRAPPER))))
                 || (!display_paces && (f & PACE_FACT_PAUSED))))
          pace |= RUNLOOP_PACE_TIMER;
    }
@@ -717,8 +752,6 @@ static INLINE bool runloop_pace_no_window(unsigned sources,
 static INLINE unsigned runloop_pace_decide(runloop_pace_facts_t f)
 {
    unsigned pace = runloop_pace_sources(f);
-   if ((f & PACE_FACT_MENU_ALIVE) && (f & PACE_FACT_MENU_EARLY_EXIT))
-      return pace;
    if (runloop_pace_no_window(pace, f))
       return pace | RUNLOOP_PACE_NOWINDOW;
    if (runloop_pace_gap_engages(pace,
@@ -732,6 +765,24 @@ static INLINE unsigned runloop_pace_decide(runloop_pace_facts_t f)
 
 
 typedef struct runloop runloop_state_t;
+
+/* runloop_state_t::frame_work bits */
+enum runloop_frame_work
+{
+   RUNLOOP_WORK_DISCORD  = (1 << 0),  /* Discord RPC is up: pump it */
+   RUNLOOP_WORK_PRESENCE = (1 << 1),  /* a rich-presence sink is up */
+   RUNLOOP_WORK_CHEATS   = (1 << 2),  /* a cheat list is loaded */
+   RUNLOOP_WORK_CAMERA   = (1 << 3),  /* the core started the camera */
+   RUNLOOP_WORK_CHEEVOS  = (1 << 4)   /* achievements attached to content */
+};
+
+/* Raise or drop one frame_work bit from the product that owns it.
+ * MAIN THREAD ONLY: frame_work is a plain word read by the iterate
+ * with no acquire; every caller runs on the thread that runs
+ * runloop_iterate() (init/deinit, a command, a setting handler, a
+ * task's *main-thread* callback). A worker thread must not call
+ * this - post a command or a main-thread callback instead. */
+void runloop_frame_work_set(unsigned bit, bool on);
 
 /* Runs deferred off-main message pushes; the main thread, once per
  * iterate. */
@@ -795,6 +846,28 @@ bool libretro_get_system_info(
       struct retro_system_info *info,
       bool *load_no_content);
 
+/* A staged load opens the core's library on the task worker once the
+ * previous core is closed; the core stage then takes the handle.
+ * begin returns false when there is no worker to open it on (the core
+ * stage opens it itself), ready is true once no open is in flight,
+ * cancel drops an untaken handle. */
+bool runloop_core_preload_begin(void);
+bool runloop_core_preload_ready(void);
+void runloop_core_preload_cancel(void);
+
+#ifdef HAVE_DYNAMIC
+/* Frees the records libretro_get_system_info() keeps of the cores it
+ * has asked; the next question reads them back from disk. */
+void runloop_core_probe_cache_free(void);
+
+/* Whether the core at @core_path takes content of extension @ext as a
+ * path, by its own declaration when last asked - need_fullpath, and
+ * the content info overrides it made then.  False if that core has not
+ * been asked this session, or its overrides are not known. */
+bool runloop_core_probe_need_fullpath(const char *core_path,
+      const char *ext, bool *need_fullpath);
+#endif
+
 void runloop_performance_counter_register(
       struct retro_perf_counter *perf);
 
@@ -827,6 +900,15 @@ size_t runloop_pace_string(char *s, size_t len);
 void runloop_set_frame_limit(
       const struct retro_system_av_info *av_info,
       float fastforward_ratio);
+
+/* Whether the menu is up at Menu Frame Rate 'Display Rate', where a
+ * core running behind it keeps its own clock rather than setting the
+ * menu's. */
+bool runloop_menu_display_rate(void);
+
+/* Whether the menu is up at Menu Frame Rate 'Content Rate', held to the
+ * content's period over a stopped core. */
+bool runloop_menu_content_rate(void);
 
 float runloop_get_fastforward_ratio(
       settings_t *settings,
@@ -871,6 +953,17 @@ void runloop_path_set_names(void);
 
 uint32_t runloop_get_flags(void);
 
+/* The platform has taken the application away, or given it back:
+ * paused and idle while it is away. */
+void runloop_set_platform_paused(bool paused);
+
+/* Whether a core has content loaded. */
+bool runloop_content_loaded(void);
+
+/* Whether the keyboard callback in place is the frontend's own, which
+ * is the one a replay feeds its recorded keys to. */
+bool runloop_key_event_is_frontend(void);
+
 bool runloop_get_entry_state_path(char *path, size_t len, int slot);
 
 bool runloop_get_current_savestate_path(char *path, size_t len);
@@ -910,10 +1003,17 @@ runloop_state_t *runloop_state_get_ptr(void);
  * runloop_is_content_closing:
  *
  * True while content is being closed, i.e. while the core is being
- * torn down.  Currently only ever true inside the synchronous
- * teardown, where nothing else runs to ask.
+ * torn down.
  */
 bool runloop_is_content_closing(void);
+
+/**
+ * runloop_is_content_switching:
+ *
+ * True while a staged content load is in flight, from the close of
+ * the old core to the driver reinit that follows the new one.
+ */
+bool runloop_is_content_switching(void);
 
 RETRO_END_DECLS
 

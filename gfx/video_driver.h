@@ -516,6 +516,8 @@ typedef struct video_frame_info
 #ifdef GEKKO
    unsigned overscan_correction_top;
    unsigned overscan_correction_bottom;
+   /* The A/V encoder's gamma, set by the driver's resize from frame() */
+   unsigned video_gamma;
 #endif
    unsigned monitor_index;
    unsigned crt_switch_resolution;
@@ -584,12 +586,19 @@ typedef struct video_frame_info
    const char *stat_text;
    size_t stat_text_len;
 
+#ifdef GEKKO
+   /* The A/V encoder's trap filter, set beside video_gamma */
+   bool video_soft_filter;
+#endif
    bool widgets_active;
    bool notifications_hidden;
    bool menu_mouse_enable;
    bool input_menu_swap_ok_cancel_buttons;
    bool input_driver_nonblock_state;
    bool input_driver_grab_mouse_state;
+   /* When the input this frame was made from was read; 0 if not
+    * stamped. input_driver_get_poll_time(). */
+   retro_time_t input_poll_time;
    bool hard_sync;
    bool scanline_sync;
    bool runahead;
@@ -632,6 +641,10 @@ typedef struct video_frame_info
     * pacing holds to the content's period while it runs and to the
     * display's while it does not. */
    bool core_running;
+   /* The menu is up at Menu Frame Rate 'Content Rate': the hold keeps
+    * the content's period over the stopped core, as nothing else then
+    * holds the menu to it. */
+   bool menu_content_rate;
    bool xmb_shadows_enable;
    bool battery_level_enable;
    bool timedate_enable;
@@ -893,7 +906,10 @@ typedef struct video_poke_interface
    /* Optional GPU-native compressed-texture path (BCn/ETC/ASTC).
     * Drivers that can sample the format implement both; leaving them
     * NULL (the default) makes video_driver_texture_load() fall back to
-    * a CPU decode + the normal RGBA8 load_texture. */
+    * a CPU decode + the normal RGBA8 load_texture.
+    * supports_texture_format also answers TEXTURE_GPU_FORMAT_RGB10A2:
+    * whether load_texture and update_texture take a pix10 image as
+    * 10-bit. Without it such an image is narrowed to 8 bits first. */
    bool      (*supports_texture_format)(void *data,
          enum texture_gpu_format fmt);
    uintptr_t (*load_texture_compressed)(void *video_data,
@@ -989,6 +1005,27 @@ typedef struct video_poke_interface
     * while the audio rate was scaled for the full multiple. Drivers
     * that hold a frame for as long as they are asked leave it NULL. */
    unsigned (*get_swap_interval_cap)(void *data);
+
+   /* Lending a streamed texture's upload memory, so a producer writes
+    * a frame where update_texture copies it to the GPU from and the
+    * copy into it goes away. Direct video only: the thread wrapper
+    * leaves both NULL, since the lent memory's readiness is the
+    * video thread's to know.
+    *
+    * texture_lend hands out slot @slot of texture @id's upload memory,
+    * mapped and writable, when its rows lie the @pitch bytes apart the
+    * caller writes them at; NULL, with nothing lent, otherwise. The
+    * memory is the texture's until it is unloaded. update_texture given a texture_image whose pixels
+    * are a lent slot uploads from there; with any slot lent, an update
+    * from other memory only ever goes through the slots not lent.
+    *
+    * texture_lend_ready answers whether lent slot @slot may be written:
+    * false while the GPU may still read the last upload from it. Never
+    * waits. */
+   void *(*texture_lend)(void *video_data, uintptr_t id, unsigned slot,
+         size_t pitch);
+   bool (*texture_lend_ready)(void *video_data, uintptr_t id,
+         unsigned slot);
 } video_poke_interface_t;
 
 /* dims is the frame's size, VIDEO_SCALE_PACK'd; msg is for showing a
@@ -1211,10 +1248,12 @@ typedef struct
 #endif
 
    /* hw_render.context_type, published for cross-thread readers:
-    * both writers run on the main thread and store-release this
-    * mirror after their edit lands - SET_HW_RENDER after copying
+    * every writer runs on the main thread and store-releases this
+    * mirror after its edit lands - SET_HW_RENDER after copying
     * the callback in, video_driver_free_hw_context() after
-    * context_destroy() and the memset - so an acquire load reading
+    * context_destroy() and the memset, and whoever puts a saved
+    * request back (video_driver_hw_request_restore(), a driver
+    * restart) after the copy - so an acquire load reading
     * RETRO_HW_CONTEXT_NONE is guaranteed the teardown completed.
     * video_driver_is_hw_context() reads only this; the hw_render
     * struct itself stays main-thread state. */
@@ -1333,6 +1372,13 @@ typedef struct
     * VIDEO_DRIVER_ASPECT_RATIO() and video_driver_store_aspect_ratio(). */
    retro_atomic_int_t aspect_ratio_bits;
    float video_refresh_rate_original;
+   /* The refresh rate of the output the window is on, as
+    * video_driver_get_window_refresh_rate() last read it, and whether
+    * that reading still stands; main thread only. */
+   float window_refresh_rate;
+   /* The same, as a windowing system that follows the window from
+    * output to output by events reported it (Wayland); 0 = none */
+   float window_refresh_hint;
 
    enum retro_pixel_format pix_fmt;
    enum rarch_display_type display_type;
@@ -1417,6 +1463,7 @@ typedef struct
     * out of order cannot strand or steal it. */
    struct font_data *osd_font;
    void             *osd_font_owner;
+   bool              window_refresh_known;
 } video_driver_state_t;
 
 typedef struct video_frame_delay_auto
@@ -1659,6 +1706,15 @@ const char* config_get_video_driver_options(void);
  *
  * Returns: video driver's userdata.
  **/
+/* For the input code: see video_driver.c. */
+uint64_t video_driver_get_frame_count(void);
+const struct retro_game_geometry *video_driver_get_core_geometry(void);
+void video_driver_show_mouse(bool state);
+#ifdef HAVE_OVERLAY
+bool video_driver_get_overlay_interface(
+      const video_overlay_interface_t **iface, void **iface_data);
+#endif
+
 void *video_driver_get_ptr(void);
 
 video_driver_state_t *video_state_get_ptr(void);
@@ -1672,6 +1728,11 @@ video_driver_state_t *video_state_get_ptr(void);
 void video_driver_shader_deferred_tick(void);
 
 bool video_driver_set_rotation(unsigned rotation);
+
+/* The size, packed with VIDEO_SCALE_PACK, the video driver would ask
+ * its window for in the given state; what a fullscreen toggle on the
+ * existing window resizes it to. */
+unsigned video_driver_window_dims(bool fullscreen);
 
 bool video_driver_set_video_mode(unsigned dims, bool fullscreen);
 
@@ -1752,9 +1813,6 @@ static INLINE void video_driver_aspect_ratio_put(
 
 #define VIDEO_DRIVER_ASPECT_RATIO(video_st) \
    video_driver_aspect_ratio_of(&(video_st)->aspect_ratio_bits)
-
-void video_driver_menu_settings(void **list_data, void *list_info_data,
-      void *group_data, void *subgroup_data, const char *parent_group);
 
 /**
  * video_viewport_get_scaled_aspect2:
@@ -1862,8 +1920,16 @@ bool video_driver_texture_update(uintptr_t id, void *data);
  * replacement load on this, once per surface rather than per frame. */
 bool video_driver_texture_can_update(void);
 
-/* Whether the active driver can sample @fmt as a compressed texture.
- * False with no driver, no poke, or a format it declines. */
+/* texture_lend / texture_lend_ready of the active driver; NULL and
+ * true under the thread wrapper or with a driver that lends nothing,
+ * where no slot is ever lent. Main thread. */
+void *video_driver_texture_lend(uintptr_t id, unsigned slot,
+      size_t pitch);
+bool video_driver_texture_lend_ready(uintptr_t id, unsigned slot);
+
+/* Whether the active driver can sample @fmt: a compressed texture, or
+ * for TEXTURE_GPU_FORMAT_RGB10A2 a pix10 image as 10-bit. False with
+ * no driver, no poke, or a format it declines. */
 bool video_driver_supports_texture_format(enum texture_gpu_format fmt);
 
 /* Upload without making the caller wait for the video thread. @data
@@ -1963,6 +2029,31 @@ bool video_context_driver_set(const gfx_ctx_driver_t *data);
 
 bool video_context_driver_get_ident(gfx_ctx_ident_t *ident);
 
+/* Whether the video context in use is the one named. */
+bool video_context_driver_is(const char *ident);
+
+/* A context's window surface, for a platform that takes the surface
+ * away while the context lives on - Android does when the app goes to
+ * the background, and gives one back when it returns. Both run where
+ * the context lives: EGL's bindings are per thread, so under threaded
+ * video they are handed to the video thread.
+ *
+ * video_context_surface_can_create() says whether the context can be
+ * given a new surface at all; video_context_surface_create() does it
+ * and returns false when it cannot or it failed, which leaves a
+ * restart of the video driver. video_context_surface_destroy() lets
+ * the surface go, after the video thread has finished the frame that
+ * may still be using it. */
+bool video_context_surface_can_create(void);
+bool video_context_surface_create(void);
+void video_context_surface_destroy(void);
+
+/* The video driver the configuration names, when a core has forced
+ * another for as long as it is loaded and the setting holds that one
+ * for now; NULL when the setting is the configured one. For code that
+ * writes the configuration out while the core is still loaded. */
+const char *video_driver_get_configured_ident(void);
+
 bool video_context_driver_get_refresh_rate(float *refresh_rate);
 
 bool video_context_driver_set_flags(gfx_ctx_flags_t *flags);
@@ -1994,6 +2085,27 @@ void video_shader_driver_set_parameter(struct video_shader *live_shader,
       unsigned index, float value);
 
 float video_driver_get_refresh_rate(void);
+
+/**
+ * video_driver_get_window_refresh_rate:
+ *
+ * The refresh rate of the output the window is on, or 0 when nothing
+ * can say. Read from the display server once and kept until
+ * video_driver_window_output_changed() says the window may be on
+ * another output, or at another mode. Main thread only.
+ **/
+float video_driver_get_window_refresh_rate(void);
+
+/* The window may have moved to another output, or its output changed
+ * mode: the next video_driver_get_window_refresh_rate() reads again.
+ * Main thread only. */
+void video_driver_window_output_changed(void);
+
+/* For a windowing system that is told which output the window is on
+ * rather than asked (Wayland: surface enter and leave): the refresh rate
+ * of that output, in hertz, or 0 when it is not known. Main thread
+ * only. */
+void video_driver_set_window_refresh_rate(float hz);
 
 bool video_context_driver_get_flags(gfx_ctx_flags_t *flags);
 
@@ -2073,6 +2185,21 @@ uintptr_t video_driver_get_current_framebuffer(void);
 retro_proc_address_t video_driver_get_proc_address(const char *sym);
 
 void video_driver_free_hw_context(void);
+
+/* A hardware-render request the core made for a context that does not
+ * exist yet - a staged content load takes the request during the new
+ * core's init, while the previous session's drivers are still up.
+ * The pair carries it across the teardown of those drivers: take
+ * moves the request out (the teardown then destroys nothing that was
+ * never reset), restore puts it back for drivers_init to build the
+ * context from, and publishes the type. */
+struct video_hw_request
+{
+   struct retro_hw_render_callback cb;
+   const struct retro_hw_render_context_negotiation_interface *negotiation;
+};
+void video_driver_hw_request_take(struct video_hw_request *req);
+void video_driver_hw_request_restore(const struct video_hw_request *req);
 
 #ifdef HAVE_VIDEO_FILTER
 void video_driver_filter_free(void);

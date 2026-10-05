@@ -18,8 +18,12 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef HAVE_RETROSMB
+#include <net/net_smb2_compat.h>
+#else
 #include <smb2/smb2.h>
 #include <smb2/libsmb2.h>
+#endif
 
 #include <retro_miscellaneous.h>
 #include <streams/file_stream.h>
@@ -564,5 +568,6 @@ cloud_sync_driver_t cloud_sync_smb = {
    smb_read,
    smb_update,
    smb_free,
-   "smb"
+   "smb",
+   CLOUD_SYNC_DRIVER_FLG_BLOCKING
 };

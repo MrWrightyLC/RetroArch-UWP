@@ -38,6 +38,8 @@
 #include <retro_inline.h>
 #include <retro_common_api.h>
 #include <retro_miscellaneous.h>
+#include <retro_atomic.h>
+#include <rthreads/retro_eventcount.h>
 
 #include <libretro.h>
 #include <libretro_vulkan.h>
@@ -125,7 +127,11 @@ enum vk_flags
    VK_FLAG_GPU_RECORDING       = (1 << 19),
    /* VK_ERROR_DEVICE_LOST was seen and reported to the runloop once;
     * the frames until the reinit fail quietly. */
-   VK_FLAG_DEVICE_LOST_REPORTED = (1 << 20)
+   VK_FLAG_DEVICE_LOST_REPORTED = (1 << 20),
+   /* Held across creating a frame texture to lend the core: it stays in
+    * cached system memory, never video memory, because the core and the
+    * frontend may read a lent frame back. */
+   VK_FLAG_TEXTURE_FOR_LEND     = (1 << 21)
 };
 
 enum vk_texture_type
@@ -178,14 +184,6 @@ enum vulkan_context_flags
    VK_CTX_FLAG_HDR_SCRGB                    = (1 << 6)
 };
 
-enum vulkan_emulated_mailbox_flags
-{
-   VK_MAILBOX_FLAG_ACQUIRED            = (1 << 0),
-   VK_MAILBOX_FLAG_REQUEST_ACQUIRE     = (1 << 1),
-   VK_MAILBOX_FLAG_DEAD                = (1 << 2),
-   VK_MAILBOX_FLAG_HAS_PENDING_REQUEST = (1 << 3)
-};
-
 enum gfx_ctx_vulkan_data_flags
 {
    /* If set, prefer a path where we use
@@ -205,7 +203,10 @@ enum vk_texture_flags
 {
    VK_TEX_FLAG_DEFAULT_SMOOTH               = (1 << 0),
    VK_TEX_FLAG_NEED_MANUAL_CACHE_MANAGEMENT = (1 << 1),
-   VK_TEX_FLAG_MIPMAP                       = (1 << 2)
+   VK_TEX_FLAG_MIPMAP                       = (1 << 2),
+   /* Streamed texture in device-local host-visible memory: written by
+    * the CPU, never read by it. */
+   VK_TEX_FLAG_BAR_MAPPED                   = (1 << 3)
 };
 
 typedef struct vulkan_context
@@ -295,20 +296,38 @@ typedef struct vulkan_context
    bool present_pending;
 } vulkan_context_t;
 
+/* The acquire thread behind emulated mailbox, and the thread that
+ * presents. There is no lock between them: three words, each written
+ * by one side and taken by the other, and an eventcount each way.
+ *
+ *   request   the presenting thread wants an image; the acquire
+ *             thread takes it (exchange) and acquires
+ *   acquired  the acquire thread has an answer; result and index were
+ *             written before it was raised, and are not written again
+ *             until the presenting thread has lowered it and asked
+ *             again
+ *   dead      teardown
+ */
 struct vulkan_emulated_mailbox
 {
    sthread_t *thread;
-   slock_t *lock;
-   scond_t *cond;
    VkDevice device;              /* ptr alignment */
    VkSwapchainKHR swapchain;     /* ptr alignment */
    /* Every wait this object makes, from the display's rate; sampled at
     * init so the thread never reads video state. */
    int64_t timeout_us;
 
+   retro_eventcount_t work;      /* the acquire thread sleeps: request, dead */
+   retro_eventcount_t answered;  /* the presenting thread sleeps: acquired */
+   retro_atomic_int_t request;
+   retro_atomic_int_t acquired;
+   retro_atomic_int_t dead;
+
    unsigned index;
    VkResult result;              /* enum alignment */
-   uint8_t flags;
+   /* The presenting thread only: a request is out and its answer has
+    * not been taken yet. */
+   bool has_pending_request;
 };
 
 typedef struct gfx_ctx_vulkan_data
@@ -402,6 +421,16 @@ struct vk_descriptor_manager
 uint32_t vulkan_find_memory_type(
       const VkPhysicalDeviceMemoryProperties *mem_props,
       uint32_t device_reqs, uint32_t host_reqs);
+
+/* Allocates alloc->allocationSize for a buffer the CPU only writes and
+ * the GPU reads. alloc->memoryTypeIndex is the caller's host-visible
+ * choice; it is used as given unless the device maps all of its memory
+ * host-visible (resizable BAR, unified memory), where the device-local
+ * host-visible coherent type is tried first. */
+VkResult vulkan_allocate_cpu_write_memory(VkDevice device,
+      const VkPhysicalDeviceMemoryProperties *mem_props,
+      uint32_t type_bits, const VkMemoryAllocateInfo *alloc,
+      VkDeviceMemory *memory);
 
 uint32_t vulkan_find_memory_type_fallback(
       const VkPhysicalDeviceMemoryProperties *mem_props,

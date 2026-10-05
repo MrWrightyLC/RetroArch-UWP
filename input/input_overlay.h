@@ -109,7 +109,11 @@ enum OVERLAY_LOADER_FLAGS
     * eight. An 8-bit image decodes as it always did. */
    OVERLAY_LOADER_10BIT        = (1 << 2),
    /* A desc of the pack names the LED its image shows (_led). */
-   OVERLAY_LOADER_HAS_LEDS     = (1 << 3)
+   OVERLAY_LOADER_HAS_LEDS     = (1 << 3),
+   /* The driver samples the pack's pixels where they lie, as GX
+    * tiles: each image is tiled once it is decoded, and an APNG
+    * keeps no stream, since nothing could show its frames. */
+   OVERLAY_LOADER_GX_TILE      = (1 << 4)
 };
 
 enum INPUT_OVERLAY_FLAGS
@@ -124,7 +128,12 @@ enum INPUT_OVERLAY_FLAGS
    INPUT_OVERLAY_TEXTURES_DECLINED = (1 << 5),
    /* The pack names its LED images (overlayN_descM_led): the overlay
     * LED driver shows and hides those, and ledN_map is not used. */
-   INPUT_OVERLAY_HAS_LEDS = (1 << 6)
+   INPUT_OVERLAY_HAS_LEDS = (1 << 6),
+   /* A stylus is in use: the overlay stays loaded but is not drawn,
+    * takes no touches and answers no pointer queries, so the pen
+    * reaches the core through the input driver. Level-triggered from
+    * the run loop. */
+   INPUT_OVERLAY_STYLUS_HIDDEN = (1 << 7)
 };
 
 enum OVERLAY_FLAGS

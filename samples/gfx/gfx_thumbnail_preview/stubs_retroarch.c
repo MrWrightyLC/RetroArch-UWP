@@ -155,17 +155,20 @@ const char *msg_hash_to_str(unsigned id) { (void)id; return ""; }
 /* ---- threads: single-threaded harness, real locks not needed.
  * The threaded build links rthreads itself and has none of these. ---- */
 #ifndef PREVIEW_THREADED
-void *slock_new(void) { return malloc(1); }
-void slock_free(void *l) { free(l); }
-void slock_lock(void *l) { (void)l; }
-void slock_unlock(void *l) { (void)l; }
-void *scond_new(void) { return malloc(1); }
-void scond_free(void *c) { free(c); }
-void scond_wait(void *c, void *l) { (void)c; (void)l; }
-void scond_signal(void *c) { (void)c; }
-void scond_broadcast(void *c) { (void)c; }
-void *sthread_create(void *f, void *ud) { (void)f; (void)ud; return NULL; }
-void sthread_join(void *t) { (void)t; }
+/* Declared by rthreads.h, which the audio driver header below pulls
+ * in, so the stubs keep its types: opaque, never dereferenced here. */
+#include <rthreads/rthreads.h>
+slock_t *slock_new(void) { return (slock_t*)malloc(1); }
+void slock_free(slock_t *l) { free(l); }
+void slock_lock(slock_t *l) { (void)l; }
+void slock_unlock(slock_t *l) { (void)l; }
+scond_t *scond_new(void) { return (scond_t*)malloc(1); }
+void scond_free(scond_t *c) { free(c); }
+void scond_wait(scond_t *c, slock_t *l) { (void)c; (void)l; }
+void scond_signal(scond_t *c) { (void)c; }
+int scond_broadcast(scond_t *c) { (void)c; return 0; }
+sthread_t *sthread_create(void (*f)(void*), void *ud) { (void)f; (void)ud; return NULL; }
+void sthread_join(sthread_t *t) { (void)t; }
 #else
 /* The threaded build of gfx_surface asks whether the video thread
  * wrapper is up before handing a load to it; the harness has no
@@ -320,3 +323,16 @@ bool video_driver_test_all_flags(int flags)
 { (void)flags; return false; }
 bool video_driver_supports_texture_format(int fmt)
 { (void)fmt; return false; }
+
+/* No driver lends upload memory here: every slot stays the surface's. */
+void *video_driver_texture_lend(uintptr_t id, unsigned slot, size_t pitch)
+{
+   (void)id; (void)slot; (void)pitch;
+   return NULL;
+}
+
+bool video_driver_texture_lend_ready(uintptr_t id, unsigned slot)
+{
+   (void)id; (void)slot;
+   return true;
+}
