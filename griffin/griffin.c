@@ -41,6 +41,12 @@
  * always available regardless of whether zlib or 7zip is compiled in. */
 #define HAVE_COMPRESSION 1
 
+/* The RAR reader has no dependency either, so it is built wherever the
+ * archive layer is. */
+#ifndef HAVE_RRAR
+#define HAVE_RRAR 1
+#endif
+
 #if defined(HAVE_OPENGL) && defined(HAVE_ANGLE)
 #ifndef HAVE_OPENGLES
 #define HAVE_OPENGLES  1
@@ -131,6 +137,12 @@ ARCHIVE FILE
 
 #ifdef HAVE_RZSTD
 #include "../libretro-common/file/archive_file_zstd.c"
+#endif
+
+#ifdef HAVE_RRAR
+#include "../libretro-common/file/archive_file_rar.c"
+#include "../libretro-common/formats/rar/rrar_archive.c"
+#include "../libretro-common/formats/rar/rrar_ppmd7.c"
 #endif
 
 /*============================================================
@@ -274,6 +286,7 @@ CRYPTO
 
 #include "../gfx/video_driver.c"
 #include "../gfx/common/video_mode_select.c"
+#include "../gfx/video_views.c"
 /*============================================================
 UI COMMON CONTEXT
 ============================================================ */
@@ -293,6 +306,9 @@ VIDEO CONTEXT
 #if defined(_WIN32) && !defined(_XBOX)
 
 #if (defined(HAVE_OPENGL) || defined(HAVE_OPENGL1) || defined(HAVE_OPENGL_CORE) || defined(HAVE_OPENGLES)) && !defined(HAVE_ANGLE)
+#ifndef __WINRT__
+#include "../gfx/common/win_wgl_dxgi.c"
+#endif
 #include "../gfx/drivers_context/wgl_ctx.c"
 #endif
 #if defined(HAVE_VULKAN)
@@ -309,8 +325,16 @@ VIDEO CONTEXT
 
 #if defined(ANDROID)
 #include "../gfx/drivers_context/android_ctx.c"
+#if defined(HAVE_OPENXR)
+#include "../input/drivers/openxr_input.c"
+#include "../gfx/drivers_context/gl_android_openxr_ctx.c"
+#include "../deps/openxr/src/xr_generated_dispatch_table_core.c"
+#endif
 #if defined(HAVE_VULKAN)
 #include "../gfx/drivers_context/android_vk_ctx.c"
+#if defined(HAVE_OPENXR)
+#include "../gfx/drivers_context/android_vk_openxr_ctx.c"
+#endif
 #endif
 #include "../gfx/display_servers/dispserv_android.c"
 #elif defined(__QNX__)
@@ -346,6 +370,11 @@ VIDEO CONTEXT
 #ifdef HAVE_VULKAN
 #include "../gfx/common/vulkan_common.c"
 #include "../libretro-common/vulkan/vulkan_symbol_wrapper.c"
+#ifdef HAVE_OPENXR
+#include "../gfx/video_xr.c"
+#include "../gfx/common/vulkan_openxr.c"
+#include "../input/common/input_openxr.c"
+#endif
 #ifdef HAVE_VULKAN_DISPLAY
 #include "../gfx/drivers_context/khr_display_ctx.c"
 #endif
@@ -408,6 +437,7 @@ VIDEO SHADERS
 #ifdef HAVE_SLANG
 #include "../gfx/drivers_shader/glslang_util.c"
 #include "../gfx/drivers_shader/slang_cache.c"
+#include "../gfx/drivers_shader/slang_rect.c"
 #include "../gfx/drivers_shader/slang_process.c"
 #endif
 
@@ -450,6 +480,9 @@ VIDEO IMAGE
 ============================================================ */
 
 #include "../libretro-common/formats/image_texture.c"
+#include "../libretro-common/formats/image/image_yuv_blit.c"
+#include "../libretro-common/formats/image_texture_scale.c"
+#include "../libretro-common/formats/image_texture_set.c"
 
 #ifdef HAVE_RTGA
 #include "../libretro-common/formats/tga/rtga.c"
@@ -480,6 +513,7 @@ VIDEO IMAGE
 #endif
 
 #include "../libretro-common/formats/image_transfer.c"
+#include "../libretro-common/formats/video_player.c"
 #include "../libretro-common/formats/data_transfer.c"
 #ifdef HAVE_RPNG
 #include "../libretro-common/formats/png/rpng.c"
@@ -842,6 +876,14 @@ INPUT
 #include "../input/drivers_joypad/dinput_joypad.c"
 #endif
 
+#ifdef HAVE_WIN32INPUT
+#include "../input/drivers/win32_input.c"
+#endif
+
+#ifdef HAVE_WINMM_JOYPAD
+#include "../input/drivers_joypad/winmm_joypad.c"
+#endif
+
 #ifdef HAVE_XINPUT
 #ifdef HAVE_DINPUT
 #include "../input/drivers_joypad/xinput_hybrid_joypad.c"
@@ -895,6 +937,14 @@ INPUT (HID)
 
 #if defined(HAVE_LIBUSB) && defined(HAVE_THREADS)
 #include "../input/drivers_hid/libusb_hid.c"
+#endif
+
+#ifdef HAVE_HIDRAW
+#include "../input/drivers_hid/hidraw_hid.c"
+#endif
+
+#if defined(HAVE_WINUSB) && defined(HAVE_THREADS)
+#include "../input/drivers_hid/winusb_hid.c"
 #endif
 
 #ifdef HAVE_BTSTACK
@@ -1096,6 +1146,10 @@ AUDIO
 #include "../audio/drivers/dsound.c"
 #endif
 
+#ifdef HAVE_WAVEOUT
+#include "../audio/drivers/waveout.c"
+#endif
+
 #ifdef HAVE_WASAPI
 #include "../audio/drivers/wasapi.c"
 #endif
@@ -1173,6 +1227,7 @@ DRIVERS
 #include "../gfx/gfx_display.c"
 #include "../gfx/gfx_instrument.c"
 #include "../gfx/gfx_surface.c"
+#include "../gfx/gfx_surface_player.c"
 #include "../gfx/gfx_thumbnail.c"
 #include "../gfx/gfx_anim_preview.c"
 
@@ -1387,6 +1442,9 @@ FRONTEND
 #include "../frontend/drivers/platform_qnx.c"
 #elif defined(__linux__) || (defined(BSD) && !defined(__MACH__))
 #include "../frontend/drivers/platform_unix.c"
+#if defined(ANDROID)
+#include "../libretro-common/jni/rjni.c"
+#endif
 #elif defined(DJGPP)
 #include "../frontend/drivers/platform_dos.c"
 #endif
@@ -1878,4 +1936,13 @@ SMB CLIENT
 #endif
 #if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
 #include "../libretro-common/vfs/vfs_prefetch.c"
+#endif
+
+#if defined(_WIN32) && !defined(__WINRT__)
+#if defined(HAVE_VULKAN) || defined(HAVE_OPENGL) || defined(HAVE_OPENGL1) || defined(HAVE_OPENGL_CORE) || defined(HAVE_OPENGLES)
+#include "../gfx/common/win_dxgi_present.c"
+#endif
+#ifdef HAVE_VULKAN
+#include "../gfx/common/win_vulkan_dxgi.c"
+#endif
 #endif

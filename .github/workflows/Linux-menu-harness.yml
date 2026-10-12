@@ -24,11 +24,15 @@ on:
       - 'samples/menu/playlist_nav/**'
       - 'samples/menu/nav_repeat_stall/**'
       - 'samples/menu/mouse_click/**'
+      - 'samples/menu/menu_icon_ownership/**'
+      - 'gfx/gfx_display.c'
       - 'runloop.c'
       - 'samples/menu/network_settings/**'
       - 'intl/msg_hash_lbl.h'
       - 'msg_hash_lbl_str.h'
       - 'samples/menu/resolution_reset/**'
+      - 'samples/menu/setting_command/**'
+      - 'samples/menu/core_info_page/**'
       - 'samples/settings/packed_rows/**'
       - 'setting_list.h'
       - 'gfx/video_defines.h'
@@ -42,11 +46,15 @@ on:
       - 'samples/menu/playlist_nav/**'
       - 'samples/menu/nav_repeat_stall/**'
       - 'samples/menu/mouse_click/**'
+      - 'samples/menu/menu_icon_ownership/**'
+      - 'gfx/gfx_display.c'
       - 'runloop.c'
       - 'samples/menu/network_settings/**'
       - 'intl/msg_hash_lbl.h'
       - 'msg_hash_lbl_str.h'
       - 'samples/menu/resolution_reset/**'
+      - 'samples/menu/setting_command/**'
+      - 'samples/menu/core_info_page/**'
       - 'samples/settings/packed_rows/**'
       - 'setting_list.h'
       - 'gfx/video_defines.h'
@@ -87,13 +95,34 @@ jobs:
               $pkgs && break
             [ $i = 3 ] && exit 1
             echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            if [ ! -d /etc/apt/ra-orig ]; then
+              sudo mkdir /etc/apt/ra-orig
+              sudo cp -a /etc/apt/sources.list.d /etc/apt/ra-orig/
+              [ ! -f /etc/apt/sources.list ] || sudo cp -a /etc/apt/sources.list /etc/apt/ra-orig/
+            fi
             for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
               [ -f "$f" ] || continue
               sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
                 -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
             done
-            sudo timeout 90 apt-get update -y \
-              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
+            # A refresh cut short or refused leaves apt no package lists: it
+            # is retried, without translations or command-not-found data, and
+            # the mirror is put back when the archive will not answer either.
+            upd="-o Acquire::Retries=3 -o Acquire::http::Timeout=30
+              -o Acquire::Languages=none
+              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false
+              -o APT::Update::Error-Mode=any"
+            ok=0
+            for j in 1 2; do
+              sudo timeout 120 apt-get update -y $upd && { ok=1; break; }
+            done
+            if [ $ok = 0 ]; then
+              sudo rm -rf /etc/apt/sources.list.d
+              sudo cp -a /etc/apt/ra-orig/sources.list.d /etc/apt/
+              [ ! -f /etc/apt/ra-orig/sources.list ] || sudo cp -a /etc/apt/ra-orig/sources.list /etc/apt/
+              sudo rm -rf /etc/apt/ra-orig
+              sudo timeout 120 apt-get update -y $upd || true
+            fi
           done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
@@ -219,6 +248,28 @@ jobs:
           ./samples/menu/nav_repeat_stall/menu_nav_repeat_stall_test
           make -C samples/menu/nav_repeat_stall clean
 
+      - name: Build and run menu_icon_ownership_test
+        shell: bash
+        run: |
+          set -eu
+          # Every texture handle the menu drivers hold, accounted for
+          # against a counting null driver: a handle unloaded twice or
+          # still live at deinit fails the lane. Ozone's sidebar wrote
+          # the shared cursor texture into a playlist node whose own
+          # icon had not landed, and the context destroy then freed the
+          # cursor twice - a heap-corruption crash at startup under
+          # threaded video. MaterialUI's playlist icon array could be
+          # rebuilt under a decode still in flight. The contentless
+          # cores list's icons, fallback and per core, go at deinit.
+          # Shares the non-Qt build made above; one binary, one run per
+          # lane.
+          samples/menu/menu_icon_ownership/build.sh
+          ./samples/menu/menu_icon_ownership/menu_icon_ownership_test ozone
+          ./samples/menu/menu_icon_ownership/menu_icon_ownership_test xmb
+          ./samples/menu/menu_icon_ownership/menu_icon_ownership_test materialui
+          ./samples/menu/menu_icon_ownership/menu_icon_ownership_test contentless
+          make -C samples/menu/menu_icon_ownership clean
+
       - name: Build and run menu_mouse_click_test
         shell: bash
         run: |
@@ -279,6 +330,19 @@ jobs:
           ./samples/settings/packed_rows/packed_rows_test
           make -C samples/settings/packed_rows clean
 
+      - name: Build and run setting_command_test
+        shell: bash
+        run: |
+          set -eu
+          # A press on a settings row whose command reinitialises the
+          # video driver has to bring the driver up once, on the first
+          # press and on every later one, whether or not the row
+          # applies its command by itself. Shares the non-Qt build
+          # made above.
+          samples/menu/setting_command/build.sh
+          ./samples/menu/setting_command/setting_command_test
+          make -C samples/menu/setting_command clean
+
       - name: Hot function budget
         shell: bash
         run: |
@@ -333,6 +397,32 @@ jobs:
           samples/tasks/content_load/build.sh
           ./samples/tasks/content_load/content_load_test
           make -C samples/tasks/content_load clean
+
+      - name: Build and run video_filter_menu_test
+        shell: bash
+        run: |
+          set -eu
+          # The menu's Video Filter and Video Filter Enable rows get the
+          # driver the frames they make - a chosen filter's scale and
+          # format, the core's or the filter's format as Enable turns it
+          # off and on: told in place to a driver that takes it
+          # (set_frame_format), set up again otherwise, and nothing at
+          # all when the frames do not change.
+          samples/gfx/video_filter_menu/build.sh
+          ./samples/gfx/video_filter_menu/video_filter_menu_test
+          make -C samples/gfx/video_filter_menu clean
+
+      - name: Build and run core_info_page_test
+        shell: bash
+        run: |
+          set -eu
+          # The running core's information - its current-core entry,
+          # Core Information in the Information menu and the page
+          # itself - comes from its info file, once it is up and again
+          # after the drivers are set up again under it.
+          samples/menu/core_info_page/build.sh
+          ./samples/menu/core_info_page/core_info_page_test
+          make -C samples/menu/core_info_page clean
 
       - name: Build and run explore_build_test
         shell: bash

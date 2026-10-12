@@ -1569,7 +1569,6 @@ static const struct
    char s_ccfe26d1[23];
    char s_728ca1d3[5];
    char s_5f612db6[14];
-   char s_9f29f708[20];
    char s_a9145c83[11];
    char s_22f52844[14];
    char s_06842e2b[18];
@@ -1986,6 +1985,10 @@ static const struct
    char s_4b582a0b[29];
    char s_4b582a0c[29];
    char s_61213f1d[18];
+   char s_60258de0[5];
+   char s_caf61308[14];
+   char s_34b2592a[15];
+   char s_c7a27b20[14];
    char s_317b17ed[8];
    char s_94c8d15f[8];
    char s_de16b5d2[9];
@@ -2752,7 +2755,6 @@ static const struct
    char s_14b5b145[100];
    char s_c7c09eb0[88];
    char s_6f122164[38];
-   char s_61942cf6[65];
    char s_6b7e9271[112];
    char s_3bb4fbf9[139];
    char s_f865440b[23];
@@ -3242,6 +3244,7 @@ static const struct
    char s_543fcabd[13];
    char s_59212b5f[22];
    char s_f26b6cff[38];
+   char s_a63c824a[10];
    char s_a9f3b2c3[14];
    char s_0e7aca8a[19];
    char s_ab1afe7c[17];
@@ -5106,7 +5109,6 @@ static const struct
    "Skaalaa kokonaisluvuin",
    "POIS",
    "Aloituskansio",
-   "Kokoonpanotiedostot",
    "V\303\244riteema",
    "Omenanvihre\303\244",
    "Klassinen sininen",
@@ -5525,6 +5527,10 @@ static const struct
    "Ilmoituksen sijainti (vaaka)",
    "Ilmoituksen sijainti (pysty)",
    "Monitorin indeksi",
+   "Aina",
+   "Automaattinen",
+   "Ei k\303\244yt\303\266ss\303\244",
+   "Automaattinen",
    "180 as.",
    "270 as.",
    "Normaali",
@@ -6647,7 +6653,6 @@ static const struct
    "Kelattavien kuvien m\303\244\303\244r\303\244 askelta kohden. Suuremmat arvot lis\303\244\303"
    "\244v\303\244t kelausnopeutta.",
    "Aseta tiedostoselaimen aloituskansio.",
-   "Oletusarvoinen kokoonpanotiedosto tallennetaan t\303\244h\303\244n kansioon.",
    "Valitse eri v\303\244riteema. Valitsemalla \"Mukautettu\" valikkoteemojen esiasetustiedostojen k"
    "\303\244ytt\303\266 on mahdollista.",
    "N\303\244yt\303\244 aloitusn\303\244ytt\303\266 valikossa. T\303\244m\303\244 asetus muutetaan a"
@@ -7274,6 +7279,7 @@ static const struct
    "Aikakatkaisu",
    "Sis\303\244\303\244ntulon huijaus",
    "Sis\303\244\303\244ntulon huijauksen tiedostonimi",
+   "V\303\244lit\303\266n",
    "Anna salasana",
    "Salasana v\303\244\303\244rin.",
    "Salasana oikein.",
@@ -7541,7 +7547,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_fi_blob_check[
-      (sizeof(msg_hash_fi_blob) == (123751u
+      (sizeof(msg_hash_fi_blob) == (123724u
 #ifdef HAVE_LAKKA
        + 257u
 #endif
@@ -9433,7 +9439,6 @@ static const uint32_t msg_hash_fi_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_INTEGER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_APPLE_GREEN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_CLASSIC_BLUE,
@@ -9850,6 +9855,10 @@ static const uint32_t msg_hash_fi_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_X,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_Y,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MONITOR_INDEX,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_AUTO,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_OFF,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_AUTO,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED_ROTATED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_NORMAL,
@@ -10616,7 +10625,6 @@ static const uint32_t msg_hash_fi_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_ENABLE,
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_GRANULARITY,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_SUBLABEL_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_SHOW_START_SCREEN,
    (uint32_t)MENU_ENUM_SUBLABEL_RUN,
@@ -11106,6 +11114,7 @@ static const uint32_t msg_hash_fi_ids[] =
    (uint32_t)MSG_INPUT_BIND_TIMEOUT,
    (uint32_t)MSG_INPUT_CHEAT,
    (uint32_t)MSG_INPUT_CHEAT_FILENAME,
+   (uint32_t)MSG_INPUT_COMBO_INSTANT,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_NOK,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_OK,

@@ -54,8 +54,8 @@
 /* The frontend, as far as the driver links against it. */
 uint8_t g_win32_flags;
 ui_window_win32_t main_window;
-retro_keybind_set input_config_binds[MAX_USERS];
-retro_keybind_set input_autoconf_binds[MAX_USERS];
+struct retro_keybind *input_config_binds[MAX_USERS];
+struct retro_keybind *input_autoconf_binds[MAX_USERS];
 enum retro_key rarch_keysym_lut[RETROK_LAST];
 const struct rarch_key_map rarch_key_map_winraw[] = { { 0, RETROK_UNKNOWN } };
 static settings_t stub_settings;
@@ -138,13 +138,21 @@ void task_set_flags(retro_task_t *task, uint8_t flags, bool set)
 bool video_driver_get_viewport_info(struct video_viewport *vp)
 { (void)vp; return false; }
 bool video_driver_translate_coord_viewport(struct video_viewport *vp,
-      int mouse_x, int mouse_y, int16_t *res_x, int16_t *res_y,
-      int16_t *res_screen_x, int16_t *res_screen_y, bool report_oob)
+      int mouse_x, int mouse_y, uint32_t *res_pos, uint32_t *res_screen_pos,
+      bool report_oob)
 {
-   (void)vp; (void)mouse_x; (void)mouse_y; (void)res_x; (void)res_y;
-   (void)res_screen_x; (void)res_screen_y; (void)report_oob;
+   (void)vp; (void)mouse_x; (void)mouse_y; (void)res_pos;
+   (void)res_screen_pos; (void)report_oob;
    return false;
 }
+/* The driver hands its mice and touches to the frontend at its poll. */
+void input_driver_publish_pointers(const input_pointer_frame_t *frames,
+      unsigned count, unsigned flags)
+{ (void)frames; (void)count; (void)flags; }
+void input_driver_publish_touches(const uint32_t *pos, unsigned count,
+      unsigned present, unsigned down)
+{ (void)pos; (void)count; (void)present; (void)down; }
+unsigned input_driver_pointer_read_as(unsigned i) { (void)i; return 0; }
 uintptr_t video_driver_window_get(void) { return 0; }
 void win32_clip_window(bool grab) { (void)grab; }
 void win32_hotplug_arm(void) { }
@@ -626,14 +634,14 @@ int main(void)
       CHECK(!winraw_in_background(wr, RIM_INPUT), "foreground input refused");
       CHECK(winraw_in_background(wr, RIM_INPUTSINK), "background input taken");
       wr->sink     = true;
-      winraw_focus = false;
+      retro_atomic_store_release_int(&winraw_focus_flag, 0);
       CHECK(winraw_in_background(wr, RIM_INPUTSINK),
             "a sink took input with the main window unfocused");
-      winraw_focus = true;
+      retro_atomic_store_release_int(&winraw_focus_flag, 1);
       CHECK(!winraw_in_background(wr, RIM_INPUTSINK),
             "a sink refused input with the main window focused");
       wr->sink     = false;
-      winraw_focus = false;
+      retro_atomic_store_release_int(&winraw_focus_flag, 0);
       printf("   ok   background input: refused, unless a sink with the main window focused\n");
    }
 

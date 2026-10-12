@@ -247,6 +247,8 @@ typedef struct
       d3d10_shader_t shader;
       d3d10_shader_t shader_font;
       D3D10Buffer    vbo;
+      /* Sampled by a quad drawn with no texture: solid colour */
+      d3d10_texture_t white;
       int            offset;
       int            capacity;
    } sprites;
@@ -261,6 +263,9 @@ typedef struct
        * at most one map. */
       d3d10_sprite_t*  shadow;
       int              count;
+      /* textures are copies of the overlay pack's (load_textures):
+       * drawn from, never released here. */
+      bool             borrowed;
       bool             dirty;
    } overlays;
 #endif
@@ -303,6 +308,18 @@ typedef struct
 
    struct video_shader* shader_preset;
    d3d10_texture_t      luts[GFX_MAX_TEXTURES];
+   /* A software frame without a preset is written straight into this
+    * dynamic texture, mapped WRITE_DISCARD so a frame the GPU still
+    * reads is renamed rather than waited for, and drawn from it: no
+    * staging copy, no copy on the GPU. `format` is the format it was
+    * made for, which the texture may hold as another; `active` while
+    * the frame on screen, repeats of it included, is in it. */
+   struct
+   {
+      d3d10_texture_t texture;
+      DXGI_FORMAT     format;
+      bool            active;
+   } sw_direct;
    struct string_list *gpu_list;
    IDXGIAdapter1 *adapters[D3D10_MAX_GPU_COUNT];
    IDXGIAdapter1 *current_adapter;
@@ -525,6 +542,48 @@ static void d3d10_update_texture(
       ctx->lpVtbl->GenerateMips(ctx, texture->view);
 }
 
+/* Writes a software frame into sw_direct's texture, made or remade at
+ * its size first. False when it can't be: the frame takes the staging
+ * path instead. */
+static bool d3d10_sw_direct_upload(d3d10_video_t *d3d10,
+      unsigned width, unsigned height, unsigned pitch, const void *frame)
+{
+   D3D10_MAPPED_TEXTURE2D mapped;
+   d3d10_texture_t *tex = &d3d10->sw_direct.texture;
+
+   if (     !tex->handle
+         || tex->desc.Width         != width
+         || tex->desc.Height        != height
+         || d3d10->sw_direct.format != d3d10->format)
+   {
+      d3d10_release_texture(tex);
+      memset(tex, 0, sizeof(*tex));
+      tex->desc.Width          = width;
+      tex->desc.Height         = height;
+      tex->desc.Format         = d3d10->format;
+      tex->desc.Usage          = D3D10_USAGE_DYNAMIC;
+      d3d10->sw_direct.format  = d3d10->format;
+      d3d10_init_texture(d3d10->device, tex);
+      /* Written in place: the staging twin is never used. */
+      Release(tex->staging);
+      tex->staging = NULL;
+      if (!tex->handle || !tex->view)
+      {
+         d3d10_release_texture(tex);
+         memset(tex, 0, sizeof(*tex));
+         return false;
+      }
+   }
+
+   if (FAILED(tex->handle->lpVtbl->Map(tex->handle, 0,
+               D3D10_MAP_WRITE_DISCARD, 0, &mapped)))
+      return false;
+   dxgi_copy(width, height, d3d10->format, pitch, frame,
+         tex->desc.Format, mapped.RowPitch, mapped.pData);
+   tex->handle->lpVtbl->Unmap(tex->handle, 0);
+   return true;
+}
+
 static bool d3d10_init_shader(
       D3D10Device                     device,
       const char*                     src,
@@ -696,7 +755,7 @@ static void gfx_display_d3d10_draw(gfx_display_ctx_draw_t *draw,
    int vertex_count        = 1;
    d3d10_video_t* d3d10    = (d3d10_video_t*)data;
 
-   if (!d3d10 || !draw || !draw->texture)
+   if (!d3d10 || !draw)
       return;
 
    switch (draw->pipeline_id)
@@ -761,7 +820,7 @@ static void gfx_display_d3d10_draw(gfx_display_ctx_draw_t *draw,
       {
          sprite->pos.x       = VIDEO_POS_X(draw->pos) / (float)d3d10->viewport.Width;
          sprite->pos.y       =
-               (d3d10->viewport.Height - VIDEO_POS_Y(draw->pos) - VIDEO_SCALE_H(draw->dims))
+               (float)VIDEO_POS_FLIP_Y(d3d10->viewport.Height, draw->pos, draw->dims)
                / (float)d3d10->viewport.Height;
          sprite->pos.w       = VIDEO_SCALE_W(draw->dims)  / (float)d3d10->viewport.Width;
          sprite->pos.h       = VIDEO_SCALE_H(draw->dims) / (float)d3d10->viewport.Height;
@@ -822,8 +881,8 @@ static void gfx_display_d3d10_draw(gfx_display_ctx_draw_t *draw,
       d3d10->sprites.vbo->lpVtbl->Unmap(d3d10->sprites.vbo);
    }
 
-   d3d10_set_texture_and_sampler(d3d10->device, 0,
-         (d3d10_texture_t*)draw->texture);
+   d3d10_set_texture_and_sampler(d3d10->device, 0, draw->texture
+         ? (d3d10_texture_t*)draw->texture : &d3d10->sprites.white);
    d3d10->device->lpVtbl->Draw(d3d10->device, vertex_count,
          d3d10->sprites.offset);
    d3d10->sprites.offset += vertex_count;
@@ -918,14 +977,15 @@ static bool gfx_display_d3d10_mesh_draw(void *data, unsigned video_dims,
    UINT stride              = sizeof(gfx_display_mesh_vertex_t);
    UINT offset              = 0;
    d3d10_video_t *d3d10     = (d3d10_video_t*)data;
-   d3d10_texture_t *tex     = (d3d10_texture_t*)texture;
+   d3d10_texture_t *tex;
    D3D10Device dev;
    int slot;
 
    (void)video_dims;
-   if (     !d3d10 || !mesh || !tex || !d3d10->mesh_ubo
+   if (     !d3d10 || !mesh || !d3d10->mesh_ubo
          || !d3d10->mesh_shader.vs || !d3d10->mesh_shader.ps)
       return false;
+   tex = texture ? (d3d10_texture_t*)texture : &d3d10->sprites.white;
    if ((slot = d3d10_mesh_slot(d3d10, mesh)) < 0)
       return false;
    d3d10->meshes[slot].last_draw = ++d3d10->mesh_draws;
@@ -1127,8 +1187,9 @@ static void *d3d10_font_init(void* data, const char* font_path,
 
    font->atlas               = font->font_driver->get_atlas(font->font_data);
    /* The atlas may grow, up to the largest 2D texture D3D10 has */
-   font->atlas->max_width    = D3D10_REQ_TEXTURE2D_U_OR_V_DIMENSION;
-   font->atlas->max_height   = D3D10_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+   font->atlas->max_dims = VIDEO_SCALE_PACK(
+         D3D10_REQ_TEXTURE2D_U_OR_V_DIMENSION,
+         D3D10_REQ_TEXTURE2D_U_OR_V_DIMENSION);
    d3d10_font_make_texture(d3d10, font);
 
    return font;
@@ -1165,10 +1226,13 @@ static int d3d10_font_get_message_width(void *data, const char *msg,
  * rows, and issue a boxed CopySubresourceRegion for just that area.
  * The generic d3d10_update_texture() re-uploads the whole surface. */
 static void d3d10_font_update_atlas_region(
-      D3D10Device ctx, d3d10_font_t *font,
-      unsigned x0, unsigned y0, unsigned x1, unsigned y1)
+      D3D10Device ctx, d3d10_font_t *font, unsigned xy0, unsigned xy1)
 {
    unsigned y;
+   unsigned x0 = VIDEO_SCALE_W(xy0);
+   unsigned y0 = VIDEO_SCALE_H(xy0);
+   unsigned x1 = VIDEO_SCALE_W(xy1);
+   unsigned y1 = VIDEO_SCALE_H(xy1);
    D3D10_MAPPED_TEXTURE2D mapped;
    D3D10_BOX box;
 
@@ -1331,12 +1395,14 @@ static void d3d10_font_render_msg(
       { \
          (dst)->pos.x           = ((px) + ((glyph)->draw_offset_x * scale)) * inv_viewport_w; \
          (dst)->pos.y           = ((py) + ((glyph)->draw_offset_y * scale)) * inv_viewport_h; \
-         (dst)->pos.w           = (glyph)->width  * scale * inv_viewport_w; \
-         (dst)->pos.h           = (glyph)->height * scale * inv_viewport_h; \
-         (dst)->coords.u        = (glyph)->atlas_offset_x * inv_tex_w; \
-         (dst)->coords.v        = (glyph)->atlas_offset_y * inv_tex_h; \
-         (dst)->coords.w        = (glyph)->width  * inv_tex_w; \
-         (dst)->coords.h        = (glyph)->height * inv_tex_h; \
+         (dst)->pos.w           = VIDEO_SCALE_W((glyph)->dims) \
+            * scale * inv_viewport_w; \
+         (dst)->pos.h           = VIDEO_SCALE_H((glyph)->dims) \
+            * scale * inv_viewport_h; \
+         (dst)->coords.u        = VIDEO_SCALE_W((glyph)->atlas_pos) * inv_tex_w; \
+         (dst)->coords.v        = VIDEO_SCALE_H((glyph)->atlas_pos) * inv_tex_h; \
+         (dst)->coords.w        = VIDEO_SCALE_W((glyph)->dims) * inv_tex_w; \
+         (dst)->coords.h        = VIDEO_SCALE_H((glyph)->dims) * inv_tex_h; \
          (dst)->params.scaling  = 1; \
          (dst)->params.rotation = 0; \
          (dst)->colors[0]       = (col); \
@@ -1411,8 +1477,7 @@ static void d3d10_font_render_msg(
    {
       if (font->texture.staging)
          d3d10_font_update_atlas_region(d3d10->device, font,
-               font->atlas->dirty_x0, font->atlas->dirty_y0,
-               font->atlas->dirty_x1, font->atlas->dirty_y1);
+               font->atlas->dirty_xy0, font->atlas->dirty_xy1);
       font->atlas->dirty = false;
    }
 
@@ -1457,8 +1522,10 @@ static bool d3d10_font_get_line_metrics(void* data,
 static void d3d10_free_overlays(d3d10_video_t* d3d10)
 {
    size_t i;
-   for (i = 0; i < (unsigned)d3d10->overlays.count; i++)
-      d3d10_release_texture(&d3d10->overlays.textures[i]);
+   if (!d3d10->overlays.borrowed)
+      for (i = 0; i < (unsigned)d3d10->overlays.count; i++)
+         d3d10_release_texture(&d3d10->overlays.textures[i]);
+   d3d10->overlays.borrowed = false;
    /* The array as well as what it holds: every page load made a new
     * one over this one. */
    free(d3d10->overlays.textures);
@@ -1529,22 +1596,15 @@ static void d3d10_overlay_set_alpha(void* data, unsigned index, float mod)
    sprite->colors[3] = sprite->colors[0];
 }
 
-static bool d3d10_overlay_load(void* data,
-      const void* image_data, unsigned num_images)
+/* A page of @num_images: the texture array, the sprites at their
+ * defaults and the buffer they are drawn from */
+static bool d3d10_overlay_alloc(d3d10_video_t* d3d10, unsigned num_images)
 {
    size_t i;
    D3D10_BUFFER_DESC desc;
-   d3d10_sprite_t*             sprites = NULL;
-   d3d10_video_t*              d3d10   = (d3d10_video_t*)data;
-   const struct texture_image* images  = (const struct texture_image*)
-      image_data;
-
-   if (!d3d10)
-      return false;
+   d3d10_sprite_t* sprites = NULL;
 
    d3d10_free_overlays(d3d10);
-   if (!num_images)
-      return true;
    d3d10->overlays.textures = (d3d10_texture_t*)calloc(
          num_images, sizeof(d3d10_texture_t));
    d3d10->overlays.shadow   = (d3d10_sprite_t*)malloc(
@@ -1575,21 +1635,6 @@ static bool d3d10_overlay_load(void* data,
 
    for (i = 0; i < (unsigned)num_images; i++)
    {
-
-      d3d10->overlays.textures[i].desc.Width  = images[i].width;
-      d3d10->overlays.textures[i].desc.Height = images[i].height;
-      d3d10->overlays.textures[i].desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-
-      d3d10_release_texture(&d3d10->overlays.textures[i]);
-      d3d10_init_texture(d3d10->device, &d3d10->overlays.textures[i]);
-
-      if (d3d10->overlays.textures[i].staging)
-         d3d10_update_texture(
-               d3d10->device,
-               images[i].width,
-               images[i].height, 0, DXGI_FORMAT_B8G8R8A8_UNORM,
-               images[i].pixels, &d3d10->overlays.textures[i]);
-
       sprites[i].pos.x           = 0.0f;
       sprites[i].pos.y           = 0.0f;
       sprites[i].pos.w           = 1.0f;
@@ -1608,6 +1653,72 @@ static bool d3d10_overlay_load(void* data,
       sprites[i].colors[2]       = sprites[i].colors[0];
       sprites[i].colors[3]       = sprites[i].colors[0];
    }
+
+   return true;
+}
+
+static bool d3d10_overlay_load(void* data,
+      const void* image_data, unsigned num_images)
+{
+   size_t i;
+   d3d10_video_t*              d3d10   = (d3d10_video_t*)data;
+   const struct texture_image* images  = (const struct texture_image*)
+      image_data;
+
+   if (!d3d10)
+      return false;
+
+   if (!num_images)
+   {
+      d3d10_free_overlays(d3d10);
+      return true;
+   }
+   if (!d3d10_overlay_alloc(d3d10, num_images))
+      return false;
+
+   for (i = 0; i < (unsigned)num_images; i++)
+   {
+      d3d10->overlays.textures[i].desc.Width  = images[i].width;
+      d3d10->overlays.textures[i].desc.Height = images[i].height;
+      d3d10->overlays.textures[i].desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+
+      d3d10_release_texture(&d3d10->overlays.textures[i]);
+      d3d10_init_texture(d3d10->device, &d3d10->overlays.textures[i]);
+
+      if (d3d10->overlays.textures[i].staging)
+         d3d10_update_texture(
+               d3d10->device,
+               images[i].width,
+               images[i].height, 0, DXGI_FORMAT_B8G8R8A8_UNORM,
+               images[i].pixels, &d3d10->overlays.textures[i]);
+   }
+
+   return true;
+}
+
+/* A page of the pack's textures: copies of d3d10_gfx_load_texture's
+ * d3d10_texture_t per image to draw from, nothing uploaded, created
+ * or released but the page's sprite buffer. */
+static bool d3d10_overlay_load_textures(void* data,
+      const uintptr_t* textures, unsigned num_textures)
+{
+   unsigned       i;
+   d3d10_video_t* d3d10 = (d3d10_video_t*)data;
+
+   if (!d3d10)
+      return false;
+
+   if (!num_textures)
+   {
+      d3d10_free_overlays(d3d10);
+      return true;
+   }
+   if (!d3d10_overlay_alloc(d3d10, num_textures))
+      return false;
+   d3d10->overlays.borrowed = true;
+
+   for (i = 0; i < num_textures; i++)
+      d3d10->overlays.textures[i] = *(const d3d10_texture_t*)textures[i];
 
    return true;
 }
@@ -1642,7 +1753,8 @@ static void d3d10_overlay_full_screen(void* data, bool enable)
 static void d3d10_get_overlay_interface(void* data, const video_overlay_interface_t** iface)
 {
    static const video_overlay_interface_t overlay_interface = {
-      d3d10_overlay_enable,      d3d10_overlay_load, NULL, /* load_textures */        d3d10_overlay_tex_geom,
+      d3d10_overlay_enable,      d3d10_overlay_load,        d3d10_overlay_load_textures,
+      d3d10_overlay_tex_geom,
       d3d10_overlay_vertex_geom, d3d10_overlay_full_screen, d3d10_overlay_set_alpha,
    };
 
@@ -2369,11 +2481,13 @@ static void d3d10_gfx_free(void* data)
    d3d10_free_shader_preset(d3d10);
 
    d3d10_release_texture(&d3d10->frame.texture[0]);
+   d3d10_release_texture(&d3d10->sw_direct.texture);
    Release(d3d10->frame.ubo);
    Release(d3d10->frame.vbo);
 
    d3d10_release_texture(&d3d10->menu.texture);
    Release(d3d10->menu.vbo);
+   d3d10_release_texture(&d3d10->sprites.white);
 
    d3d10_release_shader(&d3d10->sprites.shader);
    d3d10_release_shader(&d3d10->sprites.shader_font);
@@ -2489,8 +2603,7 @@ static bool d3d10_init_swapchain(d3d10_video_t *d3d10,
    return true;
 }
 
-static void *d3d10_gfx_init(const video_info_t* video,
-      input_driver_t** input, void** input_data)
+static void *d3d10_gfx_init(const video_info_t* video)
 {
    unsigned i;
 #ifdef HAVE_MONITOR
@@ -2546,7 +2659,7 @@ static void *d3d10_gfx_init(const video_info_t* video,
 
    /* no input driver of this driver's own: the frontend starts the
     * one that goes with a Windows window */
-   input_driver_left_to_frontend(INPUT_WINDOW_WINDOWS, input, input_data);
+   input_driver_video_window(INPUT_WINDOW_WINDOWS, NULL);
 
    if (!d3d10_init_swapchain(d3d10,
             VIDEO_SCALE_W(d3d10->vp.full_dims),
@@ -2678,6 +2791,19 @@ static void *d3d10_gfx_init(const video_info_t* video,
    }
 
    d3d10_set_filtering(d3d10, 0, video->smooth, video->ctx_scaling);
+
+   {
+      static const uint32_t white = 0xffffffff;
+      d3d10->sprites.white.desc.Width  = 1;
+      d3d10->sprites.white.desc.Height = 1;
+      d3d10->sprites.white.desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      d3d10->sprites.white.sampler     =
+         d3d10->samplers[RARCH_FILTER_NEAREST][RARCH_WRAP_EDGE];
+      d3d10_init_texture(d3d10->device, &d3d10->sprites.white);
+      if (d3d10->sprites.white.staging)
+         d3d10_update_texture(d3d10->device, 1, 1, 0,
+               DXGI_FORMAT_B8G8R8A8_UNORM, &white, &d3d10->sprites.white);
+   }
 
    {
       D3D10_BUFFER_DESC desc;
@@ -3188,12 +3314,18 @@ static bool d3d10_gfx_frame(
       if (d3d10->flags & D3D10_ST_FLAG_RESIZE_RTS)
          d3d10_init_render_targets(d3d10, width, height);
 
-      if (frame != RETRO_HW_FRAME_BUFFER_VALID)
-         if (d3d10->frame.texture[0].staging)
-            d3d10_update_texture(
-                  d3d10->device,
-                  width, height, pitch, d3d10->format,
-                  frame, &d3d10->frame.texture[0]);
+      /* Without a preset a software frame is drawn from where it was
+       * written; a preset's passes read frame.texture[0]. */
+      d3d10->sw_direct.active = !d3d10->shader_preset
+         && frame != RETRO_HW_FRAME_BUFFER_VALID
+         && d3d10_sw_direct_upload(d3d10, width, height, pitch, frame);
+      if (     !d3d10->sw_direct.active
+            && frame != RETRO_HW_FRAME_BUFFER_VALID
+            && d3d10->frame.texture[0].staging)
+         d3d10_update_texture(
+               d3d10->device,
+               width, height, pitch, d3d10->format,
+               frame, &d3d10->frame.texture[0]);
    }
 
    stride = sizeof(d3d10_vertex_t);
@@ -3399,11 +3531,12 @@ static bool d3d10_gfx_frame(
    if (texture)
    {
       d3d10_set_shader(context, &d3d10->shaders[VIDEO_SHADER_STOCK_BLEND]);
-#if 0
-      /* TODO/FIXME */
-      if (!d3d10->hw.enable || d3d10->shader_preset)
-#endif
-         context->lpVtbl->PSSetShaderResources(context, 0, 1, &texture->view);
+      if (d3d10->sw_direct.active && texture == d3d10->frame.texture)
+         context->lpVtbl->PSSetShaderResources(context, 0, 1,
+               &d3d10->sw_direct.texture.view);
+      else
+         context->lpVtbl->PSSetShaderResources(context, 0, 1,
+               &texture->view);
       context->lpVtbl->PSSetSamplers(context, 0, 1,
             &d3d10->samplers[RARCH_FILTER_UNSPEC][RARCH_WRAP_DEFAULT]);
       context->lpVtbl->VSSetConstantBuffers(context, 0, 1,
@@ -3918,8 +4051,9 @@ static uintptr_t d3d10_texture_unload_wrap(void *data)
  * created and released. The staging texture the last update copied
  * from may still be the GPU's; mapping it would wait, so the frame is
  * dropped instead and the texture keeps what it shows. */
-static bool d3d10_gfx_update_texture_internal(d3d10_video_t *d3d10,
-      uintptr_t handle, const struct texture_image *image)
+static enum video_texture_update d3d10_gfx_update_texture_internal(
+      d3d10_video_t *d3d10, uintptr_t handle,
+      const struct texture_image *image)
 {
    D3D10_MAPPED_TEXTURE2D mapped;
    D3D10_BOX box;
@@ -3929,14 +4063,14 @@ static bool d3d10_gfx_update_texture_internal(d3d10_video_t *d3d10,
    if (     !d3d10 || !texture || !texture->staging || image->pix10
          || texture->desc.Width  != image->width
          || texture->desc.Height != image->height)
-      return false;
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
 
    hr = texture->staging->lpVtbl->Map(texture->staging, 0,
          D3D10_MAP_WRITE, D3D10_MAP_FLAG_DO_NOT_WAIT, &mapped);
    if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
-      return true;
+      return VIDEO_TEXTURE_UPDATE_DROPPED;
    if (FAILED(hr))
-      return false;
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
 
    dxgi_copy(image->width, image->height, texture->desc.Format, 0,
          image->pixels, texture->desc.Format, mapped.RowPitch,
@@ -3954,25 +4088,25 @@ static bool d3d10_gfx_update_texture_internal(d3d10_video_t *d3d10,
          (D3D10Resource)texture->staging, 0, &box);
    if (texture->desc.MiscFlags & D3D10_RESOURCE_MISC_GENERATE_MIPS)
       d3d10->device->lpVtbl->GenerateMips(d3d10->device, texture->view);
-   return true;
+   return VIDEO_TEXTURE_UPDATE_DONE;
 }
 
 #ifdef HAVE_THREADS
 static uintptr_t d3d10_texture_update_wrap(void *data)
 {
    d3d10_texture_cmd_t *cmd = (d3d10_texture_cmd_t*)data;
-   cmd->handle = d3d10_gfx_update_texture_internal(cmd->d3d10,
-         cmd->handle, cmd->image) ? cmd->handle : 0;
-   return 0;
+   return (uintptr_t)d3d10_gfx_update_texture_internal(cmd->d3d10,
+         cmd->handle, cmd->image);
 }
 #endif
 
-static bool d3d10_gfx_update_texture(void *video_data, uintptr_t id,
-      const struct texture_image *ti, bool threaded)
+static enum video_texture_update d3d10_gfx_update_texture(
+      void *video_data, uintptr_t id, const struct texture_image *ti,
+      bool threaded)
 {
    d3d10_video_t *d3d10 = (d3d10_video_t*)video_data;
    if (!id || !ti || !ti->pixels)
-      return false;
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
 
 #ifdef HAVE_THREADS
    if (threaded)
@@ -3982,8 +4116,8 @@ static bool d3d10_gfx_update_texture(void *video_data, uintptr_t id,
       cmd.image       = (struct texture_image*)ti;
       cmd.filter_type = TEXTURE_FILTER_LINEAR;
       cmd.handle      = id;
-      video_thread_texture_handle(&cmd, d3d10_texture_update_wrap);
-      return cmd.handle != 0;
+      return (enum video_texture_update)video_thread_texture_handle(
+            &cmd, d3d10_texture_update_wrap);
    }
 #endif
 
@@ -4058,7 +4192,11 @@ static uint32_t d3d10_get_flags(void *data)
    /* a borderless fullscreen toggle restyles the window; see
     * d3d10_set_video_mode() */
    if (win32_fullscreen_in_place())
+   {
       BIT32_SET(flags, GFX_CTX_FLAGS_FULLSCREEN_IN_PLACE);
+      BIT32_SET(flags, GFX_CTX_FLAGS_WINDOW_RESIZE_IN_PLACE);
+      BIT32_SET(flags, GFX_CTX_FLAGS_FULLSCREEN_EXCLUSIVE_IN_PLACE);
+   }
 #endif
    BIT32_SET(flags, GFX_CTX_FLAGS_MENU_FRAME_FILTERING);
    BIT32_SET(flags, GFX_CTX_FLAGS_OVERLAY_BEHIND_MENU_SUPPORTED);
@@ -4180,21 +4318,14 @@ static unsigned d3d10_get_swap_interval_cap(void *data)
    return 4;
 }
 
-/* A borderless fullscreen toggle. It used to restart every driver:
- * this one freed its device, shaders, swap chain and every texture
- * and made them all again, the audio driver stopped and
- * started, and a hardware-rendered core was told its context was gone
- * - for a change of the window's style and size. The window is
- * restyled where it stands instead (win32_window_set_fullscreen());
- * the size change reaches the driver through check_window like any
- * resize, and the swap chain's buffers are resized as they are when
- * the window's edge is dragged. Nothing else is touched.
- * RETROARCH_FULLSCREEN_IN_PLACE=0 turns it off. */
+/* Restyle the existing window and let check_window report its size.
+ * A failed display-mode change falls back to driver reinitialization. */
 #if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
 static void d3d10_set_video_mode(void *data, unsigned dims, bool fullscreen)
 {
    (void)data;
-   win32_window_set_fullscreen(dims, fullscreen);
+   if (!win32_window_set_fullscreen_exclusive(dims, fullscreen))
+      video_driver_modify_disp_flags(VIDEO_FLAG_DRIVER_REINIT, 0);
 }
 #endif
 

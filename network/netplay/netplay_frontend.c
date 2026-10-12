@@ -4130,7 +4130,7 @@ static void netplay_sync_input_post_frame(netplay_t *netplay, bool stalled)
       if ((netplay->flags & NETPLAY_FLAG_CATCH_UP))
       {
          netplay->flags &= ~NETPLAY_FLAG_CATCH_UP;
-         input_state_get_ptr()->flags &= ~INP_FLAG_NONBLOCKING;
+         input_driver_set_nonblocking(false);
          driver_set_nonblock_state();
       }
       return;
@@ -4323,7 +4323,7 @@ static void netplay_sync_input_post_frame(netplay_t *netplay, bool stalled)
       if (netplay->self_frame_count + 1 >= lo_frame_count)
       {
          netplay->flags &= ~NETPLAY_FLAG_CATCH_UP;
-         input_state_get_ptr()->flags &= ~INP_FLAG_NONBLOCKING;
+         input_driver_set_nonblocking(false);
          driver_set_nonblock_state();
       }
 
@@ -4352,7 +4352,7 @@ static void netplay_sync_input_post_frame(netplay_t *netplay, bool stalled)
                /* We're definitely falling behind! */
                netplay->flags |= NETPLAY_FLAG_CATCH_UP;
                netplay->catch_up_time        = 0;
-               input_state_get_ptr()->flags |= INP_FLAG_NONBLOCKING;
+               input_driver_set_nonblocking(true);
                driver_set_nonblock_state();
             }
             else
@@ -8085,7 +8085,12 @@ static bool netplay_process_savestate1(retro_ctx_serialize_info_t* serial_info)
 #ifdef HAVE_CHEEVOS
       else if (memcmp(marker, NETPLAYSTATE_CHEEVOS_BLOCK, 4) == 0 && settings->bools.cheevos_enable)
       {
-         const bool hardcore_state = (input[0] != 0);
+         bool hardcore_state;
+
+         if (block_size < 8)
+            return false;
+
+         hardcore_state = (input[0] != 0);
          if (hardcore_state != rcheevos_hardcore_active() && !netplay_is_spectating())
          {
             const char *msg = msg_hash_to_str(MSG_CHEEVOS_HARDCORE_MODE_CHANGED_BY_HOST);
@@ -8111,7 +8116,7 @@ static bool netplay_process_savestate1(retro_ctx_serialize_info_t* serial_info)
           * block, and stepping 'input' here as well used to land the
           * walk 8 bytes past the next header. */
          if (block_size > 8)
-            rcheevos_set_serialized_data((void*)(input + 8));
+            rcheevos_set_serialized_data(input + 8, block_size - 8);
       }
 #endif
 
@@ -8856,11 +8861,7 @@ bool init_netplay_deferred(const char *server, unsigned port, const char *mitm_s
 void input_poll_net(netplay_t *netplay)
 {
    if (!netplay_should_skip(netplay))
-   {
-      input_driver_state_t *input_st = input_state_get_ptr();
-
-      netplay_poll(netplay, input_st->flags & INP_FLAG_BLOCK_LIBRETRO_INPUT);
-   }
+      netplay_poll(netplay, input_driver_libretro_input_blocked());
 }
 
 /* Netplay polling callbacks */

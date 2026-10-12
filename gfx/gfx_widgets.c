@@ -54,7 +54,6 @@
 #define MSG_QUEUE_FONT_SIZE 20.0f
 
 static dispgfx_widget_t dispwidget_st = {0};
-static uint64_t widget_icon_load_gen  = 0;
 
 /* Set by gfx_widgets_reload_assets() on the thread that asks; taken by
  * the next layout pass on the thread that drives the widgets, which
@@ -88,7 +87,7 @@ static void gfx_widgets_update_icon_layout(dispgfx_widget_t *p_dispwidget)
    p_dispwidget->msg_queue_regular_text_start     = p_dispwidget->msg_queue_rect_start_x + p_dispwidget->msg_queue_icon_size_x + (p_dispwidget->simple_widget_padding / 2.5f);
    p_dispwidget->msg_queue_task_text_start_x      = p_dispwidget->msg_queue_rect_start_x + (p_dispwidget->msg_queue_height / 2.0f) + (p_dispwidget->simple_widget_padding / 2.0f);
 
-   if (!p_dispwidget->gfx_widgets_icons_textures[MENU_WIDGETS_ICON_HOURGLASS])
+   if (!GFX_SURFACE_HANDLE(p_dispwidget->gfx_widgets_icons_textures[MENU_WIDGETS_ICON_HOURGLASS]))
       p_dispwidget->msg_queue_task_text_start_x  -= p_dispwidget->gfx_widget_fonts.msg_queue.glyph_width * 2.0f;
 
    p_dispwidget->msg_queue_default_rect_width     = VIDEO_SCALE_W(p_dispwidget->last_video_dims)
@@ -338,7 +337,10 @@ static void gfx_widgets_task_cmds_discard(dispgfx_widget_t *p_dispwidget)
    }
 }
 
-/* Task widgets not yet on screen were never animated or counted. */
+/* Task widgets not yet on screen were never animated or counted: an
+ * update to one that is still waiting changes its text and starts
+ * nothing (gfx_widgets_task_cmd_apply()), so there is no animation
+ * left pointing into what is freed here. */
 static void gfx_widgets_task_pending_discard(dispgfx_widget_t *p_dispwidget)
 {
    unsigned i;
@@ -501,16 +503,19 @@ void gfx_widgets_task_transfer(retro_task_t *from, retro_task_t *to)
    gfx_widgets_task_cmd_push(p_dispwidget, cmd);
 }
 
+/* The task's widget, and whether it is still waiting to go on screen */
 static disp_widget_msg_t *gfx_widgets_task_widget_find(
-      dispgfx_widget_t *p_dispwidget, uintptr_t key)
+      dispgfx_widget_t *p_dispwidget, uintptr_t key, bool *waiting)
 {
    size_t i;
+   *waiting = false;
    for (i = 0; i < p_dispwidget->current_msgs_size; i++)
    {
       disp_widget_msg_t *msg_widget = p_dispwidget->current_msgs[i];
       if (msg_widget && msg_widget->task_key == key)
          return msg_widget;
    }
+   *waiting = true;
    for (i = 0; i < p_dispwidget->task_pending_size; i++)
       if (p_dispwidget->task_pending[i]->task_key == key)
          return p_dispwidget->task_pending[i];
@@ -522,8 +527,9 @@ static disp_widget_msg_t *gfx_widgets_task_widget_find(
 static void gfx_widgets_task_cmd_apply(dispgfx_widget_t *p_dispwidget,
       gfx_widgets_task_cmd_t *cmd)
 {
+   bool waiting                  = false;
    disp_widget_msg_t *msg_widget =
-      gfx_widgets_task_widget_find(p_dispwidget, cmd->key);
+      gfx_widgets_task_widget_find(p_dispwidget, cmd->key, &waiting);
 
    if (msg_widget)
       gfx_widgets_task_rebind(msg_widget, cmd->ident);
@@ -637,7 +643,12 @@ static void gfx_widgets_task_cmd_apply(dispgfx_widget_t *p_dispwidget,
       msg_widget->msg_len                    = _len;
       msg_widget->msg_transition_animation   = 0;
 
-      if (!msg_widget->alternative_look)
+      /* The old title slides out and the new one in - for a widget
+       * that is on screen. One still waiting is not drawn: it takes
+       * the new title as it is. An animation started for it would
+       * also outlive it when the waiting widgets are discarded (a
+       * video driver restart), and write to it once freed. */
+      if (!msg_widget->alternative_look && !waiting)
       {
          gfx_animation_ctx_entry_t entry;
 
@@ -1608,7 +1619,7 @@ static void gfx_widgets_draw_task_msg(
    float *msg_queue_current_progress;
 
    size_t _len                       = 0;
-   size_t task_percentage_offset     = 0;
+   unsigned task_percentage_offset   = 0;
    char task_percentage[16]          = "";
    bool draw_msg_new                 = false;
    bool msg_alternative              = msg->alternative_look;
@@ -1625,7 +1636,7 @@ static void gfx_widgets_draw_task_msg(
       _len = snprintf(task_percentage, sizeof(task_percentage),
             "%i%%", msg->task_progress);
 
-   task_percentage_offset = p_dispwidget->gfx_widget_fonts.msg_queue.glyph_width * _len;
+   task_percentage_offset = (unsigned)(p_dispwidget->gfx_widget_fonts.msg_queue.glyph_width * _len);
    rect_width             = (msg_alternative)
          ? video_width
          : p_dispwidget->simple_widget_padding + msg->width + (p_dispwidget->msg_queue_icon_size_x / 2) + task_percentage_offset;
@@ -1745,7 +1756,7 @@ static void gfx_widgets_draw_task_msg(
             p_disp,
             video_dims,
             VIDEO_SCALE_PACK(msg_queue_height / 2.5f, msg_queue_height / 2.5f),
-            p_dispwidget->gfx_widgets_icons_textures[texture],
+            GFX_SURFACE_HANDLE(p_dispwidget->gfx_widgets_icons_textures[texture]),
             rect_x + (msg_queue_height / 12.0f) + (msg_queue_height / MSG_QUEUE_FONT_SIZE),
             rect_y + (msg_queue_height / MSG_QUEUE_FONT_SIZE),
             radians,
@@ -1927,7 +1938,7 @@ static void gfx_widgets_draw_regular_msg(
             p_disp,
             video_dims,
             VIDEO_SCALE_PACK(icon_size, icon_size),
-            p_dispwidget->gfx_widgets_icons_textures[MENU_WIDGETS_ICON_INFO],
+            GFX_SURFACE_HANDLE(p_dispwidget->gfx_widgets_icons_textures[MENU_WIDGETS_ICON_INFO]),
             p_dispwidget->msg_queue_rect_start_x
                   + (p_dispwidget->msg_queue_height / 10.0f),
             video_height - msg->offset_y - p_dispwidget->msg_queue_icon_offset_y,
@@ -2034,7 +2045,7 @@ static void gfx_widgets_frame_state(void *data)
       bool all_loaded = true;
       for (_i = 0; _i < MENU_WIDGETS_ICON_LAST; _i++)
       {
-         if (!p_dispwidget->gfx_widgets_icons_textures[_i])
+         if (!GFX_SURFACE_HANDLE(p_dispwidget->gfx_widgets_icons_textures[_i]))
          {
             all_loaded = false;
             break;
@@ -2100,7 +2111,7 @@ static void gfx_widgets_frame_state(void *data)
       }
       gfx_display_set_alpha(p_dispwidget->pure_white, 1.0f);
 
-      if (p_dispwidget->ai_service_overlay_texture)
+      if (GFX_SURFACE_HANDLE(p_dispwidget->ai_service_overlay_texture))
       {
          gfx_display_blend_begin(dispctx, userdata);
          gfx_widgets_draw_icon(
@@ -2108,7 +2119,7 @@ static void gfx_widgets_frame_state(void *data)
                p_disp,
                video_info->dims,
                VIDEO_SCALE_PACK(overlay_width, overlay_height),
-               p_dispwidget->ai_service_overlay_texture,
+               GFX_SURFACE_HANDLE(p_dispwidget->ai_service_overlay_texture),
                overlay_x,
                overlay_y,
                0.0f, /* rad                         */
@@ -2241,8 +2252,8 @@ static void gfx_widgets_frame_state(void *data)
             dispctx,
             userdata,
             video_info->dims,
-            p_dispwidget->gfx_widgets_icons_textures[
-            MENU_WIDGETS_ICON_PAUSED],
+            GFX_SURFACE_HANDLE(p_dispwidget->gfx_widgets_icons_textures[
+            MENU_WIDGETS_ICON_PAUSED]),
             (onscreen_panels ? p_dispwidget->simple_widget_height : 0),
             top_right_x_advance,
             MSG_PAUSED);
@@ -2254,8 +2265,8 @@ static void gfx_widgets_frame_state(void *data)
             dispctx,
             userdata,
             video_info->dims,
-            p_dispwidget->gfx_widgets_icons_textures[
-            MENU_WIDGETS_ICON_FAST_FORWARD],
+            GFX_SURFACE_HANDLE(p_dispwidget->gfx_widgets_icons_textures[
+            MENU_WIDGETS_ICON_FAST_FORWARD]),
             (onscreen_panels ? p_dispwidget->simple_widget_height : 0),
             top_right_x_advance,
             MSG_FAST_FORWARD);
@@ -2267,8 +2278,8 @@ static void gfx_widgets_frame_state(void *data)
             dispctx,
             userdata,
             video_info->dims,
-            p_dispwidget->gfx_widgets_icons_textures[
-            MENU_WIDGETS_ICON_REWIND],
+            GFX_SURFACE_HANDLE(p_dispwidget->gfx_widgets_icons_textures[
+            MENU_WIDGETS_ICON_REWIND]),
             (onscreen_panels ? p_dispwidget->simple_widget_height : 0),
             top_right_x_advance,
             MSG_REWINDING);
@@ -2281,8 +2292,8 @@ static void gfx_widgets_frame_state(void *data)
             dispctx,
             userdata,
             video_info->dims,
-            p_dispwidget->gfx_widgets_icons_textures[
-            MENU_WIDGETS_ICON_SLOW_MOTION],
+            GFX_SURFACE_HANDLE(p_dispwidget->gfx_widgets_icons_textures[
+            MENU_WIDGETS_ICON_SLOW_MOTION]),
             (onscreen_panels ? p_dispwidget->simple_widget_height : 0),
             top_right_x_advance,
             MSG_SLOW_MOTION);
@@ -2458,9 +2469,6 @@ static void gfx_widgets_load_icons(dispgfx_widget_t *p_dispwidget)
    size_t i;
    bool supports_rgba = gfx_surface_wants_rgba();
 
-   /* Invalidate any in-flight async icon loads */
-   widget_icon_load_gen++;
-
    /* Start with no-icons layout — text positions are correct for
     * text-only rendering.  When loads complete (immediately on sync
     * platforms, via callback on async), the frame-loop detects
@@ -2474,9 +2482,10 @@ static void gfx_widgets_load_icons(dispgfx_widget_t *p_dispwidget)
             p_dispwidget->monochrome_png_path,
             gfx_widgets_icons_names[i],
             sizeof(texpath));
-      gfx_display_load_icon(texpath, supports_rgba,
-            &p_dispwidget->gfx_widgets_icons_textures[i],
-            widget_icon_load_gen, &widget_icon_load_gen);
+      gfx_surface_submit_path(
+            gfx_surface_still(&p_dispwidget->gfx_widgets_icons_textures[i],
+               gfx_display_texture_filter()),
+            texpath, supports_rgba);
    }
 }
 
@@ -2543,9 +2552,6 @@ void gfx_widgets_reload_assets(void)
 #endif
 
    gfx_widgets_state_lock();
-   for (i = 0; i < MENU_WIDGETS_ICON_LAST; i++)
-      video_driver_texture_unload(
-            &p_dispwidget->gfx_widgets_icons_textures[i]);
    gfx_widgets_load_icons(p_dispwidget);
 
    for (i = 0; i < ARRAY_SIZE(widgets); i++)
@@ -2714,9 +2720,6 @@ static void gfx_widgets_context_destroy(dispgfx_widget_t *p_dispwidget)
 {
    size_t i;
 
-   /* Icons still uploading land nowhere */
-   gfx_display_texture_loads_cancel(p_dispwidget, sizeof(*p_dispwidget));
-
    for (i = 0; i < ARRAY_SIZE(widgets); i++)
    {
       const gfx_widget_t* widget = widgets[i];
@@ -2727,12 +2730,12 @@ static void gfx_widgets_context_destroy(dispgfx_widget_t *p_dispwidget)
 
    /* TODO: Dismiss onscreen notifications that have been freed */
 
-   /* Invalidate in-flight async widget icon loads */
-   widget_icon_load_gen++;
-
    /* Textures */
    for (i = 0; i < MENU_WIDGETS_ICON_LAST; i++)
-      video_driver_texture_unload(&p_dispwidget->gfx_widgets_icons_textures[i]);
+   {
+      gfx_surface_free(p_dispwidget->gfx_widgets_icons_textures[i]);
+      p_dispwidget->gfx_widgets_icons_textures[i] = NULL;
+   }
 
    /* Fonts */
    gfx_widgets_font_free(&p_dispwidget->gfx_widget_fonts.regular);
@@ -2832,14 +2835,13 @@ bool gfx_widgets_ai_service_overlay_load(
    dispgfx_widget_t *p_dispwidget   = &dispwidget_st;
    if (gfx_widgets_ai_service_overlay_get_state() == 0)
    {
-      unsigned dims                 = 0;
-      if (!gfx_display_reset_textures_list_buffer(
-               &p_dispwidget->ai_service_overlay_texture,
-               gfx_display_texture_filter(),
-               (void *) buffer, buffer_len, image_type,
-               &dims))
+      gfx_surface_t *s = gfx_surface_still(
+            &p_dispwidget->ai_service_overlay_texture,
+            gfx_display_texture_filter());
+      if (!gfx_surface_submit_buffer(s, image_type, buffer, buffer_len,
+               gfx_surface_wants_rgba()))
          return false;
-      p_dispwidget->ai_service_overlay_dims = dims;
+      p_dispwidget->ai_service_overlay_dims = s->dims;
       gfx_widgets_ai_service_overlay_set_state(1);
    }
    return true;
@@ -2850,9 +2852,8 @@ void gfx_widgets_ai_service_overlay_unload(void)
    dispgfx_widget_t *p_dispwidget   = &dispwidget_st;
    if (gfx_widgets_ai_service_overlay_get_state() == 1)
    {
-      gfx_display_texture_loads_cancel(&p_dispwidget->ai_service_overlay_texture, sizeof(p_dispwidget->ai_service_overlay_texture));
-      video_driver_texture_unload(&p_dispwidget->ai_service_overlay_texture);
-      p_dispwidget->ai_service_overlay_texture = 0;
+      gfx_surface_free(p_dispwidget->ai_service_overlay_texture);
+      p_dispwidget->ai_service_overlay_texture = NULL;
       gfx_widgets_ai_service_overlay_set_state(0);
    }
 }
@@ -2884,9 +2885,14 @@ void gfx_widgets_worker_step(void *data,
 {
    video_frame_info_t *video_info = (video_frame_info_t*)data;
    dispgfx_widget_t *p_dispwidget = &dispwidget_st;
+   unsigned widget_dims;
 
    if (!p_dispwidget->worker)
       return;
+
+   /* Per-eye UI lays out at one eye's size. */
+   widget_dims = video_views_ui_dims(&video_info->views_layout,
+         video_info->dims);
 
    gfx_widgets_state_lock();
    /* The panels' text, carried with the frame */
@@ -2900,12 +2906,12 @@ void gfx_widgets_worker_step(void *data,
     * on the video thread under the threaded wrapper. */
    gfx_animation_update_widgets(cpu_features_get_time_usec(),
          video_info->menu_ticker_speed,
-         video_info->dims);
+         widget_dims);
    /* What the frame carried, not the settings the main thread writes:
     * this runs on the video thread under the threaded wrapper. */
    p_dispwidget->frame_menu_st_flags = (uint16_t)video_info->menu_st_flags;
    gfx_widgets_iterate_frame(
-         video_info->dims, video_info->fullscreen,
+         widget_dims, video_info->fullscreen,
          video_info->widget_dir_assets,
          (char*)video_info->widget_path_font,
          true);

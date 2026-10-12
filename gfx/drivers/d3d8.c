@@ -148,6 +148,8 @@ typedef struct d3d8_video
    bool quitting;
    bool needs_restore;
    bool overlays_enabled;
+   /* overlays[].tex are the overlay pack's (load_textures) */
+   bool overlays_borrowed;
    /* Only used for Xbox */
    bool widescreen_mode;
 
@@ -963,7 +965,7 @@ static void gfx_display_d3d8_draw(gfx_display_ctx_draw_t *draw,
     * texture sample by the per-vertex DIFFUSE colour, but the
     * alpha channel ignores DIFFUSE entirely and just selects the
     * texture's alpha.  For an opaque texture (the common case —
-    * gfx_white_texture, icon atlases, the Ozone cursor texture)
+    * icon atlases, the Ozone cursor texture)
     * that means a draw whose only opacity comes from per-vertex
     * alpha (e.g. a fading-out "old" cursor at alpha=0, or a
     * semi-transparent footer fill) renders fully opaque instead
@@ -1162,11 +1164,15 @@ typedef struct
  * it has no previous contents). Managed pool textures track locked
  * sub-rects natively, so only that region is transferred. */
 static void d3d8_font_upload_atlas(d3d8_font_t *font,
-      unsigned x0, unsigned y0, unsigned x1, unsigned y1, bool full)
+      unsigned xy0, unsigned xy1, bool full)
 {
    D3DLOCKED_RECT lr;
    RECT rect;
    unsigned i, j;
+   unsigned x0 = VIDEO_SCALE_W(xy0);
+   unsigned y0 = VIDEO_SCALE_H(xy0);
+   unsigned x1 = VIDEO_SCALE_W(xy1);
+   unsigned y1 = VIDEO_SCALE_H(xy1);
 
    if (!font->texture)
       return;
@@ -1228,10 +1234,8 @@ static void *d3d8_font_init(void *data,
       if (     SUCCEEDED(IDirect3DDevice8_GetDeviceCaps(d3d->dev, &caps))
             && caps.MaxTextureWidth  > 0
             && caps.MaxTextureHeight > 0)
-      {
-         font->atlas->max_width  = caps.MaxTextureWidth;
-         font->atlas->max_height = caps.MaxTextureHeight;
-      }
+         font->atlas->max_dims = VIDEO_SCALE_PACK(
+               caps.MaxTextureWidth, caps.MaxTextureHeight);
    }
    font->tex_dims   = VIDEO_SCALE_PACK(font->atlas->width,
          font->atlas->height);
@@ -1247,7 +1251,7 @@ static void *d3d8_font_init(void *data,
          D3DPOOL_MANAGED, 0, 0, 0, NULL, NULL, false);
 
    if (font->texture)
-      d3d8_font_upload_atlas(font, 0, 0, 0, 0, true);
+      d3d8_font_upload_atlas(font, 0, 0, true);
 
    font->atlas->dirty = false;
    return font;
@@ -1510,9 +1514,17 @@ static void d3d8_font_render_msg(
                D3DPOOL_MANAGED, 0, 0, 0, NULL, NULL, false);
       }
 
-      d3d8_font_upload_atlas(font,
-            font->atlas->dirty_x0, font->atlas->dirty_y0,
-            font->atlas->dirty_x1, font->atlas->dirty_y1, respecified);
+      if (respecified)
+         d3d8_font_upload_atlas(font, 0, 0, true);
+      else
+      {
+         unsigned r, xy0, xy1;
+         for (r = 0; r < font_atlas_dirty_rects(font->atlas); r++)
+         {
+            font_atlas_dirty_rect(font->atlas, r, &xy0, &xy1);
+            d3d8_font_upload_atlas(font, xy0, xy1, false);
+         }
+      }
       font->atlas->dirty = false;
    }
 
@@ -1560,12 +1572,12 @@ static void d3d8_font_render_msg(
       d3d8_font_emit_quad(dst, \
             ((px) + (glyph)->draw_offset_x * scale) * inv_viewport_w, \
             ((py) + (glyph)->draw_offset_y * scale) * inv_viewport_h, \
-            (glyph)->width  * scale * inv_viewport_w, \
-            (glyph)->height * scale * inv_viewport_h, \
-            (glyph)->atlas_offset_x * inv_tex_w, \
-            (glyph)->atlas_offset_y * inv_tex_h, \
-            (glyph)->width  * inv_tex_w, \
-            (glyph)->height * inv_tex_h, \
+            VIDEO_SCALE_W((glyph)->dims) * scale * inv_viewport_w, \
+            VIDEO_SCALE_H((glyph)->dims) * scale * inv_viewport_h, \
+            VIDEO_SCALE_W((glyph)->atlas_pos) * inv_tex_w, \
+            VIDEO_SCALE_H((glyph)->atlas_pos) * inv_tex_h, \
+            VIDEO_SCALE_W((glyph)->dims) * inv_tex_w, \
+            VIDEO_SCALE_H((glyph)->dims) * inv_tex_h, \
             col)
 #define D3D8_FONT_CULLED(ly) \
       (d3d->menu_display.scissor_active \
@@ -1849,7 +1861,8 @@ static void d3d8_deinitialize(d3d8_video_t *d3d)
    }
    d3d->renderchain_data    = NULL;
    _vbo                     = (LPDIRECT3DVERTEXBUFFER8)d3d->menu_display.buffer;
-   IDirect3DVertexBuffer8_Release(_vbo);
+   if (_vbo)
+      IDirect3DVertexBuffer8_Release(_vbo);
    d3d->menu_display.buffer = NULL;
    d3d->menu_display.decl   = NULL;
 }
@@ -2378,8 +2391,7 @@ static void d3d8_set_osd_msg(void *data, const char *msg, size_t msg_len,
 }
 
 static bool d3d8_init_internal(d3d8_video_t *d3d,
-      const video_info_t *info, input_driver_t **input,
-      void **input_data)
+      const video_info_t *info)
 {
 #ifdef HAVE_MONITOR
    bool windowed_full;
@@ -2479,7 +2491,7 @@ static bool d3d8_init_internal(d3d8_video_t *d3d,
 
    /* no input driver of this driver's own: the frontend starts the
     * one that goes with a Windows window */
-   input_driver_left_to_frontend(INPUT_WINDOW_WINDOWS, input, input_data);
+   input_driver_video_window(INPUT_WINDOW_WINDOWS, NULL);
 
    return true;
 }
@@ -2495,8 +2507,7 @@ static void d3d8_set_rotation(void *data, unsigned rot)
    d3d->should_resize = true;
 }
 
-static void *d3d8_init(const video_info_t *info,
-      input_driver_t **input, void **input_data)
+static void *d3d8_init(const video_info_t *info)
 {
    d3d8_video_t *d3d = (d3d8_video_t*)calloc(1, sizeof(*d3d));
 
@@ -2524,7 +2535,7 @@ static void *d3d8_init(const video_info_t *info,
    d3d->should_resize        = false;
    d3d->menu                 = NULL;
 
-   if (!d3d8_init_internal(d3d, info, input, input_data))
+   if (!d3d8_init_internal(d3d, info))
    {
       RARCH_ERR("[D3D8] Failed to init D3D.\n");
       free(d3d);
@@ -2545,10 +2556,21 @@ static void d3d8_free_overlays(d3d8_video_t *d3d)
       return;
 
    for (i = 0; i < d3d->overlays_size; i++)
-      d3d8_free_overlay(d3d, &d3d->overlays[i]);
+   {
+      /* The pack's textures are the pack's: only the vertex buffer */
+      if (!d3d->overlays_borrowed)
+         d3d8_free_overlay(d3d, &d3d->overlays[i]);
+      else if (d3d->overlays[i].vert_buf)
+      {
+         IDirect3DVertexBuffer8_Release(
+               (LPDIRECT3DVERTEXBUFFER8)d3d->overlays[i].vert_buf);
+         d3d->overlays[i].vert_buf = NULL;
+      }
+   }
    free(d3d->overlays);
-   d3d->overlays      = NULL;
-   d3d->overlays_size = 0;
+   d3d->overlays          = NULL;
+   d3d->overlays_size     = 0;
+   d3d->overlays_borrowed = false;
 }
 #endif
 
@@ -2706,6 +2728,44 @@ static bool d3d8_overlay_load(void *data,
    return true;
 }
 
+/* A page of the pack's textures: d3d8_load_texture's, in the same
+ * format and pool as load()'s own, uploaded once for every page */
+static bool d3d8_overlay_load_textures(void *data,
+      const uintptr_t *textures, unsigned num_textures)
+{
+   unsigned i;
+   d3d8_video_t *d3d = (d3d8_video_t*)data;
+
+   if (!d3d)
+      return false;
+
+   d3d8_free_overlays(d3d);
+   if (!num_textures)
+      return true;
+   if (!(d3d->overlays = (overlay_t*)calloc(num_textures,
+         sizeof(*d3d->overlays))))
+      return false;
+   d3d->overlays_size     = num_textures;
+   d3d->overlays_borrowed = true;
+
+   for (i = 0; i < num_textures; i++)
+   {
+      D3DSURFACE_DESC desc;
+      LPDIRECT3DTEXTURE8 tex = (LPDIRECT3DTEXTURE8)textures[i];
+
+      if (!tex || FAILED(IDirect3DTexture8_GetLevelDesc(tex, 0, &desc)))
+         continue;
+      d3d->overlays[i].tex      = tex;
+      d3d->overlays[i].tex_dims = VIDEO_SCALE_PACK(desc.Width, desc.Height);
+
+      /* Default. Stretch to whole screen. */
+      d3d8_overlay_tex_geom(d3d, i, 0, 0, 1, 1);
+      d3d8_overlay_vertex_geom(d3d, i, 0, 0, 1, 1);
+   }
+
+   return true;
+}
+
 static void d3d8_overlay_enable(void *data, bool state)
 {
    d3d8_video_t            *d3d = (d3d8_video_t*)data;
@@ -2742,7 +2802,7 @@ static void d3d8_overlay_set_alpha(void *data, unsigned index, float mod)
 static const video_overlay_interface_t d3d8_overlay_interface = {
    d3d8_overlay_enable,
    d3d8_overlay_load,
-   NULL, /* load_textures */
+   d3d8_overlay_load_textures,
    d3d8_overlay_tex_geom,
    d3d8_overlay_vertex_geom,
    d3d8_overlay_full_screen,
@@ -3116,8 +3176,8 @@ static uintptr_t d3d8_update_texture_wrap(void *data)
 }
 #endif
 
-static bool d3d8_update_texture(void *video_data, uintptr_t id,
-      const struct texture_image *ti, bool threaded)
+static enum video_texture_update d3d8_update_texture(void *video_data,
+      uintptr_t id, const struct texture_image *ti, bool threaded)
 {
    (void)video_data;
 #ifdef HAVE_THREADS
@@ -3126,11 +3186,13 @@ static bool d3d8_update_texture(void *video_data, uintptr_t id,
       struct d3d8_update_cmd cmd;
       cmd.ti = ti;
       cmd.id = id;
-      return video_thread_texture_handle(&cmd,
-            d3d8_update_texture_wrap) != 0;
+      return (video_thread_texture_handle(&cmd,
+            d3d8_update_texture_wrap) != 0)
+            ? VIDEO_TEXTURE_UPDATE_DONE : VIDEO_TEXTURE_UPDATE_REFUSED;
    }
 #endif
-   return d3d8_update_texture_internal(id, ti);
+   return (d3d8_update_texture_internal(id, ti))
+      ? VIDEO_TEXTURE_UPDATE_DONE : VIDEO_TEXTURE_UPDATE_REFUSED;
 }
 
 static uintptr_t d3d8_load_texture(void *video_data, void *data,

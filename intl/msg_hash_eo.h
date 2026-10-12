@@ -1792,7 +1792,6 @@ static const struct
    char s_ccfe26d1[16];
    char s_728ca1d3[12];
    char s_5f612db6[18];
-   char s_9f29f708[17];
    char s_a9145c83[13];
    char s_22f52844[11];
    char s_06842e2b[13];
@@ -2262,6 +2261,10 @@ static const struct
    char s_4b582a0c[31];
    char s_61213f1d[15];
    char s_95e4b29f[70];
+   char s_60258de0[6];
+   char s_caf61308[10];
+   char s_34b2592a[12];
+   char s_c7a27b20[10];
    char s_317b17ed[6];
    char s_94c8d15f[6];
    char s_de16b5d2[1];
@@ -2304,6 +2307,8 @@ static const struct
    char s_69b801ef[8];
    char s_a40653a7[21];
    char s_52e3d6ea[27];
+   char s_2c868ae4[12];
+   char s_9c535394[10];
    char s_a9c8430e[18];
    char s_f5911f43[32];
    char s_9017e0d3[18];
@@ -2330,6 +2335,7 @@ static const struct
    char s_552163d9[32];
    char s_ef3d53d8[19];
    char s_6dcc2f9f[17];
+   char s_d3c5c0e9[11];
    char s_48431da6[7];
    char s_21d7a1f6[5];
    char s_d2fe3ed2[16];
@@ -3302,7 +3308,6 @@ static const struct
    char s_c7c09eb0[88];
    char s_7d4adfaf[32];
    char s_6f122164[47];
-   char s_61942cf6[67];
    char s_6b7e9271[103];
    char s_68b6e245[52];
    char s_3bb4fbf9[97];
@@ -3918,6 +3923,7 @@ static const struct
    char s_543fcabd[12];
    char s_59212b5f[7];
    char s_f26b6cff[26];
+   char s_a63c824a[5];
    char s_a9f3b2c3[16];
    char s_0e7aca8a[20];
    char s_ab1afe7c[17];
@@ -6186,7 +6192,6 @@ static const struct
    "Entjera skalado",
    "Mal\305\235altita",
    "Komenca dosierujo",
-   "Konfigurdosieroj",
    "Kolora etoso",
    "Verda pomo",
    "Klasika bluo",
@@ -6657,6 +6662,10 @@ static const struct
    "Pozicio de sciigoj (vertikala)",
    "Ekrana indekso",
    "Ebligi plenekranan re\304\235imon super \"no\304\211o\" en aparatoj Android kaj iOS",
+   "\304\210iam",
+   "A\305\255tomata",
+   "Malebligita",
+   "A\305\255tomata",
    "180\302\260",
    "270\302\260",
    "",
@@ -6699,6 +6708,8 @@ static const struct
    "Skalado",
    "Skanlinia sinkronigo",
    "Imito de rulanta skanlinio",
+   "Horizontala",
+   "Vertikala",
    "Videaj ombrigiloj",
    "Prokrasti a\305\255tomatan ombrigilon",
    "Videaj ombrigiloj",
@@ -6725,6 +6736,7 @@ static const struct
    "Aparatara kunhavigata kunteksto",
    "Dulineara filtrado",
    "Malmola filtrilo",
+   "2-dimensia",
    "Propra",
    "Loka",
    "Elsenda kvalito",
@@ -8040,7 +8052,6 @@ static const struct
    "La nombro da filmeroj revolvotaj per pa\305\235o. Pli altaj valoroj pliigas la revolvrapidon.",
    "\305\234an\304\235i agordojn pri revolvado.",
    "Agordi startan dosierujon por dosieresplorilo.",
-   "Defa\305\255lta konfigurdosiero estas enmemorigita en \304\211i tiu dosierujo.",
    "Elekti malsaman koloran etoson. Elektante \"Propran\" ebligas la uzon de menuetosaj anta\305\255"
    "agorddosieroj.",
    "Elekti menuetosan anta\305\255agordon de dosieresplorilo.",
@@ -8833,6 +8844,7 @@ static const struct
    "Atendotempo",
    "Enigi ",
    "Enigi trompan dosiernomon",
+   "Tuja",
    "Enigi pasvorton",
    "Mal\304\235usta pasvorto.",
    "\304\234usta pasvorto.",
@@ -9132,7 +9144,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_eo_blob_check[
-      (sizeof(msg_hash_eo_blob) == (171576u
+      (sizeof(msg_hash_eo_blob) == (171568u
 #ifdef ANDROID
        + 312u
 #endif
@@ -11352,7 +11364,6 @@ static const uint32_t msg_hash_eo_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_INTEGER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_APPLE_GREEN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_CLASSIC_BLUE,
@@ -11822,6 +11833,10 @@ static const uint32_t msg_hash_eo_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_Y,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MONITOR_INDEX,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_NOTCH_WRITE_OVER,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_AUTO,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_OFF,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_AUTO,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED_ROTATED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_NORMAL,
@@ -11864,6 +11879,8 @@ static const uint32_t msg_hash_eo_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCALING_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCANLINE_SYNC,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCAN_SUBFRAMES,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_HORIZONTAL,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_VERTICAL,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADERS_ENABLE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_DELAY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_DIR,
@@ -11890,6 +11907,7 @@ static const uint32_t msg_hash_eo_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHARED_CONTEXT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SMOOTH,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SOFT_FILTER,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_STEREO_MODE_2D,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_STREAMING_MODE_CUSTOM,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_STREAMING_MODE_LOCAL,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_STREAM_QUALITY,
@@ -12862,7 +12880,6 @@ static const uint32_t msg_hash_eo_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_GRANULARITY,
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_SUBLABEL_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_THEME_PRESET,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_SHOW_START_SCREEN,
@@ -13478,6 +13495,7 @@ static const uint32_t msg_hash_eo_ids[] =
    (uint32_t)MSG_INPUT_BIND_TIMEOUT,
    (uint32_t)MSG_INPUT_CHEAT,
    (uint32_t)MSG_INPUT_CHEAT_FILENAME,
+   (uint32_t)MSG_INPUT_COMBO_INSTANT,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_NOK,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_OK,

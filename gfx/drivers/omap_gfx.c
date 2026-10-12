@@ -840,8 +840,7 @@ static void omap_init_font(omap_video_t *vid)
     * to make again */
    {
       struct font_atlas *grow = vid->font_driver->get_atlas(vid->font);
-      grow->max_width  = 2048;
-      grow->max_height = 2048;
+      grow->max_dims = VIDEO_SCALE_PACK(2048, 2048);
    }
 
    r = msg_color_r * 255;
@@ -910,10 +909,10 @@ static void omap_render_msg(omap_video_t *vid, const char *msg)
          base_y               = (line_y + (pen_y)) + glyph->draw_offset_y; \
          max_width            = vid_width  - base_x; \
          max_height           = vid_height - base_y; \
-         glyph_width          = glyph->width; \
-         glyph_height         = glyph->height; \
-         src                  = atlas->buffer + glyph->atlas_offset_x + \
-            glyph->atlas_offset_y * atlas->width; \
+         glyph_width          = VIDEO_SCALE_W(glyph->dims); \
+         glyph_height         = VIDEO_SCALE_H(glyph->dims); \
+         src                  = atlas->buffer + VIDEO_SCALE_W(glyph->atlas_pos) + \
+            VIDEO_SCALE_H(glyph->atlas_pos) * atlas->width; \
          if (base_x < 0) \
          { \
             src         -= base_x; \
@@ -950,8 +949,7 @@ static void omap_render_msg(omap_video_t *vid, const char *msg)
 }
 
 /* FIXME/TODO: Filters not supported. */
-static void *omap_init(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+static void *omap_init(const video_info_t *video)
 {
    settings_t *settings = config_get_ptr();
    omap_video_t *vid    = (omap_video_t*)calloc(1, sizeof(omap_video_t));
@@ -978,8 +976,6 @@ static void *omap_init(const video_info_t *video,
    if (omapfb_set_mode(vid->omap, 320, 240) != 0)
       goto fail_omapfb;
 
-   if (input && input_data)
-      *input = NULL;
 
    omap_init_font(vid);
 

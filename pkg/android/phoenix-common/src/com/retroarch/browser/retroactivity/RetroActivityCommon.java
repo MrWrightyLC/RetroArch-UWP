@@ -60,6 +60,7 @@ import android.os.CombinedVibration;
 import android.os.Vibrator;
 import android.os.VibrationEffect;
 import android.os.VibratorManager;
+import android.provider.Settings;
 import android.util.Log;
 import android.util.SparseArray;
 import android.text.Editable;
@@ -224,6 +225,8 @@ public class RetroActivityCommon extends NativeActivity
 
   @Override
   protected void onDestroy() {
+    mTouchHapticHandler.removeCallbacks(mTouchHaptic);
+    mTouchHapticPending.set(false);
     ((InputManager) getSystemService(Context.INPUT_SERVICE))
             .unregisterInputDeviceListener(this);
     unregisterReceiver(mUsbPermissionReceiver);
@@ -981,15 +984,69 @@ public class RetroActivityCommon extends NativeActivity
     return result == report.length;
   }
 
+  @TargetApi(21)
+  private static final class TouchHapticAttributes
+  {
+    static final AudioAttributes VALUE = new AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build();
+  }
+
+  @TargetApi(26)
+  private static final class TouchHapticEffect
+  {
+    static final VibrationEffect VALUE = VibrationEffect.createOneShot(
+        30, VibrationEffect.DEFAULT_AMPLITUDE);
+  }
+
+  private final android.os.Handler mTouchHapticHandler =
+      new android.os.Handler(android.os.Looper.getMainLooper());
+  private final java.util.concurrent.atomic.AtomicBoolean mTouchHapticPending =
+      new java.util.concurrent.atomic.AtomicBoolean();
+  private boolean mTouchVibratorResolved;
+  private Vibrator mTouchVibrator;
+  private final Runnable mTouchHaptic = new Runnable() {
+    @Override
+    public void run() {
+      mTouchHapticPending.set(false);
+      if (!getWindow().getDecorView().hasWindowFocus()
+          || Settings.System.getInt(getContentResolver(),
+              Settings.System.HAPTIC_FEEDBACK_ENABLED, 0) == 0)
+        return;
+
+      if (!mTouchVibratorResolved) {
+        mTouchVibrator = (Vibrator)getSystemService(Context.VIBRATOR_SERVICE);
+        if (mTouchVibrator != null && !mTouchVibrator.hasVibrator())
+          mTouchVibrator = null;
+        mTouchVibratorResolved = true;
+      }
+      if (mTouchVibrator == null)
+        return;
+
+      if (Build.VERSION.SDK_INT >= 26)
+        mTouchVibrator.vibrate(TouchHapticEffect.VALUE, TouchHapticAttributes.VALUE);
+      else if (Build.VERSION.SDK_INT >= 21)
+        mTouchVibrator.vibrate(30, TouchHapticAttributes.VALUE);
+      else
+        mTouchVibrator.vibrate(30);
+    }
+  };
+
   public void doHapticFeedback(final int effect)
   {
+    if (effect == HapticFeedbackConstants.KEYBOARD_PRESS) {
+      if (mTouchHapticPending.compareAndSet(false, true)
+          && !mTouchHapticHandler.post(mTouchHaptic))
+        mTouchHapticPending.set(false);
+      return;
+    }
     // Called from the native app thread. View.performHapticFeedback is not
     // documented as thread safe, so hand it to the UI thread.
     runOnUiThread(new Runnable() {
       @Override
       public void run() {
         getWindow().getDecorView().performHapticFeedback(effect,
-            HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING | HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING);
+            HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING);
       }
     });
   }
@@ -1614,6 +1671,17 @@ public class RetroActivityCommon extends NativeActivity
     Log.i("RetroActivity", "isPlayStoreBuild: " + BuildConfig.PLAY_STORE_BUILD);
 
     return BuildConfig.PLAY_STORE_BUILD;
+  }
+
+  /**
+   * Checks if this version of RetroArch is a Meta Quest build.
+   *
+   * @return true if this is a Meta Quest build, false otherwise
+   */
+  public boolean isMetaQuestBuild() {
+    Log.i("RetroActivity", "isMetaQuestBuild: " + BuildConfig.META_QUEST_BUILD);
+
+    return BuildConfig.META_QUEST_BUILD;
   }
 
   /**

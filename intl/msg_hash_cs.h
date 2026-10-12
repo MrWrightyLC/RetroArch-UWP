@@ -1663,7 +1663,6 @@ static const struct
    char s_ccfe26d1[29];
    char s_728ca1d3[8];
    char s_5f612db6[22];
-   char s_9f29f708[23];
    char s_a9145c83[15];
    char s_a26e1351[26];
    char s_22f52844[18];
@@ -2031,6 +2030,7 @@ static const struct
    char s_4b582a0c[28];
    char s_61213f1d[15];
    char s_95e4b29f[100];
+   char s_60258de0[6];
    char s_317b17ed[6];
    char s_94c8d15f[6];
    char s_de16b5d2[11];
@@ -2067,6 +2067,8 @@ static const struct
    char s_78585119[8];
    char s_69b801ef[14];
    char s_52e3d6ea[34];
+   char s_2c868ae4[15];
+   char s_9c535394[13];
    char s_a9c8430e[14];
    char s_f5911f43[22];
    char s_9017e0d3[14];
@@ -2925,7 +2927,6 @@ static const struct
    char s_14b5b145[103];
    char s_c7c09eb0[103];
    char s_6f122164[66];
-   char s_61942cf6[63];
    char s_6b7e9271[126];
    char s_68b6e245[57];
    char s_3bb4fbf9[116];
@@ -3463,6 +3464,7 @@ static const struct
    char s_543fcabd[15];
    char s_59212b5f[15];
    char s_f26b6cff[25];
+   char s_a63c824a[11];
    char s_a9f3b2c3[14];
    char s_0e7aca8a[19];
    char s_ab1afe7c[20];
@@ -5728,7 +5730,6 @@ static const struct
    "Celo\304\215\303\255seln\303\251 \305\241k\303\241lov\303\241n\303\255",
    "Vypnout",
    "Startovac\303\255 adres\303\241\305\231",
-   "Konfigura\304\215n\303\255 soubory",
    "Barevn\303\275 motiv",
    "Proti - Vypalov\303\241n\303\255 zenu",
    "Jablkov\304\233 zelen\303\241",
@@ -6103,6 +6104,7 @@ static const struct
    "Index monitoru",
    "Povolen\303\255 zobrazen\303\255 na celou obrazovku p\305\231es notifikaci v za\305\231\303\255z"
    "en\303\255ch se syst\303\251mem Android a iOS",
+   "V\305\276dy",
    "180\302\272",
    "270\302\272",
    "Norm\303\241ln\303\255",
@@ -6139,6 +6141,8 @@ static const struct
    "Chytr\303\241",
    "\305\240k\303\241lov\303\241n\303\255",
    "Simulace valiv\303\251 skenovac\303\255 linie",
+   "Horizont\303\241ln\303\255",
+   "Vertik\303\241ln\303\255",
    "Shadery videa",
    "Prodleva auto-shaderu",
    "Shadery videa",
@@ -7670,8 +7674,6 @@ static const struct
    "\305\241\303\255 hodnoty zvy\305\241uj\303\255 rychlost p\305\231ev\303\255jen\303\255.",
    "Nastaven\303\255 po\304\215\303\241te\304\215n\303\255ho adres\303\241\305\231e pro Pr\305\257zk"
    "umn\303\255ka soubor\305\257.",
-   "V tomto adres\303\241\305\231i je ulo\305\276en v\303\275choz\303\255 konfigura\304\215n\303\255"
-   " soubor.",
    "Vyberte jin\303\275 barevn\303\275 motiv. V\303\275b\304\233r mo\305\276nosti 'Vlastn\303\255' u"
    "mo\305\276\305\210uje pou\305\276it\303\255 soubor\305\257 s p\305\231ednastaven\303\275mi motiv"
    "y nab\303\255dek.",
@@ -8480,6 +8482,7 @@ static const struct
    "\304\214asov\303\275 limit",
    "Vstupn\303\255 cheat",
    "N\303\241zev vstupn\303\255ho cheatu",
+   "Okam\305\276it\303\251",
    "Zadejte heslo",
    "Nespr\303\241vn\303\251 heslo.",
    "Heslo je spr\303\241vn\303\251.",
@@ -8789,7 +8792,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_cs_blob_check[
-      (sizeof(msg_hash_cs_blob) == (162279u
+      (sizeof(msg_hash_cs_blob) == (162238u
 #ifdef ANDROID
        + 390u
 #endif
@@ -10801,7 +10804,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_INTEGER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_ANTI_ZENBURN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_APPLE_GREEN,
@@ -11169,6 +11171,7 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_Y,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MONITOR_INDEX,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_NOTCH_WRITE_OVER,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED_ROTATED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_NORMAL,
@@ -11205,6 +11208,8 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCALE_INTEGER_SCALING_SMART,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCALING_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCAN_SUBFRAMES,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_HORIZONTAL,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_VERTICAL,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADERS_ENABLE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_DELAY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_DIR,
@@ -12063,7 +12068,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_ENABLE,
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_GRANULARITY,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_SUBLABEL_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_THEME_PRESET,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_SHOW_START_SCREEN,
@@ -12601,6 +12605,7 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MSG_INPUT_BIND_TIMEOUT,
    (uint32_t)MSG_INPUT_CHEAT,
    (uint32_t)MSG_INPUT_CHEAT_FILENAME,
+   (uint32_t)MSG_INPUT_COMBO_INSTANT,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_NOK,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_OK,

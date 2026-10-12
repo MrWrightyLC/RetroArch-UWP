@@ -100,13 +100,17 @@ static int16_t sdl3_joypad_get_axis(sdl3_joypad_t *pad, unsigned axis)
    return 0;
 }
 
+/* A PS3 controller (0x054c/0x0268) with more axes than a gamepad's six
+ * is under SDL's own driver for it, which gives ten more: how hard its
+ * buttons are pressed. The axes are what says so, not the hint that
+ * turns the driver on: its default is SDL's and differs by platform
+ * (on for macOS, off elsewhere), and asking for it with a default of
+ * off said no on macOS, where the axes were there. */
 static bool sdl3_joypad_has_pressure_axes(SDL_Joystick *joypad,
       int32_t vendor, int32_t product)
 {
-   /* 0x054c/0x0268 is a PS3 controller. */
    return vendor  == 0x054c
        && product == 0x0268
-       && SDL_GetHintBoolean(SDL_HINT_JOYSTICK_HIDAPI_PS3, false)
        && SDL_GetNumJoystickAxes(joypad) > SDL_GAMEPAD_AXIS_COUNT;
 }
 
@@ -537,7 +541,8 @@ static int16_t sdl3_joypad_axis(unsigned port, uint32_t joyaxis)
 
 static int16_t sdl3_joypad_state(
       rarch_joypad_info_t *joypad_info,
-      const struct retro_keybind *binds,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
    int i;
@@ -552,11 +557,8 @@ static int16_t sdl3_joypad_state(
 
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey = (binds[i].joykey != NO_BTN)
-         ? binds[i].joykey : joypad_info->auto_binds[i].joykey;
-      const uint32_t joyaxis = (binds[i].joyaxis != AXIS_NONE)
-         ? binds[i].joyaxis : joypad_info->auto_binds[i].joyaxis;
+      const uint64_t joykey = joykeys[i];
+      const uint32_t joyaxis = joyaxes[i];
 
       if (
                (uint16_t)joykey != NO_BTN

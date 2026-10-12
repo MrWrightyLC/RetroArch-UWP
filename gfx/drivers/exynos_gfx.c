@@ -1086,8 +1086,7 @@ static int exynos_init_font(struct exynos_video *vid)
        * to make again */
       {
          struct font_atlas *grow = vid->font_driver->get_atlas(vid->font);
-         grow->max_width  = 2048;
-         grow->max_height = 2048;
+         grow->max_dims = VIDEO_SCALE_PACK(2048, 2048);
       }
    }
    else
@@ -1166,9 +1165,10 @@ static int exynos_render_msg(struct exynos_video *vid,
          base_y       = (line_y + (pen_y)) + glyph->draw_offset_y; \
          max_width    = dst->width - base_x; \
          max_height   = dst->height - base_y; \
-         glyph_width  = glyph->width; \
-         glyph_height = glyph->height; \
-         src = atlas->buffer + glyph->atlas_offset_x + glyph->atlas_offset_y * atlas->width; \
+         glyph_width  = VIDEO_SCALE_W(glyph->dims); \
+         glyph_height = VIDEO_SCALE_H(glyph->dims); \
+         src = atlas->buffer + VIDEO_SCALE_W(glyph->atlas_pos) \
+            + VIDEO_SCALE_H(glyph->atlas_pos) * atlas->width; \
          if (base_x < 0) \
          { \
             src -= base_x; \
@@ -1197,8 +1197,7 @@ static int exynos_render_msg(struct exynos_video *vid,
    return exynos_blend_font(pdata);
 }
 
-static void *exynos_init(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+static void *exynos_init(const video_info_t *video)
 {
    struct exynos_video *vid;
    const unsigned fb_bpp = 4; /* Use XRGB8888 framebuffer. */
@@ -1245,8 +1244,6 @@ static void *exynos_init(const video_info_t *video,
    exynos_perf_init(&vid->data->perf);
 #endif
 
-   if (input && input_data)
-      *input = NULL;
 
    if (exynos_init_font(vid) != 0)
    {

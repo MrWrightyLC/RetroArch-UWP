@@ -227,8 +227,7 @@ static void sdl3_stream_upload(sdl3_tex_t *target, const void *src,
    SDL_UnlockTexture(target->tex);
 }
 
-static void *sdl3_gfx_init(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+static void *sdl3_gfx_init(const video_info_t *video)
 {
    int i;
    sdl3_video_t *vid = NULL;
@@ -279,7 +278,7 @@ static void *sdl3_gfx_init(const video_info_t *video,
 
    sdl3_refresh_viewport(vid);
 
-   sdl3_input_driver(config_get_ptr()->arrays.input_joypad_driver, input, input_data);
+   sdl3_input_driver(config_get_ptr()->arrays.input_joypad_driver);
 
    return vid;
 
@@ -362,11 +361,17 @@ static void sdl3_blit_frame(sdl3_video_t *vid)
  * flipped because read_viewport callers expect bottom-up data.
  * Must run before SDL_RenderPresent - afterwards the backbuffer
  * contents are undefined on several backends. */
-static bool sdl3_capture_viewport(sdl3_video_t *vid, uint8_t *buffer)
+/* bgrx: write 32-bit B,G,R,X top row first (read_viewport_bgrx);
+ * otherwise BGR24 bottom row first, as read_viewport() callers expect. */
+static bool sdl3_capture_viewport(sdl3_video_t *vid, uint8_t *buffer,
+      bool bgrx)
 {
    SDL_Surface *surf;
    int w, h, y;
    bool ok = true;
+   size_t bpp           = bgrx ? 4 : 3;
+   SDL_PixelFormat fmt  = bgrx ? SDL_PIXELFORMAT_BGRA32
+                               : SDL_PIXELFORMAT_BGR24;
 
    /* NULL rect = the current render viewport, which is the
     * aspect-corrected game viewport at this point in the frame. */
@@ -383,18 +388,19 @@ static bool sdl3_capture_viewport(sdl3_video_t *vid, uint8_t *buffer)
    h = (surf->h < (int)VIDEO_SCALE_H(vid->vp.dims)) ? surf->h : (int)VIDEO_SCALE_H(vid->vp.dims);
 
    if (w < (int)VIDEO_SCALE_W(vid->vp.dims) || h < (int)VIDEO_SCALE_H(vid->vp.dims))
-      memset(buffer, 0, VIDEO_SCALE_AREA(vid->vp.dims) * 3);
+      memset(buffer, 0, VIDEO_SCALE_AREA(vid->vp.dims) * bpp);
 
    for (y = 0; y < h; y++)
    {
+      int dst_row = bgrx ? y : (h - 1 - y);
       if (!SDL_ConvertPixels(w, 1, surf->format,
             (const uint8_t*)surf->pixels + (size_t)y * surf->pitch,
             surf->pitch,
-            SDL_PIXELFORMAT_BGR24,
-            buffer + (size_t)(h - 1 - y) * VIDEO_SCALE_W(vid->vp.dims) * 3,
-            (int)VIDEO_SCALE_W(vid->vp.dims) * 3))
+            fmt,
+            buffer + (size_t)dst_row * VIDEO_SCALE_W(vid->vp.dims) * bpp,
+            (int)(VIDEO_SCALE_W(vid->vp.dims) * bpp)))
       {
-         RARCH_WARN("[SDL3] Failed to convert viewport data to BGR24: %s.\n",
+         RARCH_WARN("[SDL3] Failed to convert viewport data: %s.\n",
                SDL_GetError());
          ok = false;
          break;
@@ -625,7 +631,20 @@ static bool sdl3_gfx_read_viewport(void *data, uint8_t *buffer, bool is_idle)
    SDL_RenderClear(vid->renderer);
    sdl3_blit_frame(vid);
 
-   return sdl3_capture_viewport(vid, buffer);
+   return sdl3_capture_viewport(vid, buffer, false);
+}
+
+static bool sdl3_gfx_read_viewport_bgrx(void *data, uint8_t *buffer,
+      bool is_idle, bool *bottom_up)
+{
+   sdl3_video_t *vid = (sdl3_video_t*)data;
+
+   /* Same redraw-and-capture as sdl3_gfx_read_viewport(). */
+   SDL_RenderClear(vid->renderer);
+   sdl3_blit_frame(vid);
+
+   *bottom_up = false;
+   return sdl3_capture_viewport(vid, buffer, true);
 }
 
 /* Applies a new window size / fullscreen in place, without tearing
@@ -804,6 +823,9 @@ static uint32_t sdl3_get_flags(void *data)
     * sdl3_gfx_set_nonblock_state. */
    if (vid && (vid->flags & SDL3_FLAG_ADAPTIVE_VSYNC))
       BIT32_SET(flags, GFX_CTX_FLAGS_ADAPTIVE_VSYNC);
+   /* The viewport readback redraws the core's frame alone, so a GPU
+    * recording never holds the menu or messages. */
+   BIT32_SET(flags, GFX_CTX_FLAGS_RECORD_GAME_ONLY);
 
    return flags;
 }
@@ -922,6 +944,56 @@ static void sdl3_unload_texture(void *data, bool threaded, uintptr_t id)
 #endif
 
    SDL_DestroyTexture(tex);
+}
+
+/* Same-size contents into a texture sdl3_load_texture made: the
+ * texture stays, SDL_UpdateTexture rewrites it. */
+static bool sdl3_update_texture_internal(SDL_Texture *tex,
+      const struct texture_image *ti)
+{
+   float w = 0.0f, h = 0.0f;
+   return     SDL_GetTextureSize(tex, &w, &h)
+           && (unsigned)w == ti->width && (unsigned)h == ti->height
+           && SDL_UpdateTexture(tex, NULL, ti->pixels,
+                 (int)(ti->width * sizeof(uint32_t)));
+}
+
+#ifdef HAVE_THREADS
+typedef struct
+{
+   SDL_Texture *tex;
+   const struct texture_image *ti;
+} sdl3_update_cmd_t;
+
+static uintptr_t sdl3_update_texture_wrap(void *data)
+{
+   sdl3_update_cmd_t *cmd = (sdl3_update_cmd_t*)data;
+   return sdl3_update_texture_internal(cmd->tex, cmd->ti) ? 1 : 0;
+}
+#endif
+
+/* On the thread the loads run on, for the reason sdl3_load_texture
+ * gives */
+static enum video_texture_update sdl3_update_texture(void *video_data,
+      uintptr_t id, const struct texture_image *ti, bool threaded)
+{
+   SDL_Texture *tex = (SDL_Texture*)id;
+   (void)video_data;
+   /* The textures hold 8 bits a channel and nothing wider */
+   if (!tex || !ti || !ti->pixels || ti->pix10 || ti->fp16)
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+#ifdef HAVE_THREADS
+   if (threaded)
+   {
+      sdl3_update_cmd_t cmd;
+      cmd.tex = tex;
+      cmd.ti  = ti;
+      return video_thread_texture_handle(&cmd, sdl3_update_texture_wrap)
+         ? VIDEO_TEXTURE_UPDATE_DONE : VIDEO_TEXTURE_UPDATE_REFUSED;
+   }
+#endif
+   return sdl3_update_texture_internal(tex, ti)
+      ? VIDEO_TEXTURE_UPDATE_DONE : VIDEO_TEXTURE_UPDATE_REFUSED;
 }
 
 static void sdl3_poke_set_osd_msg(void *data, const char *msg, size_t msg_len,
@@ -1054,11 +1126,9 @@ static void gfx_display_sdl3_draw(gfx_display_ctx_draw_t *draw,
    col = draw->coords->color;
 
    /* The texture handle is a uintptr_t cast of an SDL_Texture*
-    * registered via sdl3_load_texture (poke->load_texture). For
-    * gfx_display_draw_quad calls without an explicit texture the
-    * caller substitutes gfx_white_texture, so passing this through
-    * directly is safe; if SDL_RenderGeometry receives NULL we get
-    * flat-shaded geometry, which is a reasonable degraded path. */
+    * registered via sdl3_load_texture (poke->load_texture). A quad
+    * with no texture hands SDL_RenderGeometry NULL: the per-vertex
+    * colour alone, a solid fill. */
    tex = (SDL_Texture*)(uintptr_t)draw->texture;
 
    /* Path 1: gfx_display_draw_quad - vtx is NULL, geometry comes
@@ -1090,7 +1160,7 @@ static void gfx_display_sdl3_draw(gfx_display_ctx_draw_t *draw,
       x0 = (float)VIDEO_POS_X(draw->pos);
       x1 = (float)VIDEO_POS_X(draw->pos) + (float)VIDEO_SCALE_W(draw->dims);
       /* Re-flip Y from bottom-up to SDL top-down. */
-      y0 = (float)video_height - (float)VIDEO_SCALE_H(draw->dims) - (float)VIDEO_POS_Y(draw->pos);
+      y0 = (float)VIDEO_POS_FLIP_Y(video_height, draw->pos, draw->dims);
       y1 = y0 + (float)VIDEO_SCALE_H(draw->dims);
 
       /* Apply draw->scale_factor (centred scaling around the quad's
@@ -1271,35 +1341,33 @@ typedef struct
    void                          *font_data;
    struct font_atlas             *atlas;
    uint32_t                      *staging; /* A8 -> RGBA expansion buffer */
-   int                            tex_width;
-   int                            tex_height;
+   unsigned                       tex_dims;
 } sdl3_raster_t;
 
 static void sdl3_raster_font_upload_atlas(sdl3_raster_t *font)
 {
-   int i, total;
-   const uint8_t *src;
+   unsigned x, y, x0, y0, x1, y1, tex_w, tex_h, r, rects, xy0, xy1;
+   SDL_Rect rect;
+   bool     whole = false;
 
    if (!font || !font->atlas)
       return;
 
-   /* The atlas dimensions are fixed after init, so the texture and
-    * staging buffer are created once and the atlas is re-uploaded in
-    * place whenever the glyph cache grows (atlas->dirty). */
    if (  !font->tex
-       || font->tex_width  != (int)font->atlas->width
-       || font->tex_height != (int)font->atlas->height)
+       || font->tex_dims != VIDEO_SCALE_PACK(font->atlas->width,
+          font->atlas->height))
    {
       if (font->tex)
          SDL_DestroyTexture(font->tex);
 
-      font->tex_width  = (int)font->atlas->width;
-      font->tex_height = (int)font->atlas->height;
+      font->tex_dims = VIDEO_SCALE_PACK(font->atlas->width,
+            font->atlas->height);
 
       font->tex = SDL_CreateTexture(font->vid->renderer,
             SDL_PIXELFORMAT_RGBA32,
             SDL_TEXTUREACCESS_STATIC,
-            font->tex_width, font->tex_height);
+            (int)VIDEO_SCALE_W(font->tex_dims),
+            (int)VIDEO_SCALE_H(font->tex_dims));
       if (!font->tex)
          return;
 
@@ -1307,34 +1375,65 @@ static void sdl3_raster_font_upload_atlas(sdl3_raster_t *font)
 
       free(font->staging);
       font->staging = (uint32_t*)malloc(
-            font->tex_width * font->tex_height * sizeof(uint32_t));
+            VIDEO_SCALE_AREA(font->tex_dims) * sizeof(uint32_t));
       if (!font->staging)
       {
          SDL_DestroyTexture(font->tex);
          font->tex = NULL;
          return;
       }
+      whole = true;
    }
 
-   /* Atlas buffer is 8-bit alpha. Expand to white-RGB plus the alpha
-    * value so vertex color modulation produces correctly-tinted
-    * glyphs. SDL_PIXELFORMAT_RGBA32 is the endian-neutral alias for
-    * byte order R,G,B,A, so fill the staging buffer byte-wise. */
-   total = font->tex_width * font->tex_height;
-   src   = font->atlas->buffer;
+   /* A texture just made takes all of the atlas; otherwise only the
+    * rectangles drawn into since the last upload change */
+   tex_w = VIDEO_SCALE_W(font->tex_dims);
+   tex_h = VIDEO_SCALE_H(font->tex_dims);
+   rects = (whole || !font->atlas->dirty)
+      ? 1 : font_atlas_dirty_rects(font->atlas);
+   for (r = 0; r < rects; r++)
    {
-      uint8_t *dst = (uint8_t*)font->staging;
-      for (i = 0; i < total; i++)
+      font_atlas_dirty_rect(font->atlas, r, &xy0, &xy1);
+      x0    = VIDEO_SCALE_W(xy0);
+      y0    = VIDEO_SCALE_H(xy0);
+      x1    = VIDEO_SCALE_W(xy1);
+      y1    = VIDEO_SCALE_H(xy1);
+      if (     whole
+            || !font->atlas->dirty
+            || x1 <= x0 || y1 <= y0 || x1 > tex_w || y1 > tex_h)
       {
-         *dst++ = 0xFF;
-         *dst++ = 0xFF;
-         *dst++ = 0xFF;
-         *dst++ = src[i];
+         x0 = 0;
+         y0 = 0;
+         x1 = tex_w;
+         y1 = tex_h;
       }
-   }
 
-   SDL_UpdateTexture(font->tex, NULL, font->staging,
-         font->tex_width * sizeof(uint32_t));
+      /* Atlas buffer is 8-bit alpha. Expand to white-RGB plus the alpha
+       * value so vertex color modulation produces correctly-tinted
+       * glyphs. SDL_PIXELFORMAT_RGBA32 is the endian-neutral alias for
+       * byte order R,G,B,A, so fill the staging buffer byte-wise. */
+      for (y = y0; y < y1; y++)
+      {
+         const uint8_t *src = font->atlas->buffer + (size_t)y * tex_w + x0;
+         uint8_t       *dst = (uint8_t*)(font->staging
+               + (size_t)y * tex_w + x0);
+         for (x = x0; x < x1; x++)
+         {
+            *dst++ = 0xFF;
+            *dst++ = 0xFF;
+            *dst++ = 0xFF;
+            *dst++ = *src++;
+         }
+      }
+
+      rect.x = (int)x0;
+      rect.y = (int)y0;
+      rect.w = (int)(x1 - x0);
+      rect.h = (int)(y1 - y0);
+      SDL_UpdateTexture(font->tex, &rect,
+            font->staging + (size_t)y0 * tex_w + x0,
+            (int)(tex_w * sizeof(uint32_t)));
+   }
 
    font->atlas->dirty = false;
 }
@@ -1378,10 +1477,8 @@ static void *sdl3_raster_font_init(void *data, const char *font_path,
             SDL_GetRendererProperties(font->vid->renderer),
             SDL_PROP_RENDERER_MAX_TEXTURE_SIZE_NUMBER, 0);
       if (max_tex > 0)
-      {
-         font->atlas->max_width  = (unsigned)max_tex;
-         font->atlas->max_height = (unsigned)max_tex;
-      }
+         font->atlas->max_dims = VIDEO_SCALE_PACK(
+               (unsigned)max_tex, (unsigned)max_tex);
    }
    sdl3_raster_font_upload_atlas(font);
 
@@ -1481,8 +1578,8 @@ static void sdl3_raster_font_render_message(
          x -= (int)((float)(line_width) * scale); \
       else if (align == TEXT_ALIGN_CENTER) \
          x -= (int)((float)(line_width) * scale) * 0.5f; \
-      inv_w = 1.0f / (float)font->tex_width; \
-      inv_h = 1.0f / (float)font->tex_height; \
+      inv_w = 1.0f / (float)VIDEO_SCALE_W(font->tex_dims); \
+      inv_h = 1.0f / (float)VIDEO_SCALE_H(font->tex_dims); \
       n_glyphs = 0; \
    } while (0)
 #define FONT_LAYOUT_GLYPH(glyph, pen_x, pen_y) \
@@ -1497,12 +1594,12 @@ static void sdl3_raster_font_render_message(
          break; \
       gx = x + (glyph)->draw_offset_x * scale; \
       gy = y + (glyph)->draw_offset_y * scale; \
-      gw = (glyph)->width  * scale; \
-      gh = (glyph)->height * scale; \
-      u0 = (float)(glyph)->atlas_offset_x * inv_w; \
-      v0 = (float)(glyph)->atlas_offset_y * inv_h; \
-      u1 = u0 + (float)(glyph)->width     * inv_w; \
-      v1 = v0 + (float)(glyph)->height    * inv_h; \
+      gw = VIDEO_SCALE_W((glyph)->dims) * scale; \
+      gh = VIDEO_SCALE_H((glyph)->dims) * scale; \
+      u0 = (float)VIDEO_SCALE_W((glyph)->atlas_pos) * inv_w; \
+      v0 = (float)VIDEO_SCALE_H((glyph)->atlas_pos) * inv_h; \
+      u1 = u0 + (float)VIDEO_SCALE_W((glyph)->dims) * inv_w; \
+      v1 = v0 + (float)VIDEO_SCALE_H((glyph)->dims) * inv_h; \
       base = n_glyphs * 4; \
       verts[base + 0].position.x  = gx; \
       verts[base + 0].position.y  = gy; \
@@ -1921,7 +2018,22 @@ static video_poke_interface_t sdl3_video_poke_interface = {
    NULL,                            /* set_hdr_paper_white_nits */
    NULL,                            /* set_hdr_expand_gamut */
    NULL,                            /* set_hdr_scanlines */
-   NULL                             /* set_hdr_subpixel_layout */
+   NULL,                            /* set_hdr_subpixel_layout */
+   NULL,                            /* supports_texture_format */
+   NULL,                            /* load_texture_compressed */
+   NULL,                            /* present_last */
+   NULL,                            /* get_last_present_time */
+   NULL,                            /* hw_ring_install */
+   NULL,                            /* hw_ring_fence_new */
+   NULL,                            /* hw_ring_fence_free */
+   NULL,                            /* hw_ring_fence_signal */
+   NULL,                            /* hw_ring_fence_wait */
+   NULL,                            /* hw_ring_capture */
+   NULL,                            /* hw_ring_present_slot */
+   NULL,                            /* hw_ring_context_new */
+   NULL,                            /* hw_ring_context_free */
+   NULL,                            /* hw_ring_framebuffer */
+   sdl3_update_texture
 };
 
 static void sdl3_gfx_poke_interface(void *data, const video_poke_interface_t **iface)
@@ -1956,7 +2068,13 @@ video_driver_t video_sdl3 = {
 #endif
    NULL, /* invalidate_hw_render_cache */
    NULL, /* read_viewport_hdr */
-   &sdl3_raster_font
+   &sdl3_raster_font,
+#ifdef HAVE_OPENXR
+   NULL, /* get_vr_frame_state */
+   NULL, /* set_vr_content_info */
+   NULL, /* get_video_views_status */
+#endif
+   sdl3_gfx_read_viewport_bgrx
 };
 
 gfx_display_ctx_driver_t gfx_display_ctx_sdl3 = {

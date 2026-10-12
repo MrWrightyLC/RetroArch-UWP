@@ -38,8 +38,8 @@ static int hooked_load_acquire_int(retro_atomic_int_t *p)
 /* The frontend, as far as the driver links against it. */
 uint8_t g_win32_flags;
 ui_window_win32_t main_window;
-retro_keybind_set input_config_binds[MAX_USERS];
-retro_keybind_set input_autoconf_binds[MAX_USERS];
+struct retro_keybind *input_config_binds[MAX_USERS];
+struct retro_keybind *input_autoconf_binds[MAX_USERS];
 enum retro_key rarch_keysym_lut[RETROK_LAST];
 const struct rarch_key_map rarch_key_map_winraw[] = { { 0, RETROK_UNKNOWN } };
 static settings_t stub_settings;
@@ -127,13 +127,21 @@ void task_set_flags(retro_task_t *task, uint8_t flags, bool set)
 bool video_driver_get_viewport_info(struct video_viewport *vp)
 { (void)vp; return false; }
 bool video_driver_translate_coord_viewport(struct video_viewport *vp,
-      int mouse_x, int mouse_y, int16_t *res_x, int16_t *res_y,
-      int16_t *res_screen_x, int16_t *res_screen_y, bool report_oob)
+      int mouse_x, int mouse_y, uint32_t *res_pos, uint32_t *res_screen_pos,
+      bool report_oob)
 {
-   (void)vp; (void)mouse_x; (void)mouse_y; (void)res_x; (void)res_y;
-   (void)res_screen_x; (void)res_screen_y; (void)report_oob;
+   (void)vp; (void)mouse_x; (void)mouse_y; (void)res_pos;
+   (void)res_screen_pos; (void)report_oob;
    return false;
 }
+/* The driver hands its mice and touches to the frontend at its poll. */
+void input_driver_publish_pointers(const input_pointer_frame_t *frames,
+      unsigned count, unsigned flags)
+{ (void)frames; (void)count; (void)flags; }
+void input_driver_publish_touches(const uint32_t *pos, unsigned count,
+      unsigned present, unsigned down)
+{ (void)pos; (void)count; (void)present; (void)down; }
+unsigned input_driver_pointer_read_as(unsigned i) { (void)i; return 0; }
 uintptr_t video_driver_window_get(void) { return 0; }
 void win32_clip_window(bool grab) { (void)grab; }
 uint16_t win32_get_keyboard_mods(void) { return 0; }
@@ -161,10 +169,10 @@ static void second_report(void) { report(3000, 4000); }
 
 static void expect(LONG x, LONG y, const char *what)
 {
-   if (wr->mice[0].x != x || wr->mice[0].y != y)
+   if (VIDEO_POS_X(wr->mice[0].pos) != x || VIDEO_POS_Y(wr->mice[0].pos) != y)
    {
       printf("   FAIL %s: poll read (%ld, %ld), want (%ld, %ld)\n", what,
-            (long)wr->mice[0].x, (long)wr->mice[0].y, (long)x, (long)y);
+            (long)VIDEO_POS_X(wr->mice[0].pos), (long)VIDEO_POS_Y(wr->mice[0].pos), (long)x, (long)y);
       failures++;
    }
    else
@@ -176,6 +184,7 @@ int main(void)
    static const LONG pos[][2] = {
       { 0, 0 }, { 1, 2 }, { 640, 360 }, { 7679, 4319 }, { 12, 4319 } };
    unsigned i;
+   uint32_t cursor_pos;
 
    printf("winraw absolute position:\n");
    wr        = (winraw_input_t*)calloc(1, sizeof(*wr));
@@ -185,7 +194,7 @@ int main(void)
    wr->flags           |= WRAW_INP_FLG_MOUSE_XY_MAPPING_READY;
    wr->view_abs_ratio_x = 1.0;
    wr->view_abs_ratio_y = 1.0;
-   winraw_focus         = true;
+   retro_atomic_store_release_int(&winraw_focus_flag, 1);
    wr->last_focus       = true;
 
    for (i = 0; i < sizeof(pos) / sizeof(pos[0]); i++)
@@ -200,20 +209,32 @@ int main(void)
    load_hook = second_report;
    winraw_poll(wr);
    load_hook = NULL;
-   if (   !(wr->mice[0].x == 1000 && wr->mice[0].y == 2000)
-       && !(wr->mice[0].x == 3000 && wr->mice[0].y == 4000))
+   if (   !(VIDEO_POS_X(wr->mice[0].pos) == 1000 && VIDEO_POS_Y(wr->mice[0].pos) == 2000)
+       && !(VIDEO_POS_X(wr->mice[0].pos) == 3000 && VIDEO_POS_Y(wr->mice[0].pos) == 4000))
    {
       printf("   FAIL a report during poll: read (%ld, %ld), which no "
-            "report gave\n", (long)wr->mice[0].x, (long)wr->mice[0].y);
+            "report gave\n", (long)VIDEO_POS_X(wr->mice[0].pos), (long)VIDEO_POS_Y(wr->mice[0].pos));
       failures++;
    }
    else
       printf("   ok   a report during poll: read (%ld, %ld), as reported\n",
-            (long)wr->mice[0].x, (long)wr->mice[0].y);
+            (long)VIDEO_POS_X(wr->mice[0].pos), (long)VIDEO_POS_Y(wr->mice[0].pos));
 
    /* And the next poll takes the report that landed. */
    winraw_poll(wr);
    expect(3000, 4000, "the next poll");
+
+   report(12, 34);
+   retro_atomic_store_release_int(&g_mice[0].pos_pending, 1);
+   winraw_poll(wr);
+   cursor_pos = wr->mice[0].pos;
+   winraw_poll(wr);
+   if (wr->mice[0].pos != cursor_pos
+         || retro_atomic_load_acquire_int(&g_mice[0].abs_pending))
+   {
+      printf("   FAIL cursor priority left a stale absolute report\n");
+      failures++;
+   }
 
    if (failures)
    {

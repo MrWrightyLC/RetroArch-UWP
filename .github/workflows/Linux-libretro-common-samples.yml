@@ -54,13 +54,34 @@ jobs:
               build-essential zlib1g-dev clang ffmpeg && break
             [ $i = 3 ] && exit 1
             echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            if [ ! -d /etc/apt/ra-orig ]; then
+              sudo mkdir /etc/apt/ra-orig
+              sudo cp -a /etc/apt/sources.list.d /etc/apt/ra-orig/
+              [ ! -f /etc/apt/sources.list ] || sudo cp -a /etc/apt/sources.list /etc/apt/ra-orig/
+            fi
             for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
               [ -f "$f" ] || continue
               sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
                 -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
             done
-            sudo timeout 90 apt-get update -y \
-              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
+            # A refresh cut short or refused leaves apt no package lists: it
+            # is retried, without translations or command-not-found data, and
+            # the mirror is put back when the archive will not answer either.
+            upd="-o Acquire::Retries=3 -o Acquire::http::Timeout=30
+              -o Acquire::Languages=none
+              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false
+              -o APT::Update::Error-Mode=any"
+            ok=0
+            for j in 1 2; do
+              sudo timeout 120 apt-get update -y $upd && { ok=1; break; }
+            done
+            if [ $ok = 0 ]; then
+              sudo rm -rf /etc/apt/sources.list.d
+              sudo cp -a /etc/apt/ra-orig/sources.list.d /etc/apt/
+              [ ! -f /etc/apt/ra-orig/sources.list ] || sudo cp -a /etc/apt/ra-orig/sources.list /etc/apt/
+              sudo rm -rf /etc/apt/ra-orig
+              sudo timeout 120 apt-get update -y $upd || true
+            fi
           done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
@@ -116,9 +137,11 @@ jobs:
             unbase64_test
             crc32_test
             rinflate_window_test
+            rdeflate_hash_test
             emscripten_mmap_test
             archive_zip_test
             archive_zstd_test
+            archive_rar_test
             config_file_test
             path_resolve_realpath_test
             fill_pathname_test
@@ -135,13 +158,22 @@ jobs:
             rjpeg_test
             rh264_lossless_test
             rh264_lossless_test_nothreads
+            rh264_lossless_test_volatile
             rh265_lossless_test
             rh265_lossless_test_nothreads
+            rh265_lossless_test_volatile
+            rh265_malformed_test
             r7z_lzma_props_test
+            r7z_archive_detach_test
+            rzip_archive_test
+            # The RAR reader on real archives (LZ and PPMd blocks,
+            # filters, Unicode names) and on mangled copies of them.
+            rrar_archive_test
             vcdiff_test
             net_ifinfo
             vfs_read_overflow_test
             vfs_mapped_ptr_test
+            vfs_prefetch_test
             vfs_large_file_test
             vfs_seek_contract_test
             vfs_bulk_read_test
@@ -157,6 +189,7 @@ jobs:
             http_parse_test
             rjson_test
             rm3u_test
+            rmp4_fragment_test
             rtga_test
             rbmp_test
             rbmp_encode_test
@@ -168,6 +201,7 @@ jobs:
             rpng_chunk_overflow_test
             rpng_roundtrip_test
             rpng_decode_corpus_test
+            rpng_apng_bounds_test
             # Benchmark, not a pass/fail test, but it runs its default
             # 4K comparison and exits 0, so under this job's sanitizer
             # build it doubles as end-to-end ASan/UBSan smoke coverage
@@ -183,7 +217,11 @@ jobs:
             task_queue_detach_test
             task_queue_main_thread_test
             task_queue_budget_test
+            # A switch to the threaded queue takes over the tasks
+            # already queued and counts them.
+            task_queue_switch_test
             image_blit_bands_test
+            image_loader_test
             tpool_wait_test
             # Four CPU-burning jobs on a pool of four must overlap;
             # on a one-core runner it notes that and still passes.
@@ -246,6 +284,20 @@ jobs:
             # The HDR video blits: PQ and HLG to linear scRGB against
             # double-precision references, and HLG tone-mapped as HDR.
             image_hdr_blit_test
+            # PSP movies demultiplexed from program streams built for it,
+            # fed whole, a byte at a time and in odd chunks.
+            rpsmf_test
+            # ATRAC3 against a reference decoder's output for crafted
+            # stereo and joint stereo streams, then bad frames and
+            # garbage.
+            ratrac3_test
+            # ATRAC3plus against a reference decoder's output for a
+            # stereo stream (tones, gain points, swap and negate masks)
+            # and a mono one, then bad frames and garbage.
+            ratrac3p_test
+            # Animation playback against a scripted stream: order,
+            # pacing, loops, catch-up, the worker's two jobs.
+            video_player_test
           )
 
           # Targets that are built but deliberately not executed, each
@@ -540,6 +592,23 @@ jobs:
 
           TSAN_OPTIONS=halt_on_error=1 ./retro_atomic_test
 
+      - name: Run video_player_test under Clang + ThreadSanitizer, and threadless
+        shell: bash
+        working-directory: libretro-common/samples/formats/video_player
+        run: |
+          # The decode worker hands two jobs back and forth with the
+          # polling thread through atomics alone; the threadless shape
+          # decodes every frame on the polling thread.
+          set -u
+          set -o pipefail
+
+          make clean
+          CC=clang make all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 ./video_player_test
+          make clean
+          make all THREADS=0 SANITIZER=address,undefined
+          ./video_player_test
+
       - name: Run rtime_localtime_test under Clang + ThreadSanitizer
         shell: bash
         working-directory: libretro-common/samples/time/rtime_localtime_test
@@ -605,6 +674,18 @@ jobs:
           CC=clang make all SANITIZER=thread
 
           TSAN_OPTIONS=halt_on_error=1 ./mpsc_stack_test
+
+      - name: Run retro_spsc_test on the POSIX shm mirror
+        shell: bash
+        working-directory: libretro-common/samples/queues/retro_spsc_test
+        run: |
+          # Linux mirrors a ring through memfd; macOS and the BSDs take
+          # the POSIX shm path, which this builds here so it runs on
+          # every push, under ASan.
+          set -eu
+          make clean
+          make all CC="gcc -DRETRO_SPSC_MIRROR_SHM" SANITIZER=address,undefined
+          ./retro_spsc_test
 
       - name: Run retro_spsc_test under Clang + ThreadSanitizer
         shell: bash
@@ -836,13 +917,34 @@ jobs:
               clang && break
             [ $i = 3 ] && exit 1
             echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            if [ ! -d /etc/apt/ra-orig ]; then
+              sudo mkdir /etc/apt/ra-orig
+              sudo cp -a /etc/apt/sources.list.d /etc/apt/ra-orig/
+              [ ! -f /etc/apt/sources.list ] || sudo cp -a /etc/apt/sources.list /etc/apt/ra-orig/
+            fi
             for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
               [ -f "$f" ] || continue
               sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
                 -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
             done
-            sudo timeout 90 apt-get update -y \
-              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
+            # A refresh cut short or refused leaves apt no package lists: it
+            # is retried, without translations or command-not-found data, and
+            # the mirror is put back when the archive will not answer either.
+            upd="-o Acquire::Retries=3 -o Acquire::http::Timeout=30
+              -o Acquire::Languages=none
+              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false
+              -o APT::Update::Error-Mode=any"
+            ok=0
+            for j in 1 2; do
+              sudo timeout 120 apt-get update -y $upd && { ok=1; break; }
+            done
+            if [ $ok = 0 ]; then
+              sudo rm -rf /etc/apt/sources.list.d
+              sudo cp -a /etc/apt/ra-orig/sources.list.d /etc/apt/
+              [ ! -f /etc/apt/ra-orig/sources.list ] || sudo cp -a /etc/apt/ra-orig/sources.list /etc/apt/
+              sudo rm -rf /etc/apt/ra-orig
+              sudo timeout 120 apt-get update -y $upd || true
+            fi
           done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
@@ -912,6 +1014,99 @@ jobs:
           ./config_file_fuzz -max_len=512 -max_total_time=60 \
             -print_final_stats=1 corpus/
 
+  task-queue-mingw:
+    name: task_queue samples under mingw-w64 + Wine
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          for i in 1 2 3; do
+            sudo timeout 90 apt-get update -y \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && break
+            echo "apt-get update failed (attempt $i); retrying in 10s"
+            sleep 10
+          done
+          # Fetch first, under a bound: a download is safe to stop and
+          # resumes, an install is not. A mirror that stalls is left for
+          # the main archive on the next attempt.
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get install -y --download-only \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              build-essential gcc-mingw-w64-x86-64 wine wine64 && break
+            [ $i = 3 ] && exit 1
+            echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            if [ ! -d /etc/apt/ra-orig ]; then
+              sudo mkdir /etc/apt/ra-orig
+              sudo cp -a /etc/apt/sources.list.d /etc/apt/ra-orig/
+              [ ! -f /etc/apt/sources.list ] || sudo cp -a /etc/apt/sources.list /etc/apt/ra-orig/
+            fi
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+              [ -f "$f" ] || continue
+              sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
+                -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+            done
+            # A refresh cut short or refused leaves apt no package lists: it
+            # is retried, without translations or command-not-found data, and
+            # the mirror is put back when the archive will not answer either.
+            upd="-o Acquire::Retries=3 -o Acquire::http::Timeout=30
+              -o Acquire::Languages=none
+              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false
+              -o APT::Update::Error-Mode=any"
+            ok=0
+            for j in 1 2; do
+              sudo timeout 120 apt-get update -y $upd && { ok=1; break; }
+            done
+            if [ $ok = 0 ]; then
+              sudo rm -rf /etc/apt/sources.list.d
+              sudo cp -a /etc/apt/ra-orig/sources.list.d /etc/apt/
+              [ ! -f /etc/apt/ra-orig/sources.list ] || sudo cp -a /etc/apt/ra-orig/sources.list /etc/apt/
+              sudo rm -rf /etc/apt/ra-orig
+              sudo timeout 120 apt-get update -y $upd || true
+            fi
+          done
+          sudo apt-get install -y \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+            build-essential gcc-mingw-w64-x86-64 wine wine64
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build and run the task_queue samples under Wine
+        shell: bash
+        working-directory: libretro-common/samples/queues
+        env:
+          WINEDEBUG: -all
+        run: |
+          set -u
+          set -o pipefail
+          # The samples job above runs these on Linux only. On Win32
+          # retro_sleep() is a function in time/rtime.c rather than a
+          # macro, so a Makefile that links on Linux can still fail to
+          # link for Windows; the threaded queue's Win32 paths in
+          # rthreads.c are not run anywhere else either.
+          fails=0
+          for d in task_queue_*; do
+            t=$(sed -nE 's/^TARGET[[:space:]]*:?=[[:space:]]*//p' "$d/Makefile")
+            printf '\n[build] %s\n' "$d"
+            if ! ( cd "$d" && make clean && make CC=x86_64-w64-mingw32-gcc all ); then
+              printf '::error title=mingw build failed::%s does not build for Windows\n' "$d"
+              fails=$((fails+1))
+              continue
+            fi
+            printf '[run] %s.exe\n' "$t"
+            if ( cd "$d" && timeout 120 wine "./$t.exe" ); then
+              printf '[pass] %s\n' "$t"
+            else
+              rc=$?
+              printf '::error title=Test failed under Wine::%s exited with status %d\n' "$t" "$rc"
+              fails=$((fails+1))
+            fi
+          done
+          [[ $fails -eq 0 ]]
+
   retro-atomic-cross:
     name: Cross-arch retro_atomic_test (${{ matrix.arch }})
     runs-on: ubuntu-latest
@@ -950,13 +1145,34 @@ jobs:
               build-essential ${{ matrix.apt_pkgs }} qemu-user-static && break
             [ $i = 3 ] && exit 1
             echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            if [ ! -d /etc/apt/ra-orig ]; then
+              sudo mkdir /etc/apt/ra-orig
+              sudo cp -a /etc/apt/sources.list.d /etc/apt/ra-orig/
+              [ ! -f /etc/apt/sources.list ] || sudo cp -a /etc/apt/sources.list /etc/apt/ra-orig/
+            fi
             for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
               [ -f "$f" ] || continue
               sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
                 -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
             done
-            sudo timeout 90 apt-get update -y \
-              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
+            # A refresh cut short or refused leaves apt no package lists: it
+            # is retried, without translations or command-not-found data, and
+            # the mirror is put back when the archive will not answer either.
+            upd="-o Acquire::Retries=3 -o Acquire::http::Timeout=30
+              -o Acquire::Languages=none
+              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false
+              -o APT::Update::Error-Mode=any"
+            ok=0
+            for j in 1 2; do
+              sudo timeout 120 apt-get update -y $upd && { ok=1; break; }
+            done
+            if [ $ok = 0 ]; then
+              sudo rm -rf /etc/apt/sources.list.d
+              sudo cp -a /etc/apt/ra-orig/sources.list.d /etc/apt/
+              [ ! -f /etc/apt/ra-orig/sources.list ] || sudo cp -a /etc/apt/ra-orig/sources.list /etc/apt/
+              sudo rm -rf /etc/apt/ra-orig
+              sudo timeout 120 apt-get update -y $upd || true
+            fi
           done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
@@ -1053,7 +1269,7 @@ jobs:
   crc32-cross:
     name: Cross-arch crc32_test (${{ matrix.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -1102,13 +1318,34 @@ jobs:
               build-essential ${{ matrix.apt_pkgs }} qemu-user-static && break
             [ $i = 3 ] && exit 1
             echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            if [ ! -d /etc/apt/ra-orig ]; then
+              sudo mkdir /etc/apt/ra-orig
+              sudo cp -a /etc/apt/sources.list.d /etc/apt/ra-orig/
+              [ ! -f /etc/apt/sources.list ] || sudo cp -a /etc/apt/sources.list /etc/apt/ra-orig/
+            fi
             for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
               [ -f "$f" ] || continue
               sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
                 -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
             done
-            sudo timeout 90 apt-get update -y \
-              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
+            # A refresh cut short or refused leaves apt no package lists: it
+            # is retried, without translations or command-not-found data, and
+            # the mirror is put back when the archive will not answer either.
+            upd="-o Acquire::Retries=3 -o Acquire::http::Timeout=30
+              -o Acquire::Languages=none
+              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false
+              -o APT::Update::Error-Mode=any"
+            ok=0
+            for j in 1 2; do
+              sudo timeout 120 apt-get update -y $upd && { ok=1; break; }
+            done
+            if [ $ok = 0 ]; then
+              sudo rm -rf /etc/apt/sources.list.d
+              sudo cp -a /etc/apt/ra-orig/sources.list.d /etc/apt/
+              [ ! -f /etc/apt/ra-orig/sources.list ] || sudo cp -a /etc/apt/ra-orig/sources.list /etc/apt/
+              sudo rm -rf /etc/apt/ra-orig
+              sudo timeout 120 apt-get update -y $upd || true
+            fi
           done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
@@ -1174,6 +1411,29 @@ jobs:
              ${{ matrix.qemu }} -L ${{ matrix.sysroot }} ./pixconv_test
           fi
           make clean
+
+      - name: Build and run the sinc kernels under qemu-user
+        if: startsWith(matrix.name, 'aarch64') || matrix.name == 'armv7'
+        shell: bash
+        working-directory: samples/audio
+        run: |
+          set -euo pipefail
+          # The only place the NEON sinc kernels run: aarch64 the
+          # intrinsics, armv7 the armeabi assembly for both table
+          # layouts, against the scalar kernels, through dispatch and
+          # the fast-forward stages, and shared between siblings.
+          flags="${{ matrix.cflags }}"
+          asm=0
+          if [ "${{ matrix.name }}" = armv7 ]; then
+             flags="-mfpu=neon"
+             asm=1
+          fi
+          for d in sinc_dispatch sinc_hq sinc_fastforward sinc_sibling; do
+             make -C $d clean
+             CFLAGS="$flags" make -C $d CC="${{ matrix.cc }}" NEON_ASM=$asm
+             ${{ matrix.qemu }} -L ${{ matrix.sysroot }} $d/${d}_test
+             make -C $d clean
+          done
 
       - name: Run vfs_mapped_ptr_test without mappings (MMAP=0)
         shell: bash

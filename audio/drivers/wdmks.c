@@ -205,24 +205,17 @@ enum
  * pulls in for some toolchains and not for others - the griffin build
  * under MSVC gets neither - and including it here would drag the whole
  * device-control surface into a translation unit that holds every
- * driver in the tree. Three constants is the smaller thing to carry,
- * and they are as fixed as the rest of the interface above. */
-#ifndef METHOD_NEITHER
-#define METHOD_NEITHER 3
-#endif
-#ifndef FILE_ANY_ACCESS
-#define FILE_ANY_ACCESS 0
-#endif
-#ifndef FILE_WRITE_ACCESS
-#define FILE_WRITE_ACCESS 0x0002
-#endif
-#ifndef FILE_READ_ACCESS
-#define FILE_READ_ACCESS 0x0001
-#endif
+ * driver in the tree. Four constants is the smaller thing to carry,
+ * under their own names so a unit that also sees winioctl.h holds one
+ * definition of each. */
+#define RA_METHOD_NEITHER    3
+#define RA_FILE_ANY_ACCESS   0
+#define RA_FILE_WRITE_ACCESS 0x0002
+#define RA_FILE_READ_ACCESS  0x0001
 
 #define RA_FILE_DEVICE_KS 0x0000002f
 #define RA_KS_CTL_CODE(fn) \
-   (((RA_FILE_DEVICE_KS) << 16) | ((FILE_ANY_ACCESS) << 14) | ((fn) << 2) | (METHOD_NEITHER))
+   (((RA_FILE_DEVICE_KS) << 16) | ((RA_FILE_ANY_ACCESS) << 14) | ((fn) << 2) | (RA_METHOD_NEITHER))
 #define RA_IOCTL_KS_PROPERTY RA_KS_CTL_CODE(0x000)
 
 /* ---- structures -------------------------------------------------- */
@@ -386,13 +379,13 @@ typedef struct
 /* IOCTL_KS_WRITE_STREAM, built as the DDK builds it:
  * CTL_CODE(FILE_DEVICE_KS, 0x004, METHOD_NEITHER, FILE_WRITE_ACCESS). */
 #define RA_IOCTL_KS_WRITE_STREAM \
-   (((RA_FILE_DEVICE_KS) << 16) | ((FILE_WRITE_ACCESS) << 14) \
-    | ((0x004) << 2) | (METHOD_NEITHER))
+   (((RA_FILE_DEVICE_KS) << 16) | ((RA_FILE_WRITE_ACCESS) << 14) \
+    | ((0x004) << 2) | (RA_METHOD_NEITHER))
 /* IOCTL_KS_READ_STREAM:
  * CTL_CODE(FILE_DEVICE_KS, 0x005, METHOD_NEITHER, FILE_READ_ACCESS). */
 #define RA_IOCTL_KS_READ_STREAM \
-   (((RA_FILE_DEVICE_KS) << 16) | ((FILE_READ_ACCESS) << 14) \
-    | ((0x005) << 2) | (METHOD_NEITHER))
+   (((RA_FILE_DEVICE_KS) << 16) | ((RA_FILE_READ_ACCESS) << 14) \
+    | ((0x005) << 2) | (RA_METHOD_NEITHER))
 
 /* The audio property set, for the pin's own position. PlayOffset is
  * what the device has played, in bytes, and it is the hardware's
@@ -1701,10 +1694,12 @@ typedef struct
     * the frontend needs back is published through the atomics
     * below. */
    retro_spsc_t        rt_ring;
+   unsigned char      *rt_lend;   /* the span write_begin lent */
    size_t              rt_ring_size;
    retro_eventcount_t  rt_park;
    sthread_t          *rt_thread;
    retro_atomic_int_t  rt_run;
+   retro_atomic_int_t  rt_grant;   /* enum audio_thread_grant */
    /* How the thread woke, kept by it and read once it has joined: the
     * longest gap between two of its passes and how many gaps were a
     * loop or more, which is the count of laps the position could not
@@ -1923,7 +1918,9 @@ static void wdmks_rt_event_unregister(HANDLE pin, HANDLE ev)
    CloseHandle(ev);
 }
 
+#ifdef HAVE_THREADS
 static size_t wdmks_rt_ring_bytes(size_t ahead);
+#endif
 
 static bool wdmks_rt_get_buffer(wdmks_t *w, size_t wanted)
 {
@@ -1975,7 +1972,7 @@ static bool wdmks_rt_get_buffer(wdmks_t *w, size_t wanted)
     * a deficit nothing repays - every fourth pass short, for good.
     * With two, a pass can move the fragment and the deficit. */
    w->rt_ring_size = wdmks_rt_ring_bytes(w->rt_ahead);
-   if (!retro_spsc_init(&w->rt_ring, w->rt_ring_size))
+   if (!retro_spsc_init_mirrored(&w->rt_ring, w->rt_ring_size))
       return false;
    if (!retro_eventcount_init(&w->rt_park))
    {
@@ -2644,6 +2641,24 @@ static ssize_t wdmks_rt_write(wdmks_t *w, const unsigned char *src,
    }
 }
 
+/* The loop's geometry from the latency setting, in one place so the
+ * harness runs the numbers the driver runs.  ahead is what is held
+ * ahead of the hardware - the setting, floored at 64 frames; loop is
+ * what is asked of the driver - two fragments of that.  The ring the
+ * frontend writes is two fragments too (wdmks_rt_ring_bytes): the
+ * refill moves it once per notification, and a ring of one fragment
+ * feeds exactly what a fragment plays, so a late pass leaves a deficit
+ * nothing repays. */
+static void wdmks_rt_geometry(unsigned latency, unsigned rate,
+      unsigned frame_bytes, size_t *ahead, size_t *loop)
+{
+   size_t a = (size_t)latency * rate / 1000 * frame_bytes;
+   if (a < (size_t)frame_bytes * 64)
+      a = (size_t)frame_bytes * 64;
+   *ahead = a;
+   *loop  = a * 2;
+}
+
 #ifdef HAVE_THREADS
 /* One pass of the refill thread: sample the position (the accounting
  * and the clock fit live here now, sampled every period, so the wrap
@@ -2742,24 +2757,6 @@ static void wdmks_mmcss_end(HMODULE avrt, HANDLE task)
    }
 }
 
-/* The loop's geometry from the latency setting, in one place so the
- * harness runs the numbers the driver runs.  ahead is what is held
- * ahead of the hardware - the setting, floored at 64 frames; loop is
- * what is asked of the driver - two fragments of that.  The ring the
- * frontend writes is two fragments too (wdmks_rt_ring_bytes): the
- * refill moves it once per notification, and a ring of one fragment
- * feeds exactly what a fragment plays, so a late pass leaves a deficit
- * nothing repays. */
-static void wdmks_rt_geometry(unsigned latency, unsigned rate,
-      unsigned frame_bytes, size_t *ahead, size_t *loop)
-{
-   size_t a = (size_t)latency * rate / 1000 * frame_bytes;
-   if (a < (size_t)frame_bytes * 64)
-      a = (size_t)frame_bytes * 64;
-   *ahead = a;
-   *loop  = a * 2;
-}
-
 static size_t wdmks_rt_ring_bytes(size_t ahead)
 {
    return ahead * 2;
@@ -2791,14 +2788,23 @@ static void wdmks_rt_refill_thread(void *data)
     * twenties - and time-critical otherwise, or where the class is
     * refused. */
    w->rt_sched = "normal priority";
+   retro_atomic_store_release_int(&w->rt_grant, AUDIO_THREAD_GRANT_NORMAL);
    if (w->thread_priority)
    {
       HANDLE task = wdmks_mmcss_begin(&avrt, w->mmcss);
+      int grant   = AUDIO_THREAD_GRANT_REFUSED;
       if (task)
+      {
          w->rt_sched = "Pro Audio";
+         grant       = AUDIO_THREAD_GRANT_MMCSS;
+      }
       else if (SetThreadPriority(GetCurrentThread(),
                THREAD_PRIORITY_TIME_CRITICAL))
+      {
          w->rt_sched = "time-critical";
+         grant       = AUDIO_THREAD_GRANT_RAISED;
+      }
+      retro_atomic_store_release_int(&w->rt_grant, grant);
       mmtask = task;
    }
 
@@ -2854,6 +2860,7 @@ static void wdmks_rt_refill_thread(void *data)
       wdmks_rt_pump_once(w);
    }
    wdmks_mmcss_end(avrt, mmtask);
+   retro_atomic_store_release_int(&w->rt_grant, AUDIO_THREAD_GRANT_NONE);
 }
 
 /* Producer-side ring room, capped to the size that was asked for
@@ -3305,6 +3312,17 @@ static size_t wdmks_underruns(void *data)
    if (!w || !w->stream.looped)
       return 0;
    return retro_atomic_load_acquire_size(&w->rt_underruns);
+}
+
+static enum audio_thread_grant wdmks_thread_grant(void *data)
+{
+#ifdef HAVE_THREADS
+   wdmks_t *w = (wdmks_t*)data;
+   if (w)
+      return (enum audio_thread_grant)retro_atomic_load_acquire_int(
+            &w->rt_grant);
+#endif
+   return AUDIO_THREAD_GRANT_NONE;
 }
 
 static bool wdmks_device_clock_ppm(void *data, double *ppm)
@@ -4013,6 +4031,61 @@ static void *wdmks_init(const char *device, unsigned rate,
    return w;
 }
 
+/* The lend pair: the ring the refill thread drains, handed out span by
+ * span, on a threaded looped pin only. An integer pin is fed float of
+ * the same size, so the lent span is converted in place at the end.
+ * AC-3 frames are gathered and encapsulated inside write(). */
+static size_t wdmks_write_begin(void *data, size_t len, void **region)
+{
+   wdmks_t *w = (wdmks_t*)data;
+   *region    = NULL;
+#ifdef HAVE_THREADS
+   if (     !w || !w->running || !w->stream.looped || !w->rt_thread
+         || w->ac3 || retro_atomic_load_acquire_int(&w->dead))
+      return 0;
+   {
+      void  *ptr  = NULL;
+      size_t room = wdmks_rt_ring_room(w);
+      size_t span = retro_spsc_write_begin(&w->rt_ring, &ptr);
+      if (span > room)
+         span = room;
+      if (span > len)
+         span = len;
+      span -= span % w->frame_bytes;
+      if (!span || !ptr)
+      {
+         retro_spsc_write_end(&w->rt_ring, 0);
+         return 0;
+      }
+      w->rt_lend = (unsigned char*)ptr;
+      *region    = ptr;
+      return span;
+   }
+#else
+   (void)w;
+   (void)len;
+   return 0;
+#endif
+}
+
+static ssize_t wdmks_write_end(void *data, size_t len)
+{
+   wdmks_t *w = (wdmks_t*)data;
+#ifdef HAVE_THREADS
+   len -= len % w->frame_bytes;
+   if (len && w->cvt)
+      convert_float_to_s32((int32_t*)w->rt_lend, (const float*)w->rt_lend,
+            len / sizeof(float), w->stream.fmt.bits);
+   retro_spsc_write_end(&w->rt_ring, len);
+   w->rt_lend = NULL;
+   return (ssize_t)len;
+#else
+   (void)w;
+   (void)len;
+   return 0;
+#endif
+}
+
 audio_driver_t audio_wdmks = {
    wdmks_init,
    wdmks_write,
@@ -4033,7 +4106,10 @@ audio_driver_t audio_wdmks = {
    wdmks_underruns,
    wdmks_layout,
    NULL, /* frames_consumed_fallback */
-   wdmks_device_clock_ppm
+   wdmks_device_clock_ppm,
+   wdmks_thread_grant,
+   wdmks_write_begin,
+   wdmks_write_end
 };
 
 /* ---- capture ------------------------------------------------------ */

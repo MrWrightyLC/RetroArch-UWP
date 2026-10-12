@@ -41,6 +41,7 @@
 #include <encodings/utf.h>
 #include <lists/string_list.h>
 #include <formats/image.h>
+#include <formats/image_yuv_blit.h>
 
 #include <dxgi.h>
 
@@ -74,6 +75,7 @@
  * constants used by pass state.  The actual slang_process() call
  * sites remain guarded with HAVE_SLANG+HAVE_SPIRV_CROSS. */
 #include "../drivers_shader/slang_process.h"
+#include "../drivers_shader/slang_rect.h"
 #ifdef HAVE_THREADS
 #include "../video_thread_wrapper.h"
 #endif
@@ -117,7 +119,10 @@ enum d3d11_state_flags
    /* The menu has drawn a texture wider than eight bits under HDR: the
     * back buffer the UI is drawn into is R16G16B16A16_FLOAT from then
     * on (d3d11_back_buffer_format), so the composite gets it as drawn. */
-   D3D11_ST_FLAG_UI_WIDE             = (1 << 19)
+   D3D11_ST_FLAG_UI_WIDE             = (1 << 19),
+   /* A GPU screenshot waits for this frame's back buffer: the frame
+    * copies it into the recording ring before Present. */
+   D3D11_ST_FLAG_READBACK_PENDING    = (1 << 20)
 };
 
 enum d3d11_feature_level_hint
@@ -277,6 +282,20 @@ typedef struct
    float4_t                size_data;
 } d3d11_texture_t;
 
+/* A planar texture's planes, and the view the conversion writes the
+ * texture through */
+typedef struct d3d11_planar
+{
+   struct d3d11_planar     *next;
+   d3d11_texture_t         *texture;
+   D3D11Texture2D           plane[3];
+   D3D11ShaderResourceView  plane_view[3];
+   D3D11UnorderedAccessView uav;
+   bool                     interleaved;
+} d3d11_planar_t;
+
+static void d3d11_planar_destroy(d3d11_planar_t *p);
+
 typedef struct
 {
    UINT32 colors[4];
@@ -386,6 +405,25 @@ typedef struct
       D3D11ShaderResourceView view;
       bool                    eligible;
    } hw_direct;
+   /* Where the frame lies in the texture a preset's passes read it
+    * from: slang_rect.h's three vec4s, for the passes slang_process()
+    * rewrote to read it there. A hardware frame in the corner of a
+    * larger texture is read there by a preset whose passes all can. */
+   struct
+   {
+      float values[12];
+      bool  seen;
+   } frame_rect;
+   /* A software frame for the stock chain is written straight into
+    * this dynamic texture, mapped WRITE_DISCARD so a frame the GPU still
+    * reads is renamed rather than waited for, and drawn from it through
+    * hw_direct.view: no staging copy, no copy on the GPU. `format` is the
+    * format it was made for, which the texture may hold as another. */
+   struct
+   {
+      d3d11_texture_t texture;
+      DXGI_FORMAT     format;
+   } sw_direct;
    /* The back buffer size the copy was made at, packed. */
    unsigned              retained_dims;
    unsigned              retained_light;
@@ -393,6 +431,12 @@ typedef struct
    DXGISwapChain         swapChain;
    D3D11Device           device;
    D3D_FEATURE_LEVEL     supportedFeatureLevel;
+   /* Planar textures and what converts them (d3d11_planar_load): the
+    * compute shader and its constants, made on the first one. */
+   struct d3d11_planar  *planar;
+   D3D11ComputeShader    planar_cs;
+   D3D11Buffer           planar_cb;
+   bool                  planar_failed;
    D3D11DeviceContext    context;
    D3D11RasterizerState  scissor_enabled;
    D3D11RasterizerState  scissor_disabled;
@@ -466,6 +510,10 @@ typedef struct
       float                            min_output_nits;
       float                            max_cll;
       float                            max_fall;
+      /* The display's peak for the metadata, 0 for the values above:
+       * taken from each frame, so a swapchain the frame rebuilds reads
+       * no settings */
+      float                            display_peak;
    } hdr;
 #endif
 
@@ -488,6 +536,8 @@ typedef struct
       D3D11Buffer    hdr_cb;
 #endif
       D3D11Buffer    vbo;
+      /* Sampled by a quad drawn with no texture: solid colour */
+      d3d11_texture_t white;
       int            offset;
       int            capacity;
    } sprites;
@@ -566,8 +616,8 @@ typedef struct
     * frame is copied from the back buffer into the next staging
     * texture of this ring before Present; read_viewport maps the one
     * copied D3D11_RECORD_RING frames ago without waiting on the GPU.
-    * Before this the recorder re-rendered the frame, created a fresh
-    * staging texture and mapped it with a blocking read, every frame. */
+    * A GPU screenshot has one frame copied into it and waits for that
+    * copy; the next frame not recorded frees the ring. */
 #define D3D11_RECORD_RING 3
    struct
    {
@@ -753,7 +803,22 @@ d3d11_get_closest_match(D3D11Device device, DXGI_FORMAT desired_format, UINT des
    return *format;
 }
 
-static bool d3d11_init_texture(D3D11Device device, d3d11_texture_t* texture)
+/* The CPU-written twin the texture's updates copy from */
+static void d3d11_init_staging(D3D11Device device, d3d11_texture_t* texture)
+{
+   D3D11_TEXTURE2D_DESC desc = texture->desc;
+   desc.MipLevels            = 1;
+   desc.BindFlags            = 0;
+   desc.MiscFlags            = 0;
+   desc.Usage                = D3D11_USAGE_STAGING;
+   desc.CPUAccessFlags       = D3D11_CPU_ACCESS_WRITE;
+   device->lpVtbl->CreateTexture2D(device, &desc, NULL, &texture->staging);
+}
+
+/* @staging: whether a sampled texture gets its CPU-written twin now;
+ * one that may never be updated in place takes it on first use */
+static bool d3d11_init_texture_ex(D3D11Device device,
+      d3d11_texture_t* texture, bool staging)
 {
    bool is_render_target            = texture->desc.BindFlags & D3D11_BIND_RENDER_TARGET;
    UINT format_support              = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE;
@@ -810,22 +875,19 @@ static bool d3d11_init_texture(D3D11Device device, d3d11_texture_t* texture)
    if (is_render_target)
       device->lpVtbl->CreateRenderTargetView(device,
             (D3D11Resource)texture->handle, NULL, &texture->rt_view);
-   else
-   {
-      D3D11_TEXTURE2D_DESC desc = texture->desc;
-      desc.MipLevels            = 1;
-      desc.BindFlags            = 0;
-      desc.MiscFlags            = 0;
-      desc.Usage                = D3D11_USAGE_STAGING;
-      desc.CPUAccessFlags       = D3D11_CPU_ACCESS_WRITE;
-      device->lpVtbl->CreateTexture2D(device, &desc, NULL, &texture->staging);
-   }
+   else if (staging)
+      d3d11_init_staging(device, texture);
 
    texture->size_data.x = texture->desc.Width;
    texture->size_data.y = texture->desc.Height;
    texture->size_data.z = 1.0f / texture->desc.Width;
    texture->size_data.w = 1.0f / texture->desc.Height;
    return true;
+}
+
+static bool d3d11_init_texture(D3D11Device device, d3d11_texture_t* texture)
+{
+   return d3d11_init_texture_ex(device, texture, true);
 }
 
 static void d3d11_update_texture(
@@ -968,7 +1030,7 @@ static void gfx_display_d3d11_draw(gfx_display_ctx_draw_t *draw,
    bool linear          = false;
 #endif
 
-   if (!d3d11 || !draw || !draw->texture)
+   if (!d3d11 || !draw)
       return;
 
    switch (draw->pipeline_id)
@@ -1040,7 +1102,7 @@ static void gfx_display_d3d11_draw(gfx_display_ctx_draw_t *draw,
       {
          sprite->pos.x    = VIDEO_POS_X(draw->pos) / (float)d3d11->viewport.Width;
          sprite->pos.y    =
-            (d3d11->viewport.Height - VIDEO_POS_Y(draw->pos) - VIDEO_SCALE_H(draw->dims)) / (float)d3d11->viewport.Height;
+            (float)VIDEO_POS_FLIP_Y(d3d11->viewport.Height, draw->pos, draw->dims) / (float)d3d11->viewport.Height;
          sprite->pos.w    = VIDEO_SCALE_W(draw->dims) / (float)d3d11->viewport.Width;
          sprite->pos.h    = VIDEO_SCALE_H(draw->dims) / (float)d3d11->viewport.Height;
 
@@ -1105,7 +1167,8 @@ static void gfx_display_d3d11_draw(gfx_display_ctx_draw_t *draw,
    }
 
    {
-      d3d11_texture_t *texture = (d3d11_texture_t*)draw->texture;
+      d3d11_texture_t *texture = draw->texture
+         ? (d3d11_texture_t*)draw->texture : &d3d11->sprites.white;
       d3d11->context->lpVtbl->PSSetShaderResources(
             d3d11->context, 0, 1, &texture->view);
       d3d11->context->lpVtbl->PSSetSamplers(
@@ -1232,14 +1295,15 @@ static bool gfx_display_d3d11_mesh_draw(void *data, unsigned video_dims,
    UINT stride              = sizeof(gfx_display_mesh_vertex_t);
    UINT offset              = 0;
    d3d11_video_t *d3d11     = (d3d11_video_t*)data;
-   d3d11_texture_t *tex     = (d3d11_texture_t*)texture;
+   d3d11_texture_t *tex;
    D3D11DeviceContext ctx;
    int slot;
 
    (void)video_dims;
-   if (     !d3d11 || !mesh || !tex || !d3d11->mesh_ubo
+   if (     !d3d11 || !mesh || !d3d11->mesh_ubo
          || !d3d11->mesh_shader.vs || !d3d11->mesh_shader.ps)
       return false;
+   tex = texture ? (d3d11_texture_t*)texture : &d3d11->sprites.white;
    if ((slot = d3d11_mesh_slot(d3d11, mesh)) < 0)
       return false;
    d3d11->meshes[slot].last_draw = ++d3d11->mesh_draws;
@@ -1434,8 +1498,7 @@ typedef struct
 } d3d11_font_t;
 
 static void d3d11_font_update_atlas_region(
-      D3D11DeviceContext ctx, d3d11_font_t *font,
-      unsigned x0, unsigned y0, unsigned x1, unsigned y1);
+      D3D11DeviceContext ctx, d3d11_font_t *font, unsigned xy0, unsigned xy1);
 
 /* (Re)makes the font texture at the atlas's size and uploads all of
  * it: at init, and when the atlas has grown. The context keeps a
@@ -1456,8 +1519,8 @@ static void d3d11_font_make_texture(d3d11_video_t *d3d11,
          /* the generic path's conversion table does not cover R16;
           * stage the whole atlas through the element-size-aware
           * region helper instead */
-         d3d11_font_update_atlas_region(d3d11->context, font,
-               0, 0, font->atlas->width, font->atlas->height);
+         d3d11_font_update_atlas_region(d3d11->context, font, 0,
+               VIDEO_SCALE_PACK(font->atlas->width, font->atlas->height));
       else
          d3d11_update_texture(
                d3d11->context, font->atlas->width, font->atlas->height, font->atlas->width,
@@ -1502,8 +1565,7 @@ static void * d3d11_font_init(void* data, const char* font_path,
          max_tex = 8192;
       else if (d3d11->supportedFeatureLevel >= D3D_FEATURE_LEVEL_9_3)
          max_tex = 4096;
-      font->atlas->max_width  = max_tex;
-      font->atlas->max_height = max_tex;
+      font->atlas->max_dims = VIDEO_SCALE_PACK(max_tex, max_tex);
    }
    d3d11_font_make_texture(d3d11, font);
 
@@ -1542,10 +1604,13 @@ static int d3d11_font_get_message_width(void *data, const char *msg,
  * rows, and issue a boxed CopySubresourceRegion for just that area.
  * The generic d3d11_update_texture() re-uploads the whole surface. */
 static void d3d11_font_update_atlas_region(
-      D3D11DeviceContext ctx, d3d11_font_t *font,
-      unsigned x0, unsigned y0, unsigned x1, unsigned y1)
+      D3D11DeviceContext ctx, d3d11_font_t *font, unsigned xy0, unsigned xy1)
 {
    unsigned y;
+   unsigned x0 = VIDEO_SCALE_W(xy0);
+   unsigned y0 = VIDEO_SCALE_H(xy0);
+   unsigned x1 = VIDEO_SCALE_W(xy1);
+   unsigned y1 = VIDEO_SCALE_H(xy1);
    D3D11_MAPPED_SUBRESOURCE mapped;
    D3D11_BOX box;
 
@@ -1774,12 +1839,12 @@ static void d3d11_font_render_msg(
       { \
          (dst)->pos.x           = ((px) + (glyph)->draw_offset_x * scale) * inv_vp_w; \
          (dst)->pos.y           = ((py) + (glyph)->draw_offset_y * scale) * inv_vp_h; \
-         (dst)->pos.w           = (glyph)->width  * scale_inv_vp_w; \
-         (dst)->pos.h           = (glyph)->height * scale_inv_vp_h; \
-         (dst)->coords.u        = (glyph)->atlas_offset_x * inv_tex_w; \
-         (dst)->coords.v        = (glyph)->atlas_offset_y * inv_tex_h; \
-         (dst)->coords.w        = (glyph)->width  * inv_tex_w; \
-         (dst)->coords.h        = (glyph)->height * inv_tex_h; \
+         (dst)->pos.w           = VIDEO_SCALE_W((glyph)->dims) * scale_inv_vp_w; \
+         (dst)->pos.h           = VIDEO_SCALE_H((glyph)->dims) * scale_inv_vp_h; \
+         (dst)->coords.u        = VIDEO_SCALE_W((glyph)->atlas_pos) * inv_tex_w; \
+         (dst)->coords.v        = VIDEO_SCALE_H((glyph)->atlas_pos) * inv_tex_h; \
+         (dst)->coords.w        = VIDEO_SCALE_W((glyph)->dims) * inv_tex_w; \
+         (dst)->coords.h        = VIDEO_SCALE_H((glyph)->dims) * inv_tex_h; \
          (dst)->params.scaling  = 1; \
          (dst)->params.rotation = 0; \
          (dst)->colors[0]       = (col); \
@@ -1909,8 +1974,7 @@ static void d3d11_font_upload_atlas(d3d11_video_t *d3d11,
    {
       if (font->texture.staging)
          d3d11_font_update_atlas_region(d3d11->context, font,
-               font->atlas->dirty_x0, font->atlas->dirty_y0,
-               font->atlas->dirty_x1, font->atlas->dirty_y1);
+               font->atlas->dirty_xy0, font->atlas->dirty_xy1);
       font->atlas->dirty = false;
    }
 }
@@ -2036,7 +2100,11 @@ static uint32_t d3d11_get_flags(void *data)
    /* a borderless fullscreen toggle restyles the window; see
     * d3d11_set_video_mode() */
    if (win32_fullscreen_in_place())
+   {
       BIT32_SET(flags, GFX_CTX_FLAGS_FULLSCREEN_IN_PLACE);
+      BIT32_SET(flags, GFX_CTX_FLAGS_WINDOW_RESIZE_IN_PLACE);
+      BIT32_SET(flags, GFX_CTX_FLAGS_FULLSCREEN_EXCLUSIVE_IN_PLACE);
+   }
 #endif
    BIT32_SET(flags, GFX_CTX_FLAGS_CUSTOMIZABLE_FRAME_LATENCY);
    BIT32_SET(flags, GFX_CTX_FLAGS_MENU_FRAME_FILTERING);
@@ -2453,6 +2521,8 @@ static void d3d11_set_hdr_subpixel_layout(void* data, unsigned subpixel_layout)
    }
 }
 
+/* Only the slang passes set these. */
+#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
 static void d3d11_set_hdr_inverse_tonemap(d3d11_video_t* d3d11, bool inverse_tonemap)
 {
 
@@ -2481,6 +2551,7 @@ static void d3d11_set_hdr10(d3d11_video_t* d3d11, bool hdr10)
          d3d11->pass[i].hdr10     = hdr10 ? 1.0f : 0.0f;
    }
 }
+#endif
 #endif
 
 static void d3d11_set_filtering(void* data, unsigned index,
@@ -2749,6 +2820,7 @@ error:
 #endif
 }
 
+#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
 static void d3d11_deferred_state_free(
       d3d11_deferred_state_t *ds,
       unsigned passes_built)
@@ -2790,6 +2862,22 @@ static void d3d11_deferred_state_free(
 
    free(ds);
 }
+#endif
+
+#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+/* A hardware core's frame may lie in the corner of a larger texture:
+ * the preset's passes are rewritten to read it there where they can,
+ * through d3d11->frame_rect. */
+static void d3d11_frame_rect_semantics(d3d11_video_t *d3d11,
+      semantics_map_t *map)
+{
+   if (!(d3d11->flags & D3D11_ST_FLAG_HW_IFACE_ENABLE))
+      return;
+   map->uniforms[SLANG_SEMANTIC_ORIGINAL_RECT]   = d3d11->frame_rect.values;
+   map->uniforms[SLANG_SEMANTIC_ORIGINAL_CLAMP]  = d3d11->frame_rect.values + 4;
+   map->uniforms[SLANG_SEMANTIC_ORIGINAL_TEXELS] = d3d11->frame_rect.values + 8;
+}
+#endif
 
 static bool d3d11_shader_load_step(void *data,
       shader_load_deferred_t *deferred)
@@ -2869,6 +2957,7 @@ static bool d3d11_shader_load_step(void *data,
             }
          };
 
+         d3d11_frame_rect_semantics(d3d11, &semantics_map);
          if (!slang_process(
                   ds->shader_preset, i, RARCH_SHADER_HLSL,
                   ds->shader_model, &semantics_map,
@@ -3216,6 +3305,7 @@ static bool d3d11_gfx_set_shader(void* data, enum rarch_shader_type type, const 
       };
       /* clang-format on */
 
+      d3d11_frame_rect_semantics(d3d11, &semantics_map);
       if (!slang_process(
                d3d11->shader_preset, i, RARCH_SHADER_HLSL, shader_model,
                &semantics_map,
@@ -3418,11 +3508,22 @@ static void d3d11_gfx_free(void* data)
    d3d11_free_shader_preset(d3d11);
 
    d3d11_release_texture(&d3d11->frame.texture[0]);
+   d3d11_release_texture(&d3d11->sw_direct.texture);
    Release(d3d11->frame.ubo);
    Release(d3d11->frame.vbo);
 
+   while (d3d11->planar)
+   {
+      d3d11_planar_t *p = d3d11->planar;
+      d3d11->planar     = p->next;
+      d3d11_planar_destroy(p);
+   }
+   Release(d3d11->planar_cs);
+   Release(d3d11->planar_cb);
+
    d3d11_release_texture(&d3d11->menu.texture);
    Release(d3d11->menu.vbo);
+   d3d11_release_texture(&d3d11->sprites.white);
 
 #ifdef HAVE_DXGI_HDR
    Release(d3d11->hdr.ubo);
@@ -3747,9 +3848,8 @@ static bool d3d11_init_swapchain(d3d11_video_t* d3d11,
       dxgiFactory5->lpVtbl->Release(dxgiFactory5);
    }
 
-   if (FAILED(dxgiFactory->lpVtbl->CreateSwapChain(
-               dxgiFactory, (IUnknown*)d3d11->device,
-               &desc, (IDXGISwapChain**)&d3d11->swapChain)))
+   if (FAILED(DXGICreateSwapChain((DXGIFactory1)dxgiFactory,
+               d3d11->device, &desc, &d3d11->swapChain)))
    {
 #if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
       /* On a window taken from the last driver the likelier reason is
@@ -3850,7 +3950,8 @@ static bool d3d11_init_swapchain(d3d11_video_t* d3d11,
          d3d11->hdr.max_output_nits,
          d3d11->hdr.min_output_nits,
          d3d11->hdr.max_cll,
-         d3d11->hdr.max_fall);
+         d3d11->hdr.max_fall,
+         d3d11->hdr.display_peak);
 
    memset(&d3d11->back_buffer, 0, sizeof(d3d11->back_buffer));
    d3d11->back_buffer.desc.Width              = width;
@@ -3869,8 +3970,7 @@ static bool d3d11_init_swapchain(d3d11_video_t* d3d11,
    return true;
 }
 
-static void *d3d11_gfx_init(const video_info_t* video,
-      input_driver_t** input, void** input_data)
+static void *d3d11_gfx_init(const video_info_t* video)
 {
    unsigned       i;
 #ifdef HAVE_MONITOR
@@ -3932,6 +4032,7 @@ static void *d3d11_gfx_init(const video_info_t* video,
    d3d11->hdr.min_output_nits             = 0.001f;
    d3d11->hdr.max_cll                     = 0.0f;
    d3d11->hdr.max_fall                    = 0.0f;
+   d3d11->hdr.display_peak                = video_driver_hdr_metadata_peak(0.0f);
    if (settings->uints.video_hdr_mode > 0)
       d3d11->flags |=  D3D11_ST_FLAG_HDR_ENABLE;
    else
@@ -3984,7 +4085,7 @@ static void *d3d11_gfx_init(const video_info_t* video,
 
    /* no input driver of this driver's own: the frontend starts the
     * one that goes with a Windows window */
-   input_driver_left_to_frontend(INPUT_WINDOW_WINDOWS, input, input_data);
+   input_driver_video_window(INPUT_WINDOW_WINDOWS, NULL);
 
    matrix_4x4_identity(d3d11->identity);
 
@@ -4149,6 +4250,19 @@ static void *d3d11_gfx_init(const video_info_t* video,
    }
 
    d3d11_set_filtering(d3d11, 0, video->smooth, video->ctx_scaling);
+
+   {
+      static const uint32_t white = 0xffffffff;
+      d3d11->sprites.white.desc.Width  = 1;
+      d3d11->sprites.white.desc.Height = 1;
+      d3d11->sprites.white.desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      d3d11->sprites.white.sampler     =
+         d3d11->samplers[RARCH_FILTER_NEAREST][RARCH_WRAP_EDGE];
+      d3d11_init_texture(d3d11->device, &d3d11->sprites.white);
+      if (d3d11->sprites.white.staging)
+         d3d11_update_texture(d3d11->context, 1, 1, 0,
+               DXGI_FORMAT_B8G8R8A8_UNORM, &white, &d3d11->sprites.white);
+   }
 
    {
       D3D11_BUFFER_DESC desc;
@@ -4644,10 +4758,16 @@ static void d3d11_init_render_targets(d3d11_video_t* d3d11, unsigned width, unsi
 
          if (pass->feedback)
          {
+            static const float clear_color[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
             d3d11->pass[i].feedback.desc = d3d11->pass[i].rt.desc;
             d3d11_release_texture(&d3d11->pass[i].feedback);
             d3d11_init_texture(d3d11->device, &d3d11->pass[i].feedback);
-            /* TODO/FIXME: do we need to clear it to black here ? */
+            if (d3d11->pass[i].rt.rt_view)
+               d3d11->context->lpVtbl->ClearRenderTargetView(d3d11->context,
+                     d3d11->pass[i].rt.rt_view, clear_color);
+            if (d3d11->pass[i].feedback.rt_view)
+               d3d11->context->lpVtbl->ClearRenderTargetView(d3d11->context,
+                     d3d11->pass[i].feedback.rt_view, clear_color);
          }
       }
       else
@@ -4679,8 +4799,6 @@ static INLINE void d3d11_wait_for_vblank(d3d11_video_t* d3d11)
    Release(pOutput);
 }
 
-/* Copies the current backbuffer into the retained texture, creating or
- * resizing that texture to match the swapchain when it does not. */
 static void d3d11_record_free(d3d11_video_t *d3d11)
 {
    unsigned i;
@@ -4745,6 +4863,8 @@ static void d3d11_record_capture(d3d11_video_t *d3d11)
    Release(back_buffer);
 }
 
+/* Copies the current backbuffer into the retained texture, creating or
+ * resizing that texture to match the swapchain when it does not. */
 static void d3d11_retain_backbuffer(d3d11_video_t *d3d11)
 {
    D3D11Texture2D back_buffer = NULL;
@@ -5054,6 +5174,73 @@ static retro_time_t d3d11_get_last_present_time(void *data)
 
 /* The view to draw a version 3 core's texture through. A core rotates a
  * few textures, so a view per texture is made once and found again. */
+/* Writes a software frame into sw_direct's texture, made or remade at
+ * its size first. False when it can't be: the frame takes the staging
+ * path instead. */
+static bool d3d11_sw_direct_upload(d3d11_video_t *d3d11,
+      D3D11DeviceContext ctx, unsigned width, unsigned height,
+      unsigned pitch, const void *frame)
+{
+   D3D11_MAPPED_SUBRESOURCE mapped;
+   d3d11_texture_t *tex = &d3d11->sw_direct.texture;
+
+   if (     !tex->handle
+         || tex->desc.Width        != width
+         || tex->desc.Height       != height
+         || d3d11->sw_direct.format != d3d11->format)
+   {
+      d3d11_release_texture(tex);
+      memset(tex, 0, sizeof(*tex));
+      tex->desc.Width          = width;
+      tex->desc.Height         = height;
+      tex->desc.Format         = d3d11->format;
+      tex->desc.Usage          = D3D11_USAGE_DYNAMIC;
+      d3d11->sw_direct.format  = d3d11->format;
+      if (     !d3d11_init_texture_ex(d3d11->device, tex, false)
+            || !tex->view)
+      {
+         d3d11_release_texture(tex);
+         memset(tex, 0, sizeof(*tex));
+         return false;
+      }
+   }
+
+   if (FAILED(ctx->lpVtbl->Map(ctx, (D3D11Resource)tex->handle, 0,
+               D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+      return false;
+   dxgi_copy(width, height, d3d11->format, pitch, frame,
+         tex->desc.Format, mapped.RowPitch, mapped.pData);
+   ctx->lpVtbl->Unmap(ctx, (D3D11Resource)tex->handle, 0);
+   return true;
+}
+
+/* Whether a preset's passes may read the frame where it is, through
+ * hw_direct.view, as Original and as the first pass's Source: when it
+ * keeps no history, which is copied out of frame.texture[0], and the
+ * frame is in a texture of one level, @texture's, or with NULL
+ * sw_direct's - the whole of it, or its corner when every pass reads
+ * the frame through the rectangle. */
+static bool d3d11_preset_reads_in_place(d3d11_video_t *d3d11,
+      D3D11Texture2D texture, unsigned width, unsigned height)
+{
+   unsigned i;
+   D3D11_TEXTURE2D_DESC desc;
+   if (d3d11->shader_preset->history_size)
+      return false;
+   if (!texture)
+      return true;
+   texture->lpVtbl->GetDesc(texture, &desc);
+   if (     desc.MipLevels != 1 || desc.ArraySize != 1
+         || desc.Width < width  || desc.Height < height)
+      return false;
+   if (desc.Width == width && desc.Height == height)
+      return true;
+   for (i = 0; i < d3d11->shader_preset->passes; i++)
+      if (!d3d11->pass[i].semantics.frame_in_place)
+         return false;
+   return true;
+}
+
 static D3D11ShaderResourceView d3d11_hw_direct_view(d3d11_video_t *d3d11,
       D3D11Texture2D texture)
 {
@@ -5112,6 +5299,9 @@ static bool d3d11_gfx_frame(
    bool ret;
    if (!d3d11)
       return false;
+#ifdef HAVE_DXGI_HDR
+   d3d11->hdr.display_peak = video_info->hdr_display_peak;
+#endif
    d3d11_hw_v2_enter(d3d11);
    ret = d3d11_gfx_frame_body(data, frame, dims, frame_count,
          pitch, msg, video_info);
@@ -5217,9 +5407,6 @@ static bool d3d11_gfx_frame_body(
 
       d3d11->chain_bit_depth     = desired_bit_depth;
 
-      if (d3d11->flags & D3D11_ST_FLAG_HDR_ENABLE)
-         d3d11_release_texture(&d3d11->back_buffer);
-
       /* Unbind all render targets before ResizeBuffers —
        * the debug layer requires no outstanding references
        * to back buffer resources during the resize */
@@ -5277,14 +5464,20 @@ static bool d3d11_gfx_frame_body(
 
       if (d3d11->flags & D3D11_ST_FLAG_HDR_ENABLE)
       {
-         memset(&d3d11->back_buffer, 0, sizeof(d3d11->back_buffer));
-         d3d11->back_buffer.desc.Width              = video_width;
-         d3d11->back_buffer.desc.Height             = video_height;
-         d3d11->back_buffer.desc.Format             = d3d11_back_buffer_format(d3d11);
-         d3d11->back_buffer_req                     = d3d11->back_buffer.desc.Format;
-         d3d11->back_buffer.desc.BindFlags          = D3D11_BIND_RENDER_TARGET;
-         d3d11_release_texture(&d3d11->back_buffer);
-         d3d11_init_texture(d3d11->device, &d3d11->back_buffer);
+         if (     !d3d11->back_buffer.handle
+               || d3d11->back_buffer.desc.Width  != video_width
+               || d3d11->back_buffer.desc.Height != video_height
+               || d3d11->back_buffer_req != d3d11_back_buffer_format(d3d11))
+         {
+            d3d11_release_texture(&d3d11->back_buffer);
+            memset(&d3d11->back_buffer, 0, sizeof(d3d11->back_buffer));
+            d3d11->back_buffer.desc.Width     = video_width;
+            d3d11->back_buffer.desc.Height    = video_height;
+            d3d11->back_buffer.desc.Format    = d3d11_back_buffer_format(d3d11);
+            d3d11->back_buffer_req            = d3d11->back_buffer.desc.Format;
+            d3d11->back_buffer.desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+            d3d11_init_texture(d3d11->device, &d3d11->back_buffer);
+         }
 
          dxgi_swapchain_color_space(
                d3d11->swapChain,
@@ -5309,7 +5502,8 @@ static bool d3d11_gfx_frame_body(
             d3d11->hdr.max_output_nits,
             d3d11->hdr.min_output_nits,
             d3d11->hdr.max_cll,
-            d3d11->hdr.max_fall);
+            d3d11->hdr.max_fall,
+            d3d11->hdr.display_peak);
 #endif
    }
 #ifdef HAVE_DXGI_HDR
@@ -5442,12 +5636,36 @@ static bool d3d11_gfx_frame_body(
          d3d11_init_render_targets(d3d11, width, height);
 
       /* A frame that arrives any other way is drawn from
-       * frame.texture[0] as always. */
-      if (!hw_texture || !d3d11->hw_direct.eligible
-            || (d3d11->shader_preset && video_info->shader_active))
-         d3d11->hw_direct.view = NULL;
-      else
-         d3d11->hw_direct.view = d3d11_hw_direct_view(d3d11, hw_texture);
+       * frame.texture[0] as always, which is its size. */
+      {
+         unsigned tex_dims = VIDEO_SCALE_PACK(width, height);
+         if (!hw_texture || !d3d11->hw_direct.eligible
+               || (     d3d11->shader_preset && video_info->shader_active
+                    && !d3d11_preset_reads_in_place(d3d11, hw_texture,
+                       width, height)))
+            d3d11->hw_direct.view = NULL;
+         else
+         {
+            D3D11_TEXTURE2D_DESC desc;
+            hw_texture->lpVtbl->GetDesc(hw_texture, &desc);
+            tex_dims = VIDEO_SCALE_PACK(desc.Width, desc.Height);
+            if (     d3d11->shader_preset && video_info->shader_active
+                  && (desc.Width != width || desc.Height != height)
+                  && !d3d11->frame_rect.seen)
+            {
+               d3d11->frame_rect.seen = true;
+               RARCH_LOG("[D3D11] Preset reads frames where the core leaves "
+                     "them.\n");
+            }
+            d3d11->hw_direct.view = d3d11_hw_direct_view(d3d11, hw_texture);
+         }
+#ifdef HAVE_SLANG
+         slang_rect_values(d3d11->frame_rect.values,
+               VIDEO_SCALE_PACK(width, height), 0, tex_dims);
+#else
+         (void)tex_dims;
+#endif
+      }
       d3d11->hw_direct.eligible = false;
 
       if (hw_texture && d3d11->hw_direct.view)
@@ -5474,9 +5692,21 @@ static bool d3d11_gfx_frame_body(
           Release(hw_texture);
           hw_texture = NULL;
       }
-      else if (d3d11->frame.texture[0].staging)
-         d3d11_update_texture(
-               context, width, height, pitch, d3d11->format, frame, &d3d11->frame.texture[0]);
+      else if (d3d11->frame.texture[0].staging
+            && frame != RETRO_HW_FRAME_BUFFER_VALID)
+      {
+         /* A software frame is drawn from where it was written, by
+          * the stock chain or a preset that reads it in place. */
+         if (     (   !(d3d11->shader_preset && video_info->shader_active)
+                   || d3d11_preset_reads_in_place(d3d11, NULL,
+                      width, height))
+               && d3d11_sw_direct_upload(d3d11, context,
+                  width, height, pitch, frame))
+            d3d11->hw_direct.view = d3d11->sw_direct.texture.view;
+         else
+            d3d11_update_texture(context, width, height, pitch,
+                  d3d11->format, frame, &d3d11->frame.texture[0]);
+      }
    }
 
 #ifdef D3D11_ROLLING_SCANLINE_SIMULATION
@@ -5654,6 +5884,12 @@ static bool d3d11_gfx_frame_body(
             {
                int binding       = texture_sem->binding;
                textures[binding] = *(D3D11ShaderResourceView*)texture_sem->texture_data;
+               /* The frame where it is, not copied into
+                * frame.texture[0] (d3d11_preset_reads_in_place). */
+               if (     d3d11->hw_direct.view
+                     && texture_sem->texture_data
+                        == (void*)&d3d11->frame.texture[0].view)
+                  textures[binding] = d3d11->hw_direct.view;
                samplers[binding] = d3d11->samplers[texture_sem->filter][texture_sem->wrap];
                texture_sem++;
             }
@@ -6252,8 +6488,12 @@ static bool d3d11_gfx_frame_body(
    /* The recorder's copy of this frame, queued behind the render so
     * the GPU does it in its own time; read_viewport picks it up frames
     * later. Torn down when recording stops. */
-   if (video_info->gpu_recording)
+   if (     video_info->gpu_recording
+         || (d3d11->flags & D3D11_ST_FLAG_READBACK_PENDING))
+   {
+      d3d11->flags &= ~D3D11_ST_FLAG_READBACK_PENDING;
       d3d11_record_capture(d3d11);
+   }
    else if (d3d11->record.enable)
       d3d11_record_free(d3d11);
 
@@ -6565,29 +6805,48 @@ static bool d3d11_gfx_read_viewport(void* data, uint8_t* buffer, bool is_idle)
    unsigned slot;
    uint32_t y;
    uint32_t x;
+   bool wait;
    bool ret = true;
    HRESULT hr;
-
-   (void)is_idle;
 
    if (!d3d11)
       return false;
 
-   /* Nothing captured yet: the frame after recording starts queues
-    * the first copy, and the ring fills over the next few frames. The
-    * recorder treats false as "not this frame" and tries again. */
-   if (!d3d11->record.enable)
-      return false;
+   if (d3d11->record.enable)
+   {
+      /* Recording: the oldest copy, made RING frames ago. The recorder
+       * treats false as "not this frame" and tries again. */
+      slot = d3d11->record.index;
+      wait = false;
+   }
+   else
+   {
+      /* A screenshot: the frame drawn again, its back buffer copied
+       * before Present; idle, the back buffer as it stands. That copy
+       * is waited for. */
+      d3d11->flags |= D3D11_ST_FLAG_READBACK_PENDING;
+      if (!is_idle)
+         video_driver_cached_frame();
+      if (d3d11->flags & D3D11_ST_FLAG_READBACK_PENDING)
+      {
+         d3d11->flags &= ~D3D11_ST_FLAG_READBACK_PENDING;
+         d3d11_record_capture(d3d11);
+      }
+      if (!d3d11->record.enable)
+         return false;
+      slot = (d3d11->record.index + D3D11_RECORD_RING - 1)
+         % D3D11_RECORD_RING;
+      wait = true;
+   }
 
-   slot    = d3d11->record.index; /* the oldest: copied RING frames ago */
    staging = d3d11->record.staging[slot];
    if (!d3d11->record.valid[slot] || !staging)
       return false;
 
-   /* A map that would wait for the GPU is declined instead; the copy
-    * is read on a later frame, never waited for. */
+   /* Recording never waits for the GPU: a copy still being made is
+    * read on a later frame. */
    hr = d3d11->context->lpVtbl->Map(d3d11->context, (D3D11Resource)staging,
-         0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &Map);
+         0, D3D11_MAP_READ, wait ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &Map);
    if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
       return false;
    if (FAILED(hr))
@@ -6771,6 +7030,261 @@ typedef struct
 } d3d11_texture_cmd_t;
 #endif
 
+/* 8-bit 4:2:0 in, RGBA out: the chroma of each 2x2 block from the one
+ * sample it shares, as the CPU conversion does, either order */
+static const char d3d11_planar_cs_src[] =
+   "Texture2D<float>  Y  : register(t0);\n"
+   "Texture2D<float2> C0 : register(t1);\n"
+   "Texture2D<float>  C1 : register(t2);\n"
+   "RWTexture2D<float4> Out : register(u0);\n"
+   "cbuffer P : register(b0) { float4 k0; float4 k1; uint4 size; };\n"
+   "[numthreads(8, 8, 1)]\n"
+   "void main(uint3 id : SV_DispatchThreadID)\n"
+   "{\n"
+   "   int3 c;\n"
+   "   float y;\n"
+   "   float2 ch;\n"
+   "   if (id.x >= size.x || id.y >= size.y)\n"
+   "      return;\n"
+   "   c  = int3(id.xy >> 1, 0);\n"
+   "   y  = Y.Load(int3(id.xy, 0));\n"
+   "   ch = k1.z > 0.5 ? C0.Load(c) : float2(C0.Load(c).x, C1.Load(c));\n"
+   "   if (k1.w > 0.5)\n"
+   "      ch = ch.yx;\n"
+   "   ch -= 128.0 / 255.0;\n"
+   "   Out[id.xy] = float4(saturate(k0.x * y + k0.y + float3(k0.z * ch.y,\n"
+   "         k0.w * ch.x + k1.x * ch.y, k1.y * ch.x)), 1.0);\n"
+   "}\n";
+
+/* The shader and its constants, made on the first planar texture; a
+ * failure turns planar textures off */
+static bool d3d11_planar_init(d3d11_video_t *d3d11)
+{
+   D3DBlob blob = NULL;
+   D3D11_BUFFER_DESC desc;
+   if (d3d11->planar_cs)
+      return true;
+   if (d3d11->planar_failed)
+      return false;
+   d3d11->planar_failed = true;
+   if (!d3d_compile(d3d11_planar_cs_src, sizeof(d3d11_planar_cs_src) - 1,
+            "planar", "main", "cs_5_0", &blob))
+      return false;
+   d3d11->device->lpVtbl->CreateComputeShader(d3d11->device,
+         blob->lpVtbl->GetBufferPointer(blob),
+         blob->lpVtbl->GetBufferSize(blob), NULL, &d3d11->planar_cs);
+   Release(blob);
+   if (!d3d11->planar_cs)
+      return false;
+   memset(&desc, 0, sizeof(desc));
+   desc.ByteWidth      = 48;
+   desc.Usage          = D3D11_USAGE_DYNAMIC;
+   desc.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+   desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+   if (FAILED(d3d11->device->lpVtbl->CreateBuffer(d3d11->device, &desc,
+         NULL, &d3d11->planar_cb)))
+   {
+      Release(d3d11->planar_cs);
+      d3d11->planar_cs = NULL;
+      return false;
+   }
+   d3d11->planar_failed = false;
+   return true;
+}
+
+static void d3d11_planar_destroy(d3d11_planar_t *p)
+{
+   unsigned i;
+   for (i = 0; i < 3; i++)
+   {
+      Release(p->plane_view[i]);
+      Release(p->plane[i]);
+   }
+   Release(p->uav);
+   free(p);
+}
+
+/* @handle's planes, when it is a planar texture */
+static void d3d11_planar_forget(d3d11_video_t *d3d11, uintptr_t handle)
+{
+   d3d11_planar_t **cur = &d3d11->planar;
+   while (*cur)
+   {
+      d3d11_planar_t *p = *cur;
+      if ((uintptr_t)p->texture == handle)
+      {
+         *cur = p->next;
+         d3d11_planar_destroy(p);
+         return;
+      }
+      cur = &p->next;
+   }
+}
+
+static bool d3d11_planar_plane(D3D11Device device, unsigned w, unsigned h,
+      DXGI_FORMAT fmt, D3D11Texture2D *tex, D3D11ShaderResourceView *view)
+{
+   D3D11_TEXTURE2D_DESC desc;
+   memset(&desc, 0, sizeof(desc));
+   desc.Width            = w;
+   desc.Height           = h;
+   desc.MipLevels        = 1;
+   desc.ArraySize        = 1;
+   desc.Format           = fmt;
+   desc.SampleDesc.Count = 1;
+   desc.Usage            = D3D11_USAGE_DEFAULT;
+   desc.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+   return SUCCEEDED(device->lpVtbl->CreateTexture2D(device, &desc, NULL,
+            tex))
+      && SUCCEEDED(device->lpVtbl->CreateShaderResourceView(device,
+            (D3D11Resource)*tex, NULL, view));
+}
+
+/* The planes of @image into @p's, from where they lie, and the dispatch
+ * that converts them into its texture */
+static enum video_texture_update d3d11_planar_update(d3d11_video_t *d3d11,
+      d3d11_planar_t *p, const struct texture_image *image)
+{
+   const struct texture_planar *tp = image->planar;
+   D3D11DeviceContext ctx          = d3d11->context;
+   D3D11ShaderResourceView none[3];
+   D3D11UnorderedAccessView no_uav = NULL;
+   D3D11Buffer no_cb               = NULL;
+   D3D11_MAPPED_SUBRESOURCE mapped;
+   const uint8_t *c0;
+   unsigned c0_stride;
+   bool swap;
+   float k[6];
+
+   if (     !tp || !tp->planes[0] || !tp->planes[1] || !tp->planes[2]
+         || p->texture->desc.Width  != image->width
+         || p->texture->desc.Height != image->height)
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+   if (tp->chroma_step == 1 && !p->interleaved)
+   {
+      swap      = false;
+      c0        = tp->planes[1];
+      c0_stride = tp->strides[1];
+   }
+   else if (tp->chroma_step == 2 && p->interleaved
+         && tp->planes[2] == tp->planes[1] + 1)
+   {
+      swap      = false;
+      c0        = tp->planes[1];
+      c0_stride = tp->strides[1];
+   }
+   else if (tp->chroma_step == 2 && p->interleaved
+         && tp->planes[1] == tp->planes[2] + 1)
+   {
+      swap      = true;
+      c0        = tp->planes[2];
+      c0_stride = tp->strides[2];
+   }
+   else
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+
+   if (FAILED(ctx->lpVtbl->Map(ctx, (D3D11Resource)d3d11->planar_cb, 0,
+         D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+   {
+      float    *f = (float*)mapped.pData;
+      uint32_t *u = (uint32_t*)mapped.pData + 8;
+      image_yuv_coefficients(tp->yuv, k);
+      f[0] = k[0];
+      f[1] = k[1];
+      f[2] = k[2];
+      f[3] = k[3];
+      f[4] = k[4];
+      f[5] = k[5];
+      f[6] = p->interleaved ? 1.0f : 0.0f;
+      f[7] = swap ? 1.0f : 0.0f;
+      u[0] = image->width;
+      u[1] = image->height;
+      u[2] = 0;
+      u[3] = 0;
+   }
+   ctx->lpVtbl->Unmap(ctx, (D3D11Resource)d3d11->planar_cb, 0);
+
+   ctx->lpVtbl->UpdateSubresource(ctx, (D3D11Resource)p->plane[0], 0, NULL,
+         tp->planes[0], tp->strides[0], 0);
+   ctx->lpVtbl->UpdateSubresource(ctx, (D3D11Resource)p->plane[1], 0, NULL,
+         c0, c0_stride, 0);
+   if (!p->interleaved)
+      ctx->lpVtbl->UpdateSubresource(ctx, (D3D11Resource)p->plane[2], 0,
+            NULL, tp->planes[2], tp->strides[2], 0);
+
+   ctx->lpVtbl->CSSetShader(ctx, d3d11->planar_cs, NULL, 0);
+   ctx->lpVtbl->CSSetConstantBuffers(ctx, 0, 1, &d3d11->planar_cb);
+   ctx->lpVtbl->CSSetShaderResources(ctx, 0, 3, p->plane_view);
+   ctx->lpVtbl->CSSetUnorderedAccessViews(ctx, 0, 1, &p->uav, NULL);
+   ctx->lpVtbl->Dispatch(ctx, (image->width + 7) / 8,
+         (image->height + 7) / 8, 1);
+   /* Nothing of it stays bound: the texture is drawn from next */
+   none[0] = none[1] = none[2] = NULL;
+   ctx->lpVtbl->CSSetUnorderedAccessViews(ctx, 0, 1, &no_uav, NULL);
+   ctx->lpVtbl->CSSetShaderResources(ctx, 0, 3, none);
+   ctx->lpVtbl->CSSetConstantBuffers(ctx, 0, 1, &no_cb);
+   ctx->lpVtbl->CSSetShader(ctx, NULL, NULL, 0);
+   return VIDEO_TEXTURE_UPDATE_DONE;
+}
+
+/* A texture for planar frames: RGBA8 a compute shader writes, its planes
+ * beside it, and the first frame converted into it */
+static uintptr_t d3d11_planar_load(d3d11_video_t *d3d11,
+      const struct texture_image *image, enum texture_filter_type filter)
+{
+   const struct texture_planar *tp = image->planar;
+   D3D11Device device = d3d11->device;
+   d3d11_texture_t *texture;
+   d3d11_planar_t  *p;
+   unsigned cw = (image->width  + 1) / 2;
+   unsigned ch = (image->height + 1) / 2;
+
+   if (     !image->width || !image->height
+         || (tp->chroma_step != 1 && tp->chroma_step != 2)
+         || !d3d11_planar_init(d3d11))
+      return 0;
+   if (!(texture = (d3d11_texture_t*)calloc(1, sizeof(*texture))))
+      return 0;
+   if (!(p = (d3d11_planar_t*)calloc(1, sizeof(*p))))
+   {
+      free(texture);
+      return 0;
+   }
+   p->texture       = texture;
+   p->interleaved   = tp->chroma_step == 2;
+   texture->sampler = d3d11->samplers[
+         (filter == TEXTURE_FILTER_NEAREST
+          || filter == TEXTURE_FILTER_MIPMAP_NEAREST)
+         ? RARCH_FILTER_NEAREST : RARCH_FILTER_LINEAR][RARCH_WRAP_EDGE];
+   texture->desc.Width     = image->width;
+   texture->desc.Height    = image->height;
+   texture->desc.Format    = DXGI_FORMAT_R8G8B8A8_UNORM;
+   texture->desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+   if (     !d3d11_init_texture_ex(device, texture, false)
+         || texture->desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM
+         || FAILED(device->lpVtbl->CreateUnorderedAccessView(device,
+               (D3D11Resource)texture->handle, NULL, &p->uav))
+         || !d3d11_planar_plane(device, image->width, image->height,
+               DXGI_FORMAT_R8_UNORM, &p->plane[0], &p->plane_view[0])
+         || !d3d11_planar_plane(device, cw, ch, p->interleaved
+               ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM,
+               &p->plane[1], &p->plane_view[1])
+         || (!p->interleaved && !d3d11_planar_plane(device, cw, ch,
+               DXGI_FORMAT_R8_UNORM, &p->plane[2], &p->plane_view[2]))
+         || d3d11_planar_update(d3d11, p, image)
+               != VIDEO_TEXTURE_UPDATE_DONE)
+   {
+      d3d11_planar_destroy(p);
+      d3d11_release_texture(texture);
+      free(texture);
+      return 0;
+   }
+   p->next       = d3d11->planar;
+   d3d11->planar = p;
+   return (uintptr_t)texture;
+}
+
 /* Inner load function -- performs all DeviceContext-touching work.
  * Must run on the same thread that owns the D3D11 immediate
  * context (ID3D11DeviceContext is NOT thread-safe). */
@@ -6779,9 +7293,16 @@ static uintptr_t d3d11_gfx_load_texture_internal(
       enum texture_filter_type filter_type)
 {
    d3d11_texture_t* texture = NULL;
+   DXGI_FORMAT   src_format = image->fp16
+         ? DXGI_FORMAT_R16G16B16A16_FLOAT
+         : image->pix10
+         ? DXGI_FORMAT_R10G10B10A2_UNORM
+         : DXGI_FORMAT_B8G8R8A8_UNORM;
 
    if (!d3d11)
       return 0;
+   if (image->planar)
+      return d3d11_planar_load(d3d11, image, filter_type);
 
    texture = (d3d11_texture_t*)calloc(1, sizeof(*texture));
 
@@ -6810,23 +7331,39 @@ static uintptr_t d3d11_gfx_load_texture_internal(
 
    texture->desc.Width  = image->width;
    texture->desc.Height = image->height;
-   texture->desc.Format = image->fp16
-         ? DXGI_FORMAT_R16G16B16A16_FLOAT
-         : image->pix10
-         ? DXGI_FORMAT_R10G10B10A2_UNORM
-         : DXGI_FORMAT_B8G8R8A8_UNORM;
+   texture->desc.Format = src_format;
 
+   /* A loaded texture has no staging twin until an in-place update
+    * needs one: the image goes straight in */
    d3d11_release_texture(texture);
-   d3d11_init_texture(d3d11->device, texture);
+   if (!d3d11_init_texture_ex(d3d11->device, texture, false))
+   {
+      free(texture);
+      return 0;
+   }
 
-   if (texture->staging)
-      d3d11_update_texture(
-            d3d11->context, image->width, image->height, 0,
-            image->fp16  ? DXGI_FORMAT_R16G16B16A16_FLOAT
-          : image->pix10 ? DXGI_FORMAT_R10G10B10A2_UNORM
-                         : DXGI_FORMAT_B8G8R8A8_UNORM,
-            image->pixels,
-            texture);
+   if (texture->desc.Format == src_format)
+   {
+      d3d11->context->lpVtbl->UpdateSubresource(d3d11->context,
+            (D3D11Resource)texture->handle, 0, NULL, image->pixels,
+            image->width * (image->fp16 ? 8 : 4), 0);
+      if (texture->desc.MiscFlags & D3D11_RESOURCE_MISC_GENERATE_MIPS)
+         d3d11->context->lpVtbl->GenerateMips(d3d11->context, texture->view);
+   }
+   else
+   {
+      /* Another format than the image's: converted on the way through
+       * the staging twin, without which there is no texture to hand out */
+      d3d11_init_staging(d3d11->device, texture);
+      if (!texture->staging)
+      {
+         d3d11_release_texture(texture);
+         free(texture);
+         return 0;
+      }
+      d3d11_update_texture(d3d11->context, image->width, image->height,
+            0, src_format, image->pixels, texture);
+   }
 
    return (uintptr_t)texture;
 }
@@ -6836,12 +7373,15 @@ static uintptr_t d3d11_gfx_load_texture_internal(
  * referencing via the ImmediateContext's pending command stream
  * can cause the GPU to access freed memory.  Running unload on
  * the video thread serialises it with the context's draw calls. */
-static void d3d11_gfx_unload_texture_internal(uintptr_t handle)
+static void d3d11_gfx_unload_texture_internal(d3d11_video_t *d3d11,
+      uintptr_t handle)
 {
    d3d11_texture_t* texture = (d3d11_texture_t*)handle;
 
    if (!texture)
       return;
+   if (d3d11)
+      d3d11_planar_forget(d3d11, handle);
 
    Release(texture->view);
    Release(texture->staging);
@@ -6861,7 +7401,7 @@ static uintptr_t d3d11_texture_load_wrap(void *data)
 static uintptr_t d3d11_texture_unload_wrap(void *data)
 {
    d3d11_texture_cmd_t *cmd = (d3d11_texture_cmd_t*)data;
-   d3d11_gfx_unload_texture_internal(cmd->handle);
+   d3d11_gfx_unload_texture_internal(cmd->d3d11, cmd->handle);
    return 0;
 }
 #endif
@@ -6901,8 +7441,9 @@ static uintptr_t d3d11_gfx_load_texture(
  * staging texture it kept is mapped and copied into the resource, as
  * for the first upload. Immediate-context work, so the video thread's
  * when the wrapper is up. */
-static bool d3d11_gfx_update_texture_internal(d3d11_video_t *d3d11,
-      uintptr_t handle, const struct texture_image *image)
+static enum video_texture_update d3d11_gfx_update_texture_internal(
+      d3d11_video_t *d3d11, uintptr_t handle,
+      const struct texture_image *image)
 {
    D3D11_MAPPED_SUBRESOURCE mapped;
    D3D11_BOX box;
@@ -6910,10 +7451,22 @@ static bool d3d11_gfx_update_texture_internal(d3d11_video_t *d3d11,
    d3d11_texture_t *texture = (d3d11_texture_t*)handle;
    HRESULT hr;
 
-   if (     !d3d11 || !texture || !texture->staging
+   if (d3d11 && image->planar)
+   {
+      d3d11_planar_t *p = d3d11->planar;
+      while (p && p->texture != texture)
+         p = p->next;
+      return p ? d3d11_planar_update(d3d11, p, image)
+               : VIDEO_TEXTURE_UPDATE_REFUSED;
+   }
+   if (     !d3d11 || !texture
          || texture->desc.Width  != image->width
          || texture->desc.Height != image->height)
-      return false;
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+   if (!texture->staging)
+      d3d11_init_staging(d3d11->device, texture);
+   if (!texture->staging)
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
 
    /* The staging texture the last update copied from may still be
     * the GPU's; a plain map would wait for it. This is a streaming
@@ -6922,9 +7475,9 @@ static bool d3d11_gfx_update_texture_internal(d3d11_video_t *d3d11,
    hr = ctx->lpVtbl->Map(ctx, (D3D11Resource)texture->staging, 0,
          D3D11_MAP_WRITE, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
    if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
-      return true;
+      return VIDEO_TEXTURE_UPDATE_DROPPED;
    if (FAILED(hr))
-      return false;
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
 
    dxgi_copy(image->width, image->height, texture->desc.Format, 0,
          image->pixels, texture->desc.Format, mapped.RowPitch, mapped.pData);
@@ -6940,25 +7493,25 @@ static bool d3d11_gfx_update_texture_internal(d3d11_video_t *d3d11,
          0, 0, 0, 0, (D3D11Resource)texture->staging, 0, &box);
    if (texture->desc.MiscFlags & D3D11_RESOURCE_MISC_GENERATE_MIPS)
       ctx->lpVtbl->GenerateMips(ctx, texture->view);
-   return true;
+   return VIDEO_TEXTURE_UPDATE_DONE;
 }
 
 #ifdef HAVE_THREADS
 static uintptr_t d3d11_texture_update_wrap(void *data)
 {
    d3d11_texture_cmd_t *cmd = (d3d11_texture_cmd_t*)data;
-   cmd->handle = d3d11_gfx_update_texture_internal(cmd->d3d11,
-         cmd->handle, cmd->image) ? cmd->handle : 0;
-   return 0;
+   return (uintptr_t)d3d11_gfx_update_texture_internal(cmd->d3d11,
+         cmd->handle, cmd->image);
 }
 #endif
 
-static bool d3d11_gfx_update_texture(void *video_data, uintptr_t id,
-      const struct texture_image *ti, bool threaded)
+static enum video_texture_update d3d11_gfx_update_texture(
+      void *video_data, uintptr_t id, const struct texture_image *ti,
+      bool threaded)
 {
    d3d11_video_t *d3d11 = (d3d11_video_t*)video_data;
-   if (!id || !ti || !ti->pixels)
-      return false;
+   if (!id || !ti || (!ti->pixels && !ti->planar))
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
 
 #ifdef HAVE_THREADS
    if (threaded)
@@ -6968,8 +7521,8 @@ static bool d3d11_gfx_update_texture(void *video_data, uintptr_t id,
       cmd.image       = (struct texture_image*)ti;
       cmd.filter_type = TEXTURE_FILTER_LINEAR;
       cmd.handle      = id;
-      video_thread_texture_handle(&cmd, d3d11_texture_update_wrap);
-      return cmd.handle != 0;
+      return (enum video_texture_update)video_thread_texture_handle(
+            &cmd, d3d11_texture_update_wrap);
    }
 #endif
 
@@ -6999,7 +7552,7 @@ static void d3d11_gfx_unload_texture(void* data,
    }
 #endif
 
-   d3d11_gfx_unload_texture_internal(handle);
+   d3d11_gfx_unload_texture_internal((d3d11_video_t*)data, handle);
 }
 
 /* --- the threaded wrapper's hardware ring ------------------------------ */
@@ -7236,6 +7789,10 @@ static bool d3d11_gfx_supports_texture_format(void* data,
     * level; load and update copy its rows as they are. */
    if (fmt == TEXTURE_GPU_FORMAT_RGBA16F)
       return v && v->device;
+   /* A compute shader's typed store to R8G8B8A8 is feature level 11 */
+   if (fmt == TEXTURE_GPU_FORMAT_YUV420)
+      return v && v->device && !v->planar_failed
+         && v->supportedFeatureLevel >= D3D_FEATURE_LEVEL_11_0;
 #ifdef HAVE_DXGI_HDR
    /* PSMainLinearHDR shows such a texture as linear scRGB while the
     * output is HDR; in SDR there is no linear light to show it in. */
@@ -7330,23 +7887,40 @@ static unsigned d3d11_get_swap_interval_cap(void *data)
    return 4;
 }
 
-/* A borderless fullscreen toggle. It used to restart every driver:
- * this one freed its device, shaders, swap chain and every texture
- * and made them all again, the audio driver stopped and
- * started, and a hardware-rendered core was told its context was gone
- * - for a change of the window's style and size. The window is
- * restyled where it stands instead (win32_window_set_fullscreen());
- * the size change reaches the driver through check_window like any
- * resize, and the swap chain's buffers are resized as they are when
- * the window's edge is dragged. Nothing else is touched.
- * RETROARCH_FULLSCREEN_IN_PLACE=0 turns it off. */
+/* Restyle the existing window and let check_window report its size.
+ * A failed display-mode change falls back to driver reinitialization. */
 #if defined(HAVE_WINDOW) && defined(HAVE_MONITOR)
 static void d3d11_set_video_mode(void *data, unsigned dims, bool fullscreen)
 {
    (void)data;
-   win32_window_set_fullscreen(dims, fullscreen);
+   if (!win32_window_set_fullscreen_exclusive(dims, fullscreen))
+      video_driver_modify_disp_flags(VIDEO_FLAG_DRIVER_REINIT, 0);
 }
 #endif
+
+/* The frame texture follows each frame's size already; the new format
+ * goes into its description and the next frame makes it again, as a
+ * new size would, with the history textures after it. */
+static bool d3d11_set_frame_format(void *data, bool rgb32,
+      unsigned input_scale)
+{
+   d3d11_video_t *d3d11 = (d3d11_video_t*)data;
+
+   (void)input_scale;
+   if (     !d3d11
+         || (d3d11->flags & D3D11_ST_FLAG_HW_IFACE_ENABLE)
+         || d3d11->format == DXGI_FORMAT_R10G10B10A2_UNORM)
+      return false;
+   d3d11->format = rgb32
+      ? DXGI_FORMAT_B8G8R8X8_UNORM : DXGI_FORMAT_B5G6R5_UNORM;
+   if (d3d11->frame.texture[0].desc.Format != d3d11->format)
+   {
+      d3d11->frame.texture[0].desc.Format = d3d11->format;
+      d3d11->frame.texture[0].desc.Width  = 0;
+      d3d11->flags                       |= D3D11_ST_FLAG_INIT_HISTORY;
+   }
+   return true;
+}
 
 static const video_poke_interface_t d3d11_poke_interface = {
    d3d11_get_flags,
@@ -7413,7 +7987,14 @@ static const video_poke_interface_t d3d11_poke_interface = {
    d3d11_hw_ring_context_free,
    NULL, /* hw_ring_framebuffer */
    d3d11_gfx_update_texture,
-   d3d11_get_swap_interval_cap
+   d3d11_get_swap_interval_cap,
+   NULL, /* texture_lend */
+   NULL, /* texture_lend_ready */
+   NULL, /* get_last_present_wait */
+   NULL, /* set_view_count */
+   NULL, /* hw_context_destroying */
+   NULL, /* get_headset_refresh */
+   d3d11_set_frame_format
 };
 
 static void d3d11_gfx_get_poke_interface(void* data,

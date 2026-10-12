@@ -407,7 +407,11 @@
 
 /* Video VSYNC (recommended) */
 #define DEFAULT_VSYNC true
-#define DEFAULT_SCANLINE_SYNC false
+
+/* Scanline Sync specific */
+#define DEFAULT_SCANLINE_SYNC        false
+#define DEFAULT_SCANLINE_SYNC_OFFSET 0
+#define MAXIMUM_SCANLINE_SYNC_OFFSET 3000
 
 /* Vulkan specific */
 #define DEFAULT_MAX_SWAPCHAIN_IMAGES 3
@@ -575,6 +579,12 @@
  * cores of a mixed-core part trades battery for latency, so it is
  * the user's call. */
 #define DEFAULT_THREAD_PREFER_FAST_CORES false
+
+/* Schedule the threaded video thread ahead of ordinary threads, never
+ * real time; the main thread, which can run unthrottled, only when
+ * asked. */
+#define DEFAULT_VIDEO_THREAD_PRIORITY true
+#define DEFAULT_MAIN_THREAD_PRIORITY false
 
 /* Set to true if HW render cores should get their private context. */
 #define DEFAULT_VIDEO_SHARED_CONTEXT false
@@ -1186,6 +1196,27 @@
 /* Record post-shaded GPU output instead of raw game footage if available. */
 #define DEFAULT_GPU_RECORD false
 
+/* Drop recorded video frames when the encoder queue is full, instead
+ * of stalling the frontend until it drains. */
+#define DEFAULT_VIDEO_RECORD_ALLOW_FRAME_DROP true
+
+/* Record only the game: GPU recordings leave out the menu, OSD,
+ * widgets and overlays, and menu time is left out of recordings. */
+#define DEFAULT_VIDEO_RECORD_GAME_ONLY false
+
+/* Use a hardware H.264 encoder for recording/streaming when the FFmpeg
+ * build has one that works, falling back to libx264. */
+#ifdef HAVE_LAKKA_SWITCH
+#define DEFAULT_VIDEO_RECORD_HW_ENCODER true
+#else
+#define DEFAULT_VIDEO_RECORD_HW_ENCODER false
+#endif
+
+/* Depth of the recording video queue, in frames. */
+#define DEFAULT_VIDEO_RECORD_FIFO_FRAMES 32
+#define MIN_VIDEO_RECORD_FIFO_FRAMES 8
+#define MAX_VIDEO_RECORD_FIFO_FRAMES 128
+
 /* Watch shader files for changes and auto-apply as necessary. */
 #define DEFAULT_VIDEO_SHADER_WATCH_FILES false
 
@@ -1397,6 +1428,12 @@
 #else
 #define DEFAULT_AUDIO_THREADED_PIPELINE false
 #endif
+
+/* The threaded pipeline's queue held to the frame-synchronous path's:
+ * see audio_driver_pipe_cap_frames(). Off, rate control holds the
+ * device near full with a publish on top, and an audio-paced core is
+ * held only by a full ring. */
+#define DEFAULT_AUDIO_PIPELINE_FILL_CAP true
 
 /* Ask the OS to schedule the audio thread ahead of the rest of the
  * frontend. Best effort: a system that refuses keeps the default
@@ -1850,6 +1887,15 @@
  * How far an axis must be tilted to result in a button press. */
 #define DEFAULT_AXIS_THRESHOLD 0.5f
 #define DEFAULT_ANALOG_DEADZONE 0.0f
+/* An analog trigger's or pressure-sensitive button's own deadzone, on
+ * its own travel. */
+#define DEFAULT_ANALOG_TRIGGER_DEADZONE 0.0f
+/* The sticks' outer deadzone (a tilt this close to the edge is full)
+ * and anti-deadzone (movement starts at this share of full). */
+#define DEFAULT_ANALOG_OUTER_DEADZONE 0.0f
+#define DEFAULT_ANALOG_ANTI_DEADZONE 0.0f
+/* The sticks' response curve: the tilt to this power (1 a straight line). */
+#define DEFAULT_ANALOG_RESPONSE_CURVE 1.0f
 #define DEFAULT_ANALOG_SENSITIVITY 1.0f
 #define DEFAULT_SENSOR_ACCELEROMETER_SENSITIVITY 1.0f
 #define DEFAULT_SENSOR_GYROSCOPE_SENSITIVITY 1.0f
@@ -2039,6 +2085,10 @@
 
 /* Only applies to Android 7.0 (API 24) and up */
 #define DEFAULT_SUSTAINED_PERFORMANCE_MODE false
+
+/* Windows: activate the low-latency copy of the power plan */
+#define DEFAULT_WIN32_POWER_PLAN false
+#define DEFAULT_WIN32_POWER_PLAN_IDLE_DISABLE false
 
 #if defined(ANDROID) || TARGET_OS_IPHONE
 #define DEFAULT_VIBRATE_ON_KEYPRESS true

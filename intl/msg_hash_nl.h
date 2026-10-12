@@ -1685,7 +1685,6 @@ static const struct
    char s_ccfe26d1[27];
    char s_728ca1d3[4];
    char s_5f612db6[11];
-   char s_9f29f708[22];
    char s_a9145c83[11];
    char s_22f52844[12];
    char s_06842e2b[16];
@@ -2136,6 +2135,10 @@ static const struct
    char s_4b582a0b[27];
    char s_4b582a0c[27];
    char s_95e4b29f[71];
+   char s_60258de0[7];
+   char s_caf61308[12];
+   char s_34b2592a[4];
+   char s_c7a27b20[12];
    char s_317b17ed[6];
    char s_94c8d15f[6];
    char s_de16b5d2[8];
@@ -3124,7 +3127,6 @@ static const struct
    char s_c7c09eb0[95];
    char s_7d4adfaf[33];
    char s_6f122164[42];
-   char s_61942cf6[57];
    char s_6b7e9271[97];
    char s_68b6e245[63];
    char s_3bb4fbf9[110];
@@ -5857,7 +5859,6 @@ static const struct
    "Schalen in gehele getallen",
    "UIT",
    "Favorieten",
-   "Configuratiebestanden",
    "Kleurthema",
    "Appel Groen",
    "Klassieke blauw",
@@ -6309,6 +6310,10 @@ static const struct
    "OSD Berichten X-as positie",
    "OSD Berichten Y-as positie",
    "Volledig scherm inschakelen over de notch op Android- en iOS-apparaten",
+   "Altijd",
+   "Automatisch",
+   "UIT",
+   "Automatisch",
    "180\302\272",
    "270\302\272",
    "Normaal",
@@ -7607,7 +7612,6 @@ static const struct
    "Het aantal frames om terug te spoelen per stap. Hogere waarden verhogen de terugspoelsnelheid.",
    "Terugspoelinstellingen wijzigen.",
    "Stel de startmap in voor bestandsbrowser.",
-   "Standaard configuratiebestand is opgeslagen in deze map.",
    "Kies een ander kleurenthema. Door 'Aangepast' wordt het menuthema-preset bestanden ingeschakeld.",
    "Selecteer een menu thema voorinstelling in de bestandsbrowser.",
    "Toon opstartscherm in het menu. Dit wordt automatisch uitgeschakeld nadat het programma voor het"
@@ -8642,7 +8646,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_nl_blob_check[
-      (sizeof(msg_hash_nl_blob) == (173425u
+      (sizeof(msg_hash_nl_blob) == (173381u
 #ifdef ANDROID
        + 375u
 #endif
@@ -10758,7 +10762,6 @@ static const uint32_t msg_hash_nl_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_INTEGER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_APPLE_GREEN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_CLASSIC_BLUE,
@@ -11209,6 +11212,10 @@ static const uint32_t msg_hash_nl_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_X,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_Y,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_NOTCH_WRITE_OVER,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_AUTO,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_OFF,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_AUTO,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED_ROTATED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_NORMAL,
@@ -12197,7 +12204,6 @@ static const uint32_t msg_hash_nl_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_GRANULARITY,
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_SUBLABEL_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_THEME_PRESET,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_SHOW_START_SCREEN,

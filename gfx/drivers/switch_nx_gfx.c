@@ -106,8 +106,7 @@ static void *switch_font_init(void *data, const char *font_path,
    font->atlas = font->font_driver->get_atlas(font->font_data);
    /* The atlas may grow; glyphs are blitted from it in memory, so
     * there is no texture to make again */
-   font->atlas->max_width  = 2048;
-   font->atlas->max_height = 2048;
+   font->atlas->max_dims = VIDEO_SCALE_PACK(2048, 2048);
 
    return font;
 }
@@ -180,10 +179,10 @@ static void switch_font_render_message(
       int ty; \
       int off_x  = x + (glyph)->draw_offset_x + (pen_x); \
       int off_y  = y + (glyph)->draw_offset_y + (pen_y); \
-      int g_w    = (glyph)->width; \
-      int g_h    = (glyph)->height; \
-      int tex_x  = (glyph)->atlas_offset_x; \
-      int tex_y  = (glyph)->atlas_offset_y; \
+      int g_w    = VIDEO_SCALE_W((glyph)->dims); \
+      int g_h    = VIDEO_SCALE_H((glyph)->dims); \
+      int tex_x  = VIDEO_SCALE_W((glyph)->atlas_pos); \
+      int tex_y  = VIDEO_SCALE_H((glyph)->atlas_pos); \
       if (!line_ok) \
          break; \
       for (ty = tex_y; ty < tex_y + g_h; ty++) \
@@ -389,8 +388,7 @@ static void clear_screen(switch_video_t *sw)
     framebufferEnd(&sw->fb);
 }
 
-static void *switch_init(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+static void *switch_init(const video_info_t *video)
 {
     switch_video_t *sw = (switch_video_t *)calloc(1, sizeof(*sw));
     if (!sw)
@@ -428,7 +426,7 @@ static void *switch_init(const video_info_t *video,
     /* Autoselect driver */
     /* no input driver of this driver's own: the frontend starts the
      * platform's */
-    input_driver_left_to_frontend(INPUT_WINDOW_PLATFORM, input, input_data);
+    input_driver_video_window(INPUT_WINDOW_PLATFORM, NULL);
 
 
     clear_screen(sw);

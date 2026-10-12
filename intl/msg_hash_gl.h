@@ -1858,7 +1858,6 @@ static const struct
    char s_ccfe26d1[15];
    char s_728ca1d3[8];
    char s_5f612db6[19];
-   char s_9f29f708[27];
    char s_a9145c83[12];
    char s_22f52844[12];
    char s_b46ad5d0[10];
@@ -2325,6 +2324,8 @@ static const struct
    char s_4b582a0c[38];
    char s_61213f1d[21];
    char s_95e4b29f[71];
+   char s_60258de0[7];
+   char s_34b2592a[12];
    char s_57665cff[7];
    char s_0e2c0fca[44];
    char s_93ac5ec8[42];
@@ -2571,7 +2572,6 @@ static const struct
    char s_f46c7b83_1[124];
    char s_cb67f2a4[32];
    char s_3c3598a9[53];
-   char s_3bac47bd[446];
    char s_90e7db40[463];
    char s_b07cd572_0[499];
    char s_b07cd572_1[46];
@@ -3420,7 +3420,6 @@ static const struct
    char s_c7c09eb0[106];
    char s_7d4adfaf[34];
    char s_6f122164[66];
-   char s_61942cf6[74];
    char s_6b7e9271[124];
    char s_68b6e245[68];
    char s_3bb4fbf9[133];
@@ -4067,6 +4066,7 @@ static const struct
    char s_543fcabd[16];
    char s_59212b5f[14];
    char s_f26b6cff[39];
+   char s_a63c824a[13];
    char s_a9f3b2c3[23];
    char s_0e7aca8a[24];
    char s_ab1afe7c[22];
@@ -6447,7 +6447,6 @@ static const struct
    "Escala enteira",
    "Apagado",
    "Directorio inicial",
-   "Ficheiro de configuraci\303\263n",
    "Cor do tema",
    "Apple Verde",
    "Brogramas",
@@ -6916,6 +6915,8 @@ static const struct
    "Posici\303\263n de notificaci\303\263n (vertical)",
    "\303\215ndice de monitores",
    "Activa a pantalla completa sobre o notch en dispositivos Android e iOS",
+   "Sempre",
+   "Desactivado",
    "Sa\303\255da",
    "Correcci\303\263n de sobreexploraci\303\263n (inferior)",
    "Correcci\303\263n de sobreexploraci\303\263n (arriba)",
@@ -7235,11 +7236,6 @@ static const struct
    "\303\263n mostra a frecuencia como \302\253Receptor\302\273.",
    "Sincronizar audio. Recomendado.",
    "Acalar a configuraci\303\263n de sincronizaci\303\263n de audio.",
-   "Remostrar, filtrar e mesturar o son no f\303\255o de son en troques de facelo dentro de cada fot"
-   "ograma. Ten a mesma latencia co fluxo sincronizado cos fotogramas con calquera valor de Latencia"
-   " de son, cun control da frecuencia medido ao ritmo propio do dispositivo e co remostreador f\303"
-   "\263ra do orzamento temporal dos fotogramas. Os controladores de son que non poden espertar segu"
-   "ndo o ritmo do dispositivo mante\303\261en o fluxo sincronizado cos fotogramas.",
    "Solicitar ao sistema operativo que planifique o f\303\255o de son por diante do resto do fronten"
    "d, para cun fotograma ocupado te\303\261a menos posibilidades de deixar sen servizo o dispositiv"
    "o de son. Permite reducir \302\253Latencia de son\302\273 nos sistemas co permiten; se o sistema"
@@ -8559,7 +8555,6 @@ static const struct
    "cidade de rebobinado.",
    "Cambiar os axustes de rebobinado.",
    "Establecer o directorio de inicio para o explorador de ficheiros.",
-   "O ficheiro de configuraci\303\263n predeterminado almac\303\251nase neste directorio.",
    "Selecciona un tema de cor diferente. Ao escoller \"Personalizado\" permite o uso de ficheiros pr"
    "edefinidos de temas de men\303\272.",
    "Seleccione un tema de men\303\272 predefinido no Explorador de ficheiros.",
@@ -9471,6 +9466,7 @@ static const struct
    "Tempo de espera",
    "Truco entrada",
    "Introduza o nome do ficheiro de trucos",
+   "Instant\303\241neo",
    "Introducir contrasinal",
    "Contrasinal incorrecto.",
    "Contrasinal correcto.",
@@ -9780,7 +9776,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_gl_blob_check[
-      (sizeof(msg_hash_gl_blob) == (212715u
+      (sizeof(msg_hash_gl_blob) == (212200u
 #ifdef ANDROID
        + 365u
 #endif
@@ -12082,7 +12078,6 @@ static const uint32_t msg_hash_gl_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_INTEGER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_APPLE_GREEN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_BROGRAMMER,
@@ -12549,6 +12544,8 @@ static const uint32_t msg_hash_gl_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_Y,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MONITOR_INDEX,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_NOTCH_WRITE_OVER,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_OFF,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OUTPUT_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OVERSCAN_CORRECTION_BOTTOM,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OVERSCAN_CORRECTION_TOP,
@@ -12790,7 +12787,6 @@ static const uint32_t msg_hash_gl_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_SINK_RATE_ESTIMATION,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_SYNC,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_SYNCHRONIZATION_SETTINGS,
-   (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_THREADED_PIPELINE,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_THREAD_PRIORITY,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_TIME_STRETCH,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_TIME_STRETCH_LOWPASS,
@@ -13638,7 +13634,6 @@ static const uint32_t msg_hash_gl_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_GRANULARITY,
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_SUBLABEL_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_THEME_PRESET,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_SHOW_START_SCREEN,
@@ -14284,6 +14279,7 @@ static const uint32_t msg_hash_gl_ids[] =
    (uint32_t)MSG_INPUT_BIND_TIMEOUT,
    (uint32_t)MSG_INPUT_CHEAT,
    (uint32_t)MSG_INPUT_CHEAT_FILENAME,
+   (uint32_t)MSG_INPUT_COMBO_INSTANT,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_NOK,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_OK,

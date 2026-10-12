@@ -32,6 +32,7 @@
 #include <formats/image.h>
 
 #include "../video_driver.h"
+#include "gl_common.h"
 
 RETRO_BEGIN_DECLS
 
@@ -128,6 +129,8 @@ struct gl2
    GLuint pbo;
    GLuint *overlay_tex;
    GLuint menu_texture;
+   /* Sampled by a quad drawn with no texture: solid colour */
+   GLuint white_texture;
    /* Copy of the last presented backbuffer, taken with
     * glCopyTexSubImage2D before the swap of a frame() that asked for it
     * (retain_output), plus the group that frame put on screen for
@@ -145,6 +148,7 @@ struct gl2
     * this thread to wait before reading it. Sync objects are shared
     * between the two contexts. */
    void *hw_ring_sync[3];
+   void *hw_ring_done_sync; /* taken ahead of the swap */
 
    uint32_t flags;
 
@@ -183,7 +187,15 @@ struct gl2
    struct video_fbo_rect fbo_rect[GFX_MAX_SHADERS];   /* unsigned alignment */
 
    char device_str[128];
+#ifdef HAVE_GL_TEXTURE_LEND
+   gl_texture_lend_t *lend;
+#endif
+#ifdef HAVE_GL_PLANAR
+   gl_planar_t planar;
+#endif
    bool pbo_readback_valid[4];
+   /* At init: textures take half floats (TEXTURE_GPU_FORMAT_RGBA16F) */
+   bool fp16_textures;
    /* scRGB (FP16) default framebuffer support (Windows/WGL HDR):
     * everything renders into this SDR offscreen and one GLSL 1.20
     * pass encodes it into the FP16 backbuffer at end of frame.
@@ -206,7 +218,21 @@ struct gl2
       GLint    loc_mode;
       GLint    loc_ui_nits;
       GLint    loc_out_pq;
+      /* Draws a half-float texture, linear scRGB, into the SDR layer
+       * as the encode's inverse (gl2_linear_program) */
+      GLuint   lin_program;
+      GLint    lin_loc_mvp;
+      GLint    lin_loc_tex;
+      GLint    lin_loc_params;
+      bool     lin_tried;
       bool   active;
+      /* At init: the SDR layer can be RGBA16F, so a linear texture
+       * keeps what is above menu white (TEXTURE_GPU_FORMAT_SCRGB) */
+      bool     fp16_ok;
+      /* The layer the UI draws into is RGBA16F */
+      bool     tex_fp16;
+      /* The layers were last made for an RGBA16F UI layer */
+      bool     fp16_made;
       /* The backbuffer is 10-bit Rec.2020 PQ, not FP16 scRGB */
       bool   pq_out;
       /* The HDR settings this frame carried (video_frame_info_t), so the

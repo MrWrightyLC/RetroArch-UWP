@@ -583,6 +583,48 @@ void image_transfer_set_want_10bit(void *data, enum image_type_enum type,
 }
 
 
+/* Ask a video still for linear scRGB half floats from an HDR (PQ or
+ * HLG) source, 8 bytes a pixel in the frame process hands out; a no-op
+ * for every other type, and for an SDR source of these. */
+void image_transfer_set_want_fp16(void *data, enum image_type_enum type,
+      bool want)
+{
+   switch (type)
+   {
+#ifdef HAVE_RWEBM
+      case IMAGE_TYPE_WEBM:
+         rwebm_video_set_want_fp16((rwebm_video_t*)data, want);
+         break;
+#endif
+#ifdef HAVE_RMP4
+      case IMAGE_TYPE_MP4:
+         rmp4_video_set_want_fp16((rmp4_video_t*)data, want);
+         break;
+#endif
+      default:
+         break;
+   }
+}
+
+/* Whether the last processed frame came out as half floats. */
+bool image_transfer_is_fp16(void *data, enum image_type_enum type)
+{
+   switch (type)
+   {
+#ifdef HAVE_RWEBM
+      case IMAGE_TYPE_WEBM:
+         return rwebm_video_is_fp16((const rwebm_video_t*)data);
+#endif
+#ifdef HAVE_RMP4
+      case IMAGE_TYPE_MP4:
+         return rmp4_video_is_fp16((const rmp4_video_t*)data);
+#endif
+      default:
+         break;
+   }
+   return false;
+}
+
 /* Report whether the last processed frame was actually written as
  * packed XRGB2101010 rather than 8-bit RGBA, i.e. 10-bit was requested
  * and the source could supply it.  False for every type that cannot
@@ -968,6 +1010,80 @@ bool image_transfer_anim_stream_set_output(void *stream,
          /* APNG and WEBP compose each frame on a persistent canvas
           * that the next frame is built from: their frames come out
           * of the canvas. */
+         break;
+   }
+   return false;
+}
+
+/* The video streams give an HDR source as linear scRGB half floats
+ * into the caller's frame; nothing else has a source that is HDR. */
+void image_transfer_anim_stream_set_want_fp16(void *stream,
+      enum image_type_enum type, bool want)
+{
+   switch (type)
+   {
+      case IMAGE_TYPE_WEBM:
+#ifdef HAVE_RWEBM
+         rwebm_video_stream_set_want_fp16((rwebm_video_stream_t*)stream,
+               want);
+#endif
+         break;
+      case IMAGE_TYPE_MP4:
+#ifdef HAVE_RMP4
+         rmp4_video_stream_set_want_fp16((rmp4_video_stream_t*)stream,
+               want);
+#endif
+         break;
+      default:
+         break;
+   }
+}
+
+bool image_transfer_anim_stream_is_fp16(const void *stream,
+      enum image_type_enum type)
+{
+   switch (type)
+   {
+      case IMAGE_TYPE_WEBM:
+#ifdef HAVE_RWEBM
+         return rwebm_video_stream_is_fp16(
+               (const rwebm_video_stream_t*)stream) != 0;
+#else
+         break;
+#endif
+      case IMAGE_TYPE_MP4:
+#ifdef HAVE_RMP4
+         return rmp4_video_stream_is_fp16(
+               (const rmp4_video_stream_t*)stream) != 0;
+#else
+         break;
+#endif
+      default:
+         break;
+   }
+   return false;
+}
+
+bool image_transfer_anim_stream_is_hdr(const void *stream,
+      enum image_type_enum type)
+{
+   switch (type)
+   {
+      case IMAGE_TYPE_WEBM:
+#ifdef HAVE_RWEBM
+         return rwebm_video_stream_is_hdr(
+               (const rwebm_video_stream_t*)stream) != 0;
+#else
+         break;
+#endif
+      case IMAGE_TYPE_MP4:
+#ifdef HAVE_RMP4
+         return rmp4_video_stream_is_hdr(
+               (const rmp4_video_stream_t*)stream) != 0;
+#else
+         break;
+#endif
+      default:
          break;
    }
    return false;

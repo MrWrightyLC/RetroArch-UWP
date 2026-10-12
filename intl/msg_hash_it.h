@@ -1725,7 +1725,6 @@ static const struct
    char s_ccfe26d1[13];
    char s_728ca1d3[12];
    char s_5f612db6[21];
-   char s_9f29f708[23];
    char s_a9145c83[16];
    char s_22f52844[11];
    char s_06842e2b[13];
@@ -2174,6 +2173,8 @@ static const struct
    char s_4b582a0c[39];
    char s_61213f1d[19];
    char s_95e4b29f[65];
+   char s_60258de0[7];
+   char s_34b2592a[12];
    char s_317b17ed[10];
    char s_94c8d15f[10];
    char s_de16b5d2[8];
@@ -2215,6 +2216,8 @@ static const struct
    char s_69b801ef[13];
    char s_a40653a7[34];
    char s_52e3d6ea[41];
+   char s_2c868ae4[12];
+   char s_9c535394[10];
    char s_a9c8430e[13];
    char s_f5911f43[20];
    char s_9017e0d3[14];
@@ -3162,7 +3165,6 @@ static const struct
    char s_c7c09eb0[119];
    char s_7d4adfaf[44];
    char s_6f122164[55];
-   char s_61942cf6[74];
    char s_6b7e9271[115];
    char s_68b6e245[74];
    char s_3bb4fbf9[132];
@@ -3762,6 +3764,7 @@ static const struct
    char s_b0e45a57[27];
    char s_59212b5f[13];
    char s_f26b6cff[33];
+   char s_a63c824a[11];
    char s_a9f3b2c3[19];
    char s_0e7aca8a[17];
    char s_ab1afe7c[19];
@@ -5965,7 +5968,6 @@ static const struct
    "Scala Intera",
    "Disattivato",
    "Cartella predefinita",
-   "File di configurazione",
    "Colore del Tema",
    "Mela Verde",
    "Blu Classico",
@@ -6415,6 +6417,8 @@ static const struct
    "Posizione Y delle notifiche su schermo",
    "Indice del monitor",
    "Abilita schermo intero sopra notch nei dispositivi Android e iOS",
+   "Sempre",
+   "Disattivato",
    "180 gradi",
    "270 gradi",
    "Normale",
@@ -6456,6 +6460,8 @@ static const struct
    "Ridimensiona",
    "Sincronizzazione tramite Scanline",
    "Simulazione di righe di scansione mobili",
+   "Orizzontale",
+   "Verticale",
    "Shader video",
    "Ritardo auto-shader",
    "Shaders video",
@@ -7744,7 +7750,6 @@ static const struct
    "elocit\303\240 del riavvolgimento.",
    "Modifica le impostazioni di riavvolgimento.",
    "Imposta la directory iniziale per l'esplorazione file.",
-   "Il file di configurazione predefinito \303\250 memorizzato in questa directory.",
    "Selezionare un tema di colore diverso. Scegliendo 'Personalizzato' si abilita l'uso di file pred"
    "efiniti tema menu.",
    "Selezionare una preimpostazione del tema del menu dall'esplorazione file.",
@@ -8509,6 +8514,7 @@ static const struct
    "Rilascia tasti e pulsanti!",
    "Input Trucco",
    "Immettere il nome del file cheat",
+   "Istantaneo",
    "Inserisci Password",
    "Password errata.",
    "Password corretta.",
@@ -8809,7 +8815,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_it_blob_check[
-      (sizeof(msg_hash_it_blob) == (183050u
+      (sizeof(msg_hash_it_blob) == (183005u
 #ifdef ANDROID
        + 376u
 #endif
@@ -10963,7 +10969,6 @@ static const uint32_t msg_hash_it_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_INTEGER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_APPLE_GREEN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_CLASSIC_BLUE,
@@ -11412,6 +11417,8 @@ static const uint32_t msg_hash_it_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_Y,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MONITOR_INDEX,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_NOTCH_WRITE_OVER,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_OFF,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED_ROTATED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_NORMAL,
@@ -11453,6 +11460,8 @@ static const uint32_t msg_hash_it_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCALING_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCANLINE_SYNC,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCAN_SUBFRAMES,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_HORIZONTAL,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_VERTICAL,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADERS_ENABLE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_DELAY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_DIR,
@@ -12400,7 +12409,6 @@ static const uint32_t msg_hash_it_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_GRANULARITY,
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_SUBLABEL_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_THEME_PRESET,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_SHOW_START_SCREEN,
@@ -13000,6 +13008,7 @@ static const uint32_t msg_hash_it_ids[] =
    (uint32_t)MSG_INPUT_BIND_RELEASE,
    (uint32_t)MSG_INPUT_CHEAT,
    (uint32_t)MSG_INPUT_CHEAT_FILENAME,
+   (uint32_t)MSG_INPUT_COMBO_INSTANT,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_NOK,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_OK,

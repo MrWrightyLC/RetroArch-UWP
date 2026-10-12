@@ -348,8 +348,7 @@ static void oga_free(void *data)
    vid = NULL;
 }
 
-static void *oga_init(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+static void *oga_init(const video_info_t *video)
 {
    int i;
    oga_video_t *vid                     = NULL;
@@ -362,7 +361,7 @@ static void *oga_init(const video_info_t *video,
 
    /* no input driver of this driver's own: there is no window system
     * here, and the frontend starts the one that goes with that */
-   input_driver_left_to_frontend(INPUT_WINDOW_KMS, input, input_data);
+   input_driver_video_window(INPUT_WINDOW_KMS, NULL);
 
    vid = (oga_video_t*)calloc(1, sizeof(*vid));
    if (!vid)
@@ -424,8 +423,7 @@ static void *oga_init(const video_info_t *video,
           * holds; the glyphs are blitted from it in memory, so there is
           * no texture to make again */
          struct font_atlas *grow = vid->font_driver->get_atlas(vid->font);
-         grow->max_width  = 2048;
-         grow->max_height = 2048;
+         grow->max_dims = VIDEO_SCALE_PACK(2048, 2048);
       }
    }
 
@@ -516,7 +514,7 @@ static bool render_msg(oga_video_t* vid, const char* msg)
 #define FONT_LAYOUT_GLYPH(g, pen_x, pen_y) \
       do \
       { \
-         int x, y; \
+         int x, y, drawn; \
          uint32_t* dest        = NULL; \
          const uint8_t *source = NULL; \
          (void)(pen_x); \
@@ -524,31 +522,35 @@ static bool render_msg(oga_video_t* vid, const char* msg)
          if (full) \
             break; \
          if (vid->msg_height == 0) \
-            vid->msg_height = (g)->height; \
+            vid->msg_height = VIDEO_SCALE_H((g)->dims); \
          if (dest_x + (g)->advance_x > surf_w) \
          { \
             dest_x           = 0; \
-            dest_y          += (g)->height; \
-            vid->msg_height += (g)->height; \
+            dest_y          += VIDEO_SCALE_H((g)->dims); \
+            vid->msg_height += VIDEO_SCALE_H((g)->dims); \
          } \
          if (     (g)->advance_x > surf_w \
-               || dest_y + (int)(g)->height > surf_h) \
+               || dest_y + (int)VIDEO_SCALE_H((g)->dims) > surf_h) \
          { \
             full = true; \
             break; \
          } \
-         source = atlas->buffer + (g)->atlas_offset_y * \
-            atlas->width  + (g)->atlas_offset_x; \
+         source = atlas->buffer + VIDEO_SCALE_H((g)->atlas_pos) * \
+            atlas->width  + VIDEO_SCALE_W((g)->atlas_pos); \
          dest   = fb + dest_y * dest_stride + dest_x; \
-         for (y = 0; y < (int)(g)->height; y++) \
+         /* The glyph's texels up to its advance, then clear ones */ \
+         drawn  = MIN((int)VIDEO_SCALE_W((g)->dims), (g)->advance_x); \
+         for (y = 0; y < (int)VIDEO_SCALE_H((g)->dims); y++) \
          { \
-            for (x = 0; x < (int)(g)->advance_x; x++) \
+            for (x = 0; x < drawn; x++) \
             { \
-               uint32_t px = (x < (int)(g)->width) ? *(source++) : 0x00; \
-               *(dest++)   = (0xCD << 24) | (px << 16) | (px << 8) | px; \
+               uint32_t px = source[x]; \
+               dest[x]     = (0xCDu << 24) | (px * 0x010101u); \
             } \
-            dest   += dest_stride - (g)->advance_x; \
-            source += atlas->width - (g)->width; \
+            for (; x < (g)->advance_x; x++) \
+               dest[x]     = 0xCDu << 24; \
+            dest   += dest_stride; \
+            source += atlas->width; \
          } \
          dest_x += (g)->advance_x; \
          if (vid->msg_width < dest_x) \

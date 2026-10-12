@@ -7512,7 +7512,7 @@ MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_HDR_EXPAND_GAMUT_SUPER,
    "Super"
    )
-/* GENERATED REGION: HDR toggle group (see settings_def_video_hdr_toggles.h). */
+/* GENERATED REGION: HDR toggle group, stereo 3D & screens group and headset group (see settings_def_video_hdr_toggles.h, settings_def_video_stereo.h and settings_def_video_headset.h). */
 #define SETTINGS_DEF_STRINGS_PASS
 #define S_BOOL(f, T, n, d, sd, df, c, us, sub) \
 MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us) \
@@ -7590,6 +7590,8 @@ MSG_HASH(MENU_ENUM_SUBLABEL_##T, sub)
 #define S_ACTION_EX_NS(T, n, sd, ok, rp, c, us) \
 MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us)
 #include "../settings/settings_def_video_hdr_toggles.h"
+#include "../settings/settings_def_video_stereo.h"
+#include "../settings/settings_def_video_headset.h"
 #undef S_BOOL
 #undef S_BOOL_NS
 #undef S_BOOL_H
@@ -7687,6 +7689,66 @@ MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_HDR_SUBPIXEL_LAYOUT_BGR,
    "BGR"
    )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_STEREO_MODE_2D,
+   "2D"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_STEREO_MODE_SBS_HALF,
+   "Side by Side (Half)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_STEREO_MODE_SBS_FULL,
+   "Side by Side (Full)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_STEREO_MODE_TOP_BOTTOM,
+   "Top-Bottom"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_STEREO_MODE_ANAGLYPH,
+   "Anaglyph (Red/Cyan)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_STEREO_MODE_INTERLACED,
+   "Interlaced"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_VERTICAL,
+   "Vertical"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_HORIZONTAL,
+   "Horizontal"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_CONTROLLERS_COMBINED,
+   "Combined"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_CONTROLLERS_SEPARATE,
+   "Separate"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_AUTO,
+   "Auto"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
+   "Always"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_OFF,
+   "Off"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_AUTO,
+   "Auto"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_HEADSET,
+   "Headset's Choice"
+   )
 
 
 /* Settings > Video > Synchronization */
@@ -7728,14 +7790,6 @@ MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us)
 #undef S_FLOAT
 #undef S_FLOAT_NS
 #undef SETTINGS_DEF_STRINGS_PASS
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_VIDEO_SCANLINE_SYNC,
-   "Scanline Sync"
-   )
-MSG_HASH(
-   MENU_ENUM_SUBLABEL_VIDEO_SCANLINE_SYNC,
-   "Synchronize video presentation to scanline position prediction based on core time. Requirements: VSync off, Frame Delay off, display Hz near 1x core FPS and GPU at max clocks."
-   )
 /* GENERATED REGION: frame delay group (see settings_def_frame_delay.h). */
 #define SETTINGS_DEF_STRINGS_PASS
 #define S_BOOL(f, T, n, d, sd, df, c, us, sub) \
@@ -12262,6 +12316,22 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_META_VIDEO_FILTER_TOGGLE,
    "Switches software 'Video Filter' on/off."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_META_HEADSET_RECENTER,
+   "Recenter Headset Screens"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_META_HEADSET_RECENTER,
+   "Places the headset's screens in front of where you are looking now."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_META_LASER_POINTER_TOGGLE,
+   "Laser Pointer (Toggle)"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_META_LASER_POINTER_TOGGLE,
+   "Switches the headset's Laser Pointer between Off and its last mode."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_META_FPS_TOGGLE,
@@ -24861,6 +24931,30 @@ MSG_HASH(
    "Find a Button by Pressing It"
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_COMBO_TARGET,
+   "What the Combination Does"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_COMBO_TARGET,
+   "What happens when all of the combination's buttons are held down together: any hotkey, a command that has no hotkey, or one of your macros. The buttons still reach the game as well."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_COMBO_HOLD,
+   "Response Time"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_COMBO_HOLD,
+   "Instant acts the moment all of the buttons are down. Hold For waits until they have been held together for a time you choose next, so that pressing them briefly - in the middle of a game, say - does nothing."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_COMBO_HOLD_TIME,
+   "Hold For"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_COMBO_HOLD_TIME,
+   "How long all of the combination's buttons must be held down together before it acts."
+   )
+MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_REMAP_FIND,
    "Press a button or push a stick on this port's controller, or a key bound to one, and the list below jumps to it."
    )
@@ -30401,7 +30495,10 @@ MSG_HASH(
    MENU_ENUM_LABEL_VALUE_OZONE_COLOR_THEME_SELENIUM,
    "Selenium"
    )
-
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_OZONE_COLOR_THEME_BRIGHT,
+   "Bright"
+   )
 
 /* MaterialUI: Settings > User Interface > Appearance */
 
@@ -31551,6 +31648,22 @@ MSG_HASH( /* Under either of those two entries. %s is the input driver's name */
    MENU_ENUM_LABEL_VALUE_INPUT_SYSTEM_DEVICE_INFO,
    "The \"%s\" input driver reads these as one device and cannot tell them apart."
    )
+MSG_HASH( /* An entry of Information > Input Information: this computer's Bluetooth adapter. The first %s is its name, such as "hci0"; the second its address */
+   MENU_ENUM_LABEL_VALUE_BLUETOOTH_HOST_INFO,
+   "Bluetooth: %s (%s)"
+   )
+MSG_HASH( /* Under a controller's entry in Information > Input Information: the Bluetooth address the controller connects to when unplugged, such as a DualShock 3's */
+   MENU_ENUM_LABEL_VALUE_PORT_BT_HOST,
+   "- Connects over Bluetooth to: %s"
+   )
+MSG_HASH( /* The same, when that address is this computer's */
+   MENU_ENUM_LABEL_VALUE_PORT_BT_HOST_THIS,
+   "- Connects over Bluetooth to: This Computer (%s)"
+   )
+MSG_HASH( /* Under the same entry: selecting it makes the controller connect to this computer over Bluetooth when it is unplugged */
+   MENU_ENUM_LABEL_VALUE_PORT_BT_PAIR,
+   "- Pair with This Computer"
+   )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_CHEAT_SETTINGS,
    "Cheat Settings"
@@ -32687,6 +32800,14 @@ MSG_HASH(
    "Failed to initialize netplay."
    )
 MSG_HASH(
+   MSG_TLS_VERIFY_FAILED,
+   "Secure connection refused: the server's certificate could not be verified. See the log, or the 'TLS Certificate Verification' setting."
+   )
+MSG_HASH(
+   MSG_TLS_VERIFY_DISABLED,
+   "TLS certificate verification is disabled. Secure connections are not checked and can be intercepted."
+   )
+MSG_HASH(
    MSG_NETPLAY_UNSUPPORTED,
    "Core does not support netplay."
    )
@@ -32747,6 +32868,10 @@ MSG_HASH(
    "Recording terminated due to resize."
    )
 MSG_HASH(
+   MSG_RECORDING_GAME_ONLY_UNSUPPORTED,
+   "This video driver can't Record Game Only: the menu and messages are recorded."
+   )
+MSG_HASH(
    MSG_RECORDING_TO,
    "Recording to"
    )
@@ -32777,6 +32902,42 @@ MSG_HASH(
 MSG_HASH(
    MSG_INPUT_REMAP_FIND_PRESS,
    "Press a button or push a stick on the controller of Port %u\n(Timeout %u seconds)"
+   )
+MSG_HASH( /* %u is the controller's port */
+   MSG_INPUT_BT_PAIRED,
+   "Port %u's controller will connect to this computer over Bluetooth when unplugged."
+   )
+MSG_HASH(
+   MSG_INPUT_BT_PAIR_FAILED,
+   "Port %u's controller could not be paired with this computer."
+   )
+MSG_HASH(
+   MSG_INPUT_COMBO_SET_BUTTONS,
+   "Set Buttons"
+   )
+MSG_HASH(
+   MSG_INPUT_COMBO_CHOOSE_ACTION,
+   "Choose Action"
+   )
+MSG_HASH(
+   MSG_INPUT_COMBO_INSTANT,
+   "Instant"
+   )
+MSG_HASH(
+   MSG_INPUT_COMBO_HOLD_SECONDS,
+   "%s Seconds"
+   )
+MSG_HASH(
+   MSG_INPUT_COMBO_HOLD_FOR,
+   "Hold For"
+   )
+MSG_HASH(
+   MSG_INPUT_COMBO_ROW_SUBLABEL,
+   "Buttons held together that set off a hotkey, a command or a macro. Right: hold the buttons to use, then choose what they do. Left: choose what they do. OK: type it. Start: remove it."
+   )
+MSG_HASH(
+   MSG_INPUT_MACRO_ROW_SUBLABEL,
+   "Buttons pressed for you a step at a time, each held for a number of the game's frames, written as \"down 2, down+right 2, a 4\". A combination sets it off. Start: remove it."
    )
 MSG_HASH(
    MSG_REMOVING_TEMPORARY_CONTENT_FILE,
@@ -33767,6 +33928,14 @@ MSG_HASH(
    "Failed to enter GameMode"
    )
 MSG_HASH(
+   MSG_FAILED_TO_APPLY_POWER_PLAN,
+   "Failed to activate the low-latency power plan"
+   )
+MSG_HASH(
+   MSG_FAILED_TO_DISABLE_IDLE_STATES,
+   "Failed to disable processor idle states"
+   )
+MSG_HASH(
    MSG_FAILED_TO_ENTER_GAMEMODE_LINUX,
    "Failed to enter GameMode - ensure GameMode daemon is installed/running"
    )
@@ -33789,6 +33958,30 @@ MSG_HASH(
 MSG_HASH(
    MSG_VIDEO_FILTER_ENABLE_OFF,
    "Video-Filter: Disable"
+   )
+MSG_HASH(
+   MSG_OPENXR_UNAVAILABLE,
+   "Headset output is off: no OpenXR runtime or headset was found."
+   )
+MSG_HASH(
+   MSG_OPENXR_FAILED,
+   "Headset output could not start. The window shows the output."
+   )
+MSG_HASH(
+   MSG_OPENXR_SESSION_ENDED,
+   "The headset session ended. Turn Headset Output off and on to try again."
+   )
+MSG_HASH(
+   MSG_OPENXR_NEEDS_RELOAD,
+   "Headset output starts when the content is loaded again."
+   )
+MSG_HASH(
+   MSG_OPENXR_RATE_MISFIT,
+   "The headset runs at %u Hz, which doesn't fit this game's %.2f fps; its motion will judder. Set the headset's refresh rate for RetroArch to a multiple of the game's rate (in SteamVR: VR Video Settings)."
+   )
+MSG_HASH(
+   MSG_OPENXR_LASER_POINTER,
+   "Laser Pointer: %s"
    )
 
 
@@ -34686,6 +34879,38 @@ MSG_HASH(MENU_ENUM_SUBLABEL_##T, sub)
 #define S_FLOAT_NS(f, T, n, d, rnd, sd, df, c, mn, mx, st, ok, rp, us) \
 MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us)
 #include "../settings/settings_def_gamemode.h"
+#undef S_BOOL
+#undef S_BOOL_NS
+#undef S_UINT
+#undef S_UINT_NS
+#undef S_INT
+#undef S_INT_NS
+#undef S_FLOAT
+#undef S_FLOAT_NS
+#undef SETTINGS_DEF_STRINGS_PASS
+/* GENERATED REGION: Windows low-latency power plan (see settings_def_power_plan.h). */
+#define SETTINGS_DEF_STRINGS_PASS
+#define S_BOOL(f, T, n, d, sd, df, c, us, sub) \
+MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us) \
+MSG_HASH(MENU_ENUM_SUBLABEL_##T, sub)
+#define S_BOOL_NS(f, T, n, d, sd, df, c, us) \
+MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us)
+#define S_UINT(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, us, sub) \
+MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us) \
+MSG_HASH(MENU_ENUM_SUBLABEL_##T, sub)
+#define S_UINT_NS(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, us) \
+MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us)
+#define S_INT(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, us, sub) \
+MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us) \
+MSG_HASH(MENU_ENUM_SUBLABEL_##T, sub)
+#define S_INT_NS(f, T, n, d, sd, df, c, mn, mx, st, ob, ok, rp, us) \
+MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us)
+#define S_FLOAT(f, T, n, d, rnd, sd, df, c, mn, mx, st, ok, rp, us, sub) \
+MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us) \
+MSG_HASH(MENU_ENUM_SUBLABEL_##T, sub)
+#define S_FLOAT_NS(f, T, n, d, rnd, sd, df, c, mn, mx, st, ok, rp, us) \
+MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us)
+#include "../settings/settings_def_power_plan.h"
 #undef S_BOOL
 #undef S_BOOL_NS
 #undef S_UINT

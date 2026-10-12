@@ -290,6 +290,8 @@ static enum msg_hash_enums action_ok_dl_to_enum(unsigned lbl)
          return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_RESOLUTION;
       case ACTION_OK_DL_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION:
          return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION;
+      case ACTION_OK_DL_DROPDOWN_BOX_LIST_HEADSET_REFRESH_RATE:
+         return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_HEADSET_REFRESH_RATE;
       case ACTION_OK_DL_DROPDOWN_BOX_LIST_AUDIO_DEVICE:
          return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_AUDIO_DEVICE;
       case ACTION_OK_DL_DROPDOWN_BOX_LIST_MIDI_DEVICE:
@@ -386,6 +388,8 @@ static enum msg_hash_enums action_ok_dl_to_enum(unsigned lbl)
          return MENU_ENUM_LABEL_DEFERRED_VIDEO_SCALING_SETTINGS_LIST;
       case ACTION_OK_DL_VIDEO_HDR_SETTINGS_LIST:
          return MENU_ENUM_LABEL_DEFERRED_VIDEO_HDR_SETTINGS_LIST;
+      case ACTION_OK_DL_VIDEO_STEREO_SETTINGS_LIST:
+         return MENU_ENUM_LABEL_DEFERRED_VIDEO_STEREO_SETTINGS_LIST;
       case ACTION_OK_DL_VIDEO_OUTPUT_SETTINGS_LIST:
          return MENU_ENUM_LABEL_DEFERRED_VIDEO_OUTPUT_SETTINGS_LIST;
       case ACTION_OK_DL_CRT_SWITCHRES_SETTINGS_LIST:
@@ -854,6 +858,14 @@ int generic_action_ok_displaylist_push(
          info_path          = path;
          info_label         = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION_STR;
          info.enum_idx      = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION;
+         dl_type            = DISPLAYLIST_GENERIC;
+         break;
+      case ACTION_OK_DL_DROPDOWN_BOX_LIST_HEADSET_REFRESH_RATE:
+         info.type          = type;
+         info.directory_ptr = idx;
+         info_path          = path;
+         info_label         = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_HEADSET_REFRESH_RATE_STR;
+         info.enum_idx      = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_HEADSET_REFRESH_RATE;
          dl_type            = DISPLAYLIST_GENERIC;
          break;
       case ACTION_OK_DL_DROPDOWN_BOX_LIST_PLAYLIST_DEFAULT_CORE:
@@ -1799,6 +1811,7 @@ int generic_action_ok_displaylist_push(
 #endif
       case ACTION_OK_DL_VIDEO_SETTINGS_LIST:
       case ACTION_OK_DL_VIDEO_HDR_SETTINGS_LIST:
+      case ACTION_OK_DL_VIDEO_STEREO_SETTINGS_LIST:
       case ACTION_OK_DL_VIDEO_SYNCHRONIZATION_SETTINGS_LIST:
       case ACTION_OK_DL_VIDEO_FULLSCREEN_MODE_SETTINGS_LIST:
       case ACTION_OK_DL_VIDEO_WINDOWED_MODE_SETTINGS_LIST:
@@ -1988,6 +2001,7 @@ static const ok_dl_map_t ok_dl_map[] = {
    { MENU_ENUM_LABEL_VIDEO_WINDOWED_MODE_SETTINGS, ACTION_OK_DL_VIDEO_WINDOWED_MODE_SETTINGS_LIST },
    { MENU_ENUM_LABEL_VIDEO_SCALING_SETTINGS, ACTION_OK_DL_VIDEO_SCALING_SETTINGS_LIST },
    { MENU_ENUM_LABEL_VIDEO_HDR_SETTINGS, ACTION_OK_DL_VIDEO_HDR_SETTINGS_LIST },
+   { MENU_ENUM_LABEL_VIDEO_STEREO_SETTINGS, ACTION_OK_DL_VIDEO_STEREO_SETTINGS_LIST },
    { MENU_ENUM_LABEL_VIDEO_OUTPUT_SETTINGS, ACTION_OK_DL_VIDEO_OUTPUT_SETTINGS_LIST },
    { MENU_ENUM_LABEL_CRT_SWITCHRES_SETTINGS, ACTION_OK_DL_CRT_SWITCHRES_SETTINGS_LIST },
    { MENU_ENUM_LABEL_AUDIO_SETTINGS, ACTION_OK_DL_AUDIO_SETTINGS_LIST },
@@ -2388,8 +2402,8 @@ static int set_path_generic(const char *label, const char *action_path)
    {
       if (setting->value.target.string)
          strlcpy(setting->value.target.string, action_path, setting->size);
-      if (setting->actions->change)
-         setting->actions->change(setting);
+      /* menu_setting_generic() runs the change handler; it was run
+       * here as well, and the row's command fired twice */
       return menu_setting_generic(setting, 0, false);
    }
 
@@ -3973,11 +3987,10 @@ static int action_ok_video_filter_remove(const char *path,
       return -1;
    if (*settings->paths.path_softfilter_plugin)
    {
-      /* Unload video filter. The driver was set up for its output
-       * (pixel format and scale), so set it up again without it, as
-       * the reset does */
+      /* Unload video filter; the driver gets the core's frames */
       settings->paths.path_softfilter_plugin[0] = '\0';
-      command_event(CMD_EVENT_REINIT, NULL);
+      video_driver_filter_free();
+      video_driver_filter_apply();
       /* Refresh menu */
       menu_st->flags         |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH
                              |  MENU_ST_FLAG_PREVENT_POPULATE;
@@ -4073,8 +4086,7 @@ static int action_ok_rename_entry(const char *path,
    if ((playlist = playlist_get_cached()))
       playlist_get_index(playlist, entry_idx, &entry);
    if (entry && entry->label && *entry->label)
-      input_keyboard_line_append(&input_state_get_ptr()->keyboard_line,
-            entry->label, strlen(entry->label));
+      input_driver_keyboard_line_append(entry->label, strlen(entry->label));
 
    return 0;
 }
@@ -4835,6 +4847,28 @@ static int action_ok_cheat_reload_cheats(const char *path,
    return 0;
 }
 #endif
+
+/* Information > Input Information: the controller on the entry's port
+ * made to connect to this computer over Bluetooth. */
+static int action_ok_input_bt_pair(const char *path,
+      const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+   char msg[128];
+   uint8_t host[6];
+   size_t _len;
+   struct menu_state *menu_st = menu_state_get_ptr();
+   bool paired                = input_bluetooth_host_address(host, NULL, 0)
+      && input_driver_set_bt_host((unsigned)entry_idx, host);
+
+   _len = snprintf(msg, sizeof(msg), msg_hash_to_str(paired
+            ? MSG_INPUT_BT_PAIRED : MSG_INPUT_BT_PAIR_FAILED),
+         (unsigned)entry_idx + 1);
+   runloop_msg_queue_push(msg, _len, 1, 180, true, NULL,
+         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+   menu_st->flags |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+   menu_st->flags &= ~MENU_ST_FLAG_PREVENT_POPULATE;
+   return 0;
+}
 
 static int action_ok_start_recording(const char *path,
       const char *label, unsigned type, size_t idx, size_t entry_idx)
@@ -7851,7 +7885,7 @@ static int action_ok_push_dropdown_item_video_shader_param_generic(const char *p
    val                  = MIN(MAX(param_prev->minimum, val),
          param_prev->maximum);
    video_shader_driver_set_parameter(shader_info.data,
-         entry_idx - offset, val);
+         (unsigned)(entry_idx - offset), val);
    param_menu->current  = val;
 
    shader->flags       |= SHDR_FLAG_MODIFIED;
@@ -7904,6 +7938,27 @@ static int action_ok_push_dropdown_item_crt_super_resolution(const char *path,
 
    configuration_set_uint(settings,
          settings->uints.crt_switch_resolution_super, values[idx]);
+
+   return action_cancel_pop_default(NULL, NULL, 0, 0);
+}
+
+/* The values are Auto, Headset's Choice and rates in Hz, not an
+ * index, so they are rebuilt as the list was and the row picks one. */
+static int action_ok_push_dropdown_item_headset_refresh_rate(
+      const char *path, const char *label, unsigned type, size_t idx,
+      size_t entry_idx)
+{
+   unsigned values[2 + VIDEO_HEADSET_MAX_RATES];
+   unsigned n;
+   settings_t *settings = config_get_ptr();
+
+   n = video_driver_headset_rate_choices(values,
+         sizeof(values) / sizeof(values[0]));
+   if (idx >= n)
+      return -1;
+
+   configuration_set_uint(settings,
+         settings->uints.video_openxr_refresh_rate, values[idx]);
 
    return action_cancel_pop_default(NULL, NULL, 0, 0);
 }
@@ -8227,6 +8282,7 @@ static int action_ok_push_dropdown_item_input_device_type(const char *path,
 static int action_ok_push_dropdown_item_input_select_reserved_device(const char *path,
       const char *label, unsigned type, size_t idx, size_t entry_idx)
 {
+    int reinit_flags = DRIVER_VIDEO_AND_INPUT_MASK;
     unsigned user;
     const char *no_device;
     const char *reserved_device_name;
@@ -8245,7 +8301,7 @@ static int action_ok_push_dropdown_item_input_select_reserved_device(const char 
         return -1;
 
     reserved_device_name = path;
-    no_device = msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NONE);
+    no_device = msg_hash_to_str(MENU_ENUM_LABEL_VALUE_OFF);
 
     if (string_is_equal(reserved_device_name, no_device))
        settings->arrays.input_reserved_devices[user][0] = '\0';
@@ -8273,7 +8329,7 @@ static int action_ok_push_dropdown_item_input_select_reserved_device(const char 
 
     settings->flags |= SETTINGS_FLG_MODIFIED;
 
-    command_event(CMD_EVENT_REINIT, NULL);
+    command_event(CMD_EVENT_REINIT, &reinit_flags);
 
     /* Refresh menu */
     menu_st->flags                  |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
@@ -8365,7 +8421,7 @@ static int action_ok_push_dropdown_item_input_description(const char *path,
       return -1;
 
    /* Assign new mapping */
-   settings->uints.input_remap_ids[user_idx][btn_idx] = remap_idx;
+   input_config_set_remap_id(user_idx, btn_idx, remap_idx);
 
    return action_cancel_pop_default(NULL, NULL, 0, 0);
 }
@@ -9650,6 +9706,7 @@ static int menu_cbs_init_bind_ok_compare_label(menu_file_list_cbs_t *cbs,
          {MENU_ENUM_LABEL_CHEAT_DELETE,                        action_ok_cheat_delete},
 #endif
          {MENU_ENUM_LABEL_RUN_MUSIC,                           action_ok_audio_run},
+         {MENU_ENUM_LABEL_INPUT_BT_PAIR,                       action_ok_input_bt_pair},
 #ifdef HAVE_AUDIOMIXER
          {MENU_ENUM_LABEL_ADD_TO_MIXER_AND_COLLECTION,         action_ok_audio_add_to_mixer_and_collection},
          {MENU_ENUM_LABEL_ADD_TO_MIXER_AND_COLLECTION_AND_PLAY,action_ok_audio_add_to_mixer_and_collection_and_play},
@@ -10121,6 +10178,9 @@ static int menu_cbs_init_bind_ok_compare_type(menu_file_list_cbs_t *cbs,
             break;
          case MENU_SETTING_DROPDOWN_ITEM_CRT_SUPER_RESOLUTION:
             BIND_ACTION_OK(cbs, action_ok_push_dropdown_item_crt_super_resolution);
+            break;
+         case MENU_SETTING_DROPDOWN_ITEM_HEADSET_REFRESH_RATE:
+            BIND_ACTION_OK(cbs, action_ok_push_dropdown_item_headset_refresh_rate);
             break;
          case MENU_SETTING_DROPDOWN_ITEM_VIDEO_SHADER_NUM_PASS:
             BIND_ACTION_OK(cbs, action_ok_push_dropdown_item_video_shader_num_pass);

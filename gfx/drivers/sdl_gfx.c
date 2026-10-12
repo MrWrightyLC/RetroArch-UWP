@@ -110,8 +110,7 @@ static void sdl_init_font(sdl_video_t *vid,
     * to make again */
    {
       struct font_atlas *grow = vid->font_driver->get_atlas(vid->font);
-      grow->max_width  = 2048;
-      grow->max_height = 2048;
+      grow->max_dims = VIDEO_SCALE_PACK(2048, 2048);
    }
 
    r = msg_color_r * 255;
@@ -187,12 +186,12 @@ static void sdl_render_msg(
          int base_x, base_y, max_width, max_height; \
          uint32_t             *out      = NULL; \
          const uint8_t             *src = NULL; \
-         glyph_width  = glyph->width; \
-         glyph_height = glyph->height; \
+         glyph_width  = VIDEO_SCALE_W(glyph->dims); \
+         glyph_height = VIDEO_SCALE_H(glyph->dims); \
          base_x       = (line_x + (pen_x)) + glyph->draw_offset_x; \
          base_y       = (line_y + (pen_y)) + glyph->draw_offset_y; \
-         src          = atlas->buffer + glyph->atlas_offset_x \
-            + glyph->atlas_offset_y * atlas->width; \
+         src          = atlas->buffer + VIDEO_SCALE_W(glyph->atlas_pos) \
+            + VIDEO_SCALE_H(glyph->atlas_pos) * atlas->width; \
          if (base_x < 0) \
          { \
             src         -= base_x; \
@@ -220,14 +219,17 @@ static void sdl_render_msg(
             for (x = 0; x < glyph_width; x++) \
             { \
                unsigned blend   = src[x]; \
-               unsigned out_pix = out[x]; \
-               unsigned       r = (out_pix >> rshift) & 0xff; \
-               unsigned       g = (out_pix >> gshift) & 0xff; \
-               unsigned       b = (out_pix >> bshift) & 0xff; \
-               unsigned   out_r = (r * (256 - blend) + vid->font_r * blend) >> 8; \
-               unsigned   out_g = (g * (256 - blend) + vid->font_g * blend) >> 8; \
-               unsigned   out_b = (b * (256 - blend) + vid->font_b * blend) >> 8; \
-               out[x]           = (out_r << rshift) | \
+               unsigned out_pix, r, g, b, out_r, out_g, out_b; \
+               if (!blend) \
+                  continue; \
+               out_pix = out[x]; \
+               r       = (out_pix >> rshift) & 0xff; \
+               g       = (out_pix >> gshift) & 0xff; \
+               b       = (out_pix >> bshift) & 0xff; \
+               out_r   = (r * (256 - blend) + vid->font_r * blend) >> 8; \
+               out_g   = (g * (256 - blend) + vid->font_g * blend) >> 8; \
+               out_b   = (b * (256 - blend) + vid->font_b * blend) >> 8; \
+               out[x]  = (out_r << rshift) | \
                                   (out_g << gshift) | \
                                   (out_b << bshift); \
             } \
@@ -259,8 +261,7 @@ static void sdl_gfx_set_handles(void)
 #endif
 }
 
-static void *sdl_gfx_init(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+static void *sdl_gfx_init(const video_info_t *video)
 {
    unsigned full_x, full_y;
    const SDL_VideoInfo *video_info = NULL;
@@ -321,7 +322,7 @@ static void *sdl_gfx_init(const video_info_t *video,
 
    /* no input driver of this driver's own: the frontend starts the
     * one that goes with an SDL 1.2 window */
-   input_driver_left_to_frontend(INPUT_WINDOW_SDL1, input, input_data);
+   input_driver_video_window(INPUT_WINDOW_SDL1, NULL);
 
    sdl_init_font(vid,
          video_font_enable,

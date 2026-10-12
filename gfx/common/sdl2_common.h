@@ -73,6 +73,8 @@ typedef struct _sdl2_video
 
    void *font_data;
    const font_renderer_driver_t *font_driver;
+   /* The OSD font's atlas as ARGB, its texture's source */
+   uint32_t *font_staging;
 
    uint8_t font_r;
    uint8_t font_g;
@@ -102,6 +104,8 @@ typedef struct _sdl2_video
    struct sdl2_overlay *overlays;
    unsigned overlays_size;
    bool overlays_enabled;
+   /* overlays[].tex are the overlay pack's (load_textures) */
+   bool overlays_borrowed;
 #endif
 
    /* What a display draw hands SDL_RenderGeometry. Grown as needed and

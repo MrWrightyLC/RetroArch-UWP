@@ -103,12 +103,16 @@ typedef struct
       bool enable;
       sprite_vertex_t* v;
    } menu;
+   /* Sampled by a quad drawn with no texture: solid colour */
+   GX2Texture *white_texture;
 
 #ifdef HAVE_OVERLAY
    struct gx2_overlay_data *overlay;
    unsigned overlays;
    bool overlay_enable;
    bool overlay_full_screen;
+   /* overlay[].tex are the overlay pack's (load_textures) */
+   bool overlay_borrowed;
 #endif
 
    GX2Sampler sampler_nearest[RARCH_WRAP_MAX];
@@ -440,16 +444,17 @@ static void gfx_display_wiiu_draw(gfx_display_ctx_draw_t *draw,
             The compiler will optimise 90% of this out anyway */
          unsigned dw  = VIDEO_SCALE_W(draw->dims);
          unsigned dh  = VIDEO_SCALE_H(draw->dims);
-         float y      = -(VIDEO_POS_Y(draw->pos) + dh - video_height);
+         float x      = VIDEO_POS_X(draw->pos);
+         float y      = VIDEO_POS_FLIP_Y(video_height, draw->pos, draw->dims);
          /* Remember: this is a triangle strip, not a quad, draw in a Z shape
             Bottom-left, right, top-left, right */
-         v[0].pos.x   = (VIDEO_POS_X(draw->pos)    ) / video_width;
+         v[0].pos.x   = (x          ) / video_width;
          v[0].pos.y   = (y       + dh) / video_height;
-         v[1].pos.x   = (VIDEO_POS_X(draw->pos) + dw) / video_width;
+         v[1].pos.x   = (x       + dw) / video_width;
          v[1].pos.y   = (y       + dh) / video_height;
-         v[2].pos.x   = (VIDEO_POS_X(draw->pos)    ) / video_width;
+         v[2].pos.x   = (x          ) / video_width;
          v[2].pos.y   = (y          ) / video_height;
-         v[3].pos.x   = (VIDEO_POS_X(draw->pos) + dw) / video_width;
+         v[3].pos.x   = (x       + dw) / video_width;
          v[3].pos.y   = (y          ) / video_height;
       }
       else
@@ -495,8 +500,9 @@ static void gfx_display_wiiu_draw(gfx_display_ctx_draw_t *draw,
          v[i].color.a = draw->coords->color[(i << 2) + 3];
       }
 
-      if (draw->texture)
-         GX2SetPixelTexture((GX2Texture*)draw->texture, tex_shader.ps.samplerVars[0].location);
+      GX2SetPixelTexture(draw->texture
+            ? (GX2Texture*)draw->texture : wiiu->white_texture,
+            tex_shader.ps.samplerVars[0].location);
 
       GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLE_STRIP, 4, wiiu->vertex_cache_tex.current, 1);
       wiiu->vertex_cache_tex.current += 4;
@@ -509,8 +515,8 @@ static void gfx_display_wiiu_draw(gfx_display_ctx_draw_t *draw,
 
       v                  = wiiu->vertex_cache.v + wiiu->vertex_cache.current;
       v->pos.x           = VIDEO_POS_X(draw->pos);
-      v->pos.y           = wiiu->color_buffer.surface.height -
-                           VIDEO_POS_Y(draw->pos) - VIDEO_SCALE_H(draw->dims);
+      v->pos.y           = VIDEO_POS_FLIP_Y(wiiu->color_buffer.surface.height,
+                           draw->pos, draw->dims);
       v->pos.width       = VIDEO_SCALE_W(draw->dims);
       v->pos.height      = VIDEO_SCALE_H(draw->dims);
       v->coord.u         = 0.0f;
@@ -522,8 +528,9 @@ static void gfx_display_wiiu_draw(gfx_display_ctx_draw_t *draw,
             0xFF * draw->coords->color[0], 0xFF * draw->coords->color[1],
             0xFF * draw->coords->color[2], 0xFF * draw->coords->color[3]);
 
-      if (draw->texture)
-         GX2SetPixelTexture((GX2Texture*)draw->texture, sprite_shader.ps.samplerVars[0].location);
+      GX2SetPixelTexture(draw->texture
+            ? (GX2Texture*)draw->texture : wiiu->white_texture,
+            sprite_shader.ps.samplerVars[0].location);
 
       GX2DrawEx(GX2_PRIMITIVE_MODE_POINTS, 1, wiiu->vertex_cache.current, 1);
       wiiu->vertex_cache.current ++;
@@ -719,8 +726,7 @@ static void* gx2_font_init(void* data, const char* font_path,
 
    font->atlas                       = font->font_driver->get_atlas(font->font_data);
    /* The atlas may grow, kept modest for the 32 MB of MEM1 */
-   font->atlas->max_width            = 1024;
-   font->atlas->max_height           = 1024;
+   font->atlas->max_dims = VIDEO_SCALE_PACK(1024, 1024);
    if (!gx2_font_make_texture(font))
    {
       font->font_driver->free(font->font_data);
@@ -819,12 +825,12 @@ static void gx2_font_render_message(
          break; \
       v->pos.x        = x + (glyph)->draw_offset_x * scale; \
       v->pos.y        = y + (glyph)->draw_offset_y * scale; \
-      v->pos.width    = (glyph)->width * scale; \
-      v->pos.height   = (glyph)->height * scale; \
-      v->coord.u      = (glyph)->atlas_offset_x; \
-      v->coord.v      = (glyph)->atlas_offset_y; \
-      v->coord.width  = (glyph)->width; \
-      v->coord.height = (glyph)->height; \
+      v->pos.width    = VIDEO_SCALE_W((glyph)->dims) * scale; \
+      v->pos.height   = VIDEO_SCALE_H((glyph)->dims) * scale; \
+      v->coord.u      = VIDEO_SCALE_W((glyph)->atlas_pos); \
+      v->coord.v      = VIDEO_SCALE_H((glyph)->atlas_pos); \
+      v->coord.width  = VIDEO_SCALE_W((glyph)->dims); \
+      v->coord.height = VIDEO_SCALE_H((glyph)->dims); \
       v->color        = color; \
       v++; \
       x              += (glyph)->advance_x * scale; \
@@ -847,8 +853,8 @@ static void gx2_font_render_message(
          /* Copy and invalidate only the dirty row band tracked by \
           * the font renderers instead of the whole atlas */ \
          unsigned j; \
-         unsigned y0 = font->atlas->dirty_y0; \
-         unsigned y1 = font->atlas->dirty_y1; \
+         unsigned y0 = VIDEO_SCALE_H(font->atlas->dirty_xy0); \
+         unsigned y1 = VIDEO_SCALE_H(font->atlas->dirty_xy1); \
          if (y1 > font->atlas->height) \
             y1 = font->atlas->height; \
          if (y1 > font->texture.surface.height) \
@@ -1028,9 +1034,10 @@ static void gx2_set_aspect_ratio(void *data, unsigned aspect_ratio_idx)
 }
 
 static uint32_t gx2_get_flags(void *data);
+static uintptr_t gx2_load_texture(void *video_data, void *data,
+      bool threaded, enum texture_filter_type filter_type);
 
-static void *gx2_init(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+static void *gx2_init(const video_info_t *video)
 {
    unsigned i;
    float refresh_rate              = 60.0f / 1.001f;
@@ -1043,12 +1050,10 @@ static void *gx2_init(const video_info_t *video,
    if (!wiiu)
       return NULL;
 
-   *input                          = NULL;
-   *input_data                     = NULL;
 
    /* no input driver of this driver's own: the frontend starts the
     * platform's */
-   input_driver_left_to_frontend(INPUT_WINDOW_PLATFORM, input, input_data);
+   input_driver_video_window(INPUT_WINDOW_PLATFORM, NULL);
 
    /* video initialize */
    wiiu->cmd_buffer                = MEM2_alloc(0x400000, 0x40);
@@ -1182,6 +1187,17 @@ static void *gx2_init(const video_info_t *video,
    memset(wiiu->menu.texture.surface.image, 0x0, wiiu->menu.texture.surface.imageSize);
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, wiiu->menu.texture.surface.image,
                  wiiu->menu.texture.surface.imageSize);
+
+   {
+      static const uint32_t white = 0xffffffffu;
+      struct texture_image image;
+      memset(&image, 0, sizeof(image));
+      image.pixels        = (uint32_t*)&white;
+      image.width         = 1;
+      image.height        = 1;
+      wiiu->white_texture = (GX2Texture*)gx2_load_texture(wiiu, &image,
+            false, TEXTURE_FILTER_NEAREST);
+   }
 
    wiiu->v                             = MEM2_alloc(
          4 * sizeof(*wiiu->v), GX2_VERTEX_BUFFER_ALIGNMENT);
@@ -1369,12 +1385,14 @@ static void gx2_free_overlay(wiiu_video_t *gx2)
 {
    unsigned i;
 
-   for (i = 0; i < gx2->overlays; i++)
-      MEM2_free(gx2->overlay[i].tex.surface.image);
+   if (!gx2->overlay_borrowed)
+      for (i = 0; i < gx2->overlays; i++)
+         MEM2_free(gx2->overlay[i].tex.surface.image);
 
    free(gx2->overlay);
-   gx2->overlay = NULL;
-   gx2->overlays = 0;
+   gx2->overlay          = NULL;
+   gx2->overlays         = 0;
+   gx2->overlay_borrowed = false;
 
 }
 
@@ -1431,6 +1449,46 @@ static bool gx2_overlay_load(void *data,
    return true;
 }
 
+/* A page of the pack's textures: gx2_load_texture's, drawn from a
+ * copy of each GX2Texture, uploaded once for every page */
+static bool gx2_overlay_load_textures(void *data,
+      const uintptr_t *textures, unsigned num_textures)
+{
+   unsigned i;
+   wiiu_video_t *gx2 = (wiiu_video_t *)data;
+
+   if (!gx2)
+      return false;
+
+   gx2_free_overlay(gx2);
+   if (!num_textures)
+      return true;
+   if (!(gx2->overlay = (struct gx2_overlay_data *)calloc(num_textures,
+         sizeof(*gx2->overlay))))
+      return false;
+   gx2->overlays         = num_textures;
+   gx2->overlay_borrowed = true;
+
+   for (i = 0; i < num_textures; i++)
+   {
+      struct gx2_overlay_data *o = &gx2->overlay[i];
+
+      if (!textures[i])
+         continue;
+      o->tex = *(const GX2Texture*)textures[i];
+
+      /* Default. Stretch to whole screen. */
+      gx2_overlay_tex_geom(gx2, i, 0, 0, 1, 1);
+      gx2_overlay_vertex_geom(gx2, i, 0, 0, 1, 1);
+      o->alpha_mod = 1.0f;
+      o->v.color   = 0xFFFFFFFF;
+
+      GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, &o->v, sizeof(o->v));
+   }
+
+   return true;
+}
+
 static void gx2_overlay_enable(void *data, bool state)
 {
    wiiu_video_t *gx2 = (wiiu_video_t *)data;
@@ -1467,6 +1525,8 @@ static void gx2_render_overlay(void *data)
 
    for (i = 0; i < gx2->overlays; i++)
    {
+      if (!gx2->overlay[i].tex.surface.image)
+         continue;
 
       GX2SetAttribBuffer(0, sizeof(gx2->overlay[i].v), sizeof(gx2->overlay[i].v), &gx2->overlay[i].v);
 
@@ -1483,7 +1543,7 @@ static const video_overlay_interface_t gx2_overlay_interface =
 {
    gx2_overlay_enable,
    gx2_overlay_load,
-   NULL, /* load_textures */
+   gx2_overlay_load_textures,
    gx2_overlay_tex_geom,
    gx2_overlay_vertex_geom,
    gx2_overlay_full_screen,
@@ -1540,6 +1600,11 @@ static void gx2_free(void *data)
    MEM2_free(wiiu->cmd_buffer);
    MEM2_free(wiiu->texture.surface.image);
    MEM2_free(wiiu->menu.texture.surface.image);
+   if (wiiu->white_texture)
+   {
+      MEM2_free(wiiu->white_texture->surface.image);
+      free(wiiu->white_texture);
+   }
    MEM2_free(wiiu->v);
    MEM2_free(wiiu->menu.v);
    MEM2_free(wiiu->vertex_cache.v);
@@ -2359,6 +2424,33 @@ static uintptr_t gx2_load_texture(void *video_data, void *data,
    return (uintptr_t)texture;
 }
 
+/* Written in place like the menu texture: the menu's frames end on
+ * GX2DrawDone, so no draw still reads it. */
+static enum video_texture_update gx2_update_texture(void *video_data,
+      uintptr_t id, const struct texture_image *ti, bool threaded)
+{
+   uint32_t i;
+   GX2Texture *texture = (GX2Texture*)id;
+
+   if (     !texture || !ti || !ti->pixels || ti->pix10 || ti->fp16
+         || texture->surface.format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8
+         || texture->surface.width  != ti->width
+         || texture->surface.height != ti->height)
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+
+   for (i = 0; i < ti->height; i++)
+      memcpy((uint32_t *)texture->surface.image
+            + (i * texture->surface.pitch),
+            ti->pixels + (i * ti->width),
+            ti->width * sizeof(uint32_t));
+
+   GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE,
+         texture->surface.image,
+         texture->surface.imageSize);
+
+   return VIDEO_TEXTURE_UPDATE_DONE;
+}
+
 static void gx2_unload_texture(void *data,
       bool threaded, uintptr_t handle)
 {
@@ -2590,7 +2682,20 @@ static const video_poke_interface_t gx2_poke_interface = {
    NULL, /* set_hdr_scanlines */
    NULL, /* set_hdr_subpixel_layout */
    gx2_supports_texture_format,
-   gx2_load_texture_compressed
+   gx2_load_texture_compressed,
+   NULL, /* present_last */
+   NULL, /* get_last_present_time */
+   NULL, /* hw_ring_install */
+   NULL, /* hw_ring_fence_new */
+   NULL, /* hw_ring_fence_free */
+   NULL, /* hw_ring_fence_signal */
+   NULL, /* hw_ring_fence_wait */
+   NULL, /* hw_ring_capture */
+   NULL, /* hw_ring_present_slot */
+   NULL, /* hw_ring_context_new */
+   NULL, /* hw_ring_context_free */
+   NULL, /* hw_ring_framebuffer */
+   gx2_update_texture
 };
 
 static void gx2_get_poke_interface(void *data,

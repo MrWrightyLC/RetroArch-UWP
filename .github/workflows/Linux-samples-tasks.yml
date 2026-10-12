@@ -23,7 +23,11 @@ jobs:
   samples-tasks:
     name: Build and run samples/tasks
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # One job runs every samples/tasks oracle, most of them three times
+    # (plain, ASan + UBSan, TSan): 53 steps. Ten minutes was the budget
+    # when there were fewer; it now runs out partway through and the
+    # job is cancelled with nothing failing.
+    timeout-minutes: 30
 
     steps:
       - name: Install dependencies
@@ -49,13 +53,34 @@ jobs:
               $pkgs && break
             [ $i = 3 ] && exit 1
             echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            if [ ! -d /etc/apt/ra-orig ]; then
+              sudo mkdir /etc/apt/ra-orig
+              sudo cp -a /etc/apt/sources.list.d /etc/apt/ra-orig/
+              [ ! -f /etc/apt/sources.list ] || sudo cp -a /etc/apt/sources.list /etc/apt/ra-orig/
+            fi
             for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
               [ -f "$f" ] || continue
               sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
                 -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
             done
-            sudo timeout 90 apt-get update -y \
-              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
+            # A refresh cut short or refused leaves apt no package lists: it
+            # is retried, without translations or command-not-found data, and
+            # the mirror is put back when the archive will not answer either.
+            upd="-o Acquire::Retries=3 -o Acquire::http::Timeout=30
+              -o Acquire::Languages=none
+              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false
+              -o APT::Update::Error-Mode=any"
+            ok=0
+            for j in 1 2; do
+              sudo timeout 120 apt-get update -y $upd && { ok=1; break; }
+            done
+            if [ $ok = 0 ]; then
+              sudo rm -rf /etc/apt/sources.list.d
+              sudo cp -a /etc/apt/ra-orig/sources.list.d /etc/apt/
+              [ ! -f /etc/apt/ra-orig/sources.list ] || sudo cp -a /etc/apt/ra-orig/sources.list /etc/apt/
+              sudo rm -rf /etc/apt/ra-orig
+              sudo timeout 120 apt-get update -y $upd || true
+            fi
           done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
@@ -209,7 +234,10 @@ jobs:
           # its MD5 unchanged, small files several to a run, the floor
           # alone finishing the diff, and a 9 MiB download reported from
           # another thread hashed by the task over many runs instead of
-          # by the callback. Pushed on the real task queue and run to its
+          # by the callback. The directory walk listing the local files
+          # runs within the grant too and lists what dir_list_new() did,
+          # an unreadable root still stopping the sync. Pushed on the real
+          # task queue and run to its
           # end, the sync must release everything (LeakSanitizer).
           make clean cloudsync_pacing_test
           timeout 120 ./cloudsync_pacing_test
@@ -220,6 +248,31 @@ jobs:
           TSAN_OPTIONS=halt_on_error=1 timeout 300 ./cloudsync_pacing_test
           make clean >/dev/null
           echo "[pass] cloudsync_pacing_test"
+
+      - name: Build and run the cloudsync hand-over tests, locked path (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/tasks/cloudsync
+        run: |
+          set -eu
+          # Completion callbacks hand manifest entries and downloads to
+          # the task thread on lock-free lists where the atomics backend
+          # has pointer operations, and under tcs_manifest_lock where it
+          # does not. Every backend this runner has, has them, so
+          # FORCE_LOCK=1 builds tasks/task_cloudsync.c with
+          # TASK_CLOUDSYNC_FORCE_LOCK: the locked path on the host's own
+          # backend, where TSan sees an append or hand-over the lock
+          # does not cover. Same tests, same checks, other path.
+          for t in cloudsync_manifest_adds_test cloudsync_pacing_test; do
+             make clean $t FORCE_LOCK=1
+             timeout 120 ./$t
+             make clean $t FORCE_LOCK=1 SANITIZER=address,undefined
+             ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+               timeout 300 ./$t
+             make clean $t FORCE_LOCK=1 SANITIZER=thread
+             TSAN_OPTIONS=halt_on_error=1 timeout 300 ./$t
+          done
+          make clean >/dev/null
+          echo "[pass] cloudsync hand-over, locked path"
 
       - name: Build and run cloudsync_async_test (ASan + UBSan, TSan)
         shell: bash
@@ -436,9 +489,17 @@ jobs:
           timeout 120 ./bsv_replay_init_test
           echo "[pass] bsv_replay_init_test"
           make clean all SANITIZER=address,undefined
-          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+          # allocator_may_return_null: the test feeds a checkpoint too big
+          # to allocate and expects malloc to return NULL.
+          ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 UBSAN_OPTIONS=print_stacktrace=1 \
              timeout 120 ./bsv_replay_init_test
           echo "[pass] bsv_replay_init_test (ASan + UBSan)"
+          # STATESTREAM=1: the deduplicating checkpoint encoding desktop
+          # builds use, and the lanes that exercise it.
+          make clean all STATESTREAM=1 SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 UBSAN_OPTIONS=print_stacktrace=1 \
+             timeout 120 ./bsv_replay_init_test
+          echo "[pass] bsv_replay_init_test (STATESTREAM, ASan + UBSan)"
 
       - name: Build and run bsv_statestream_test (plain, ASan + UBSan)
         shell: bash
@@ -1662,13 +1723,34 @@ jobs:
               $pkgs && break
             [ $i = 3 ] && exit 1
             echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
+            if [ ! -d /etc/apt/ra-orig ]; then
+              sudo mkdir /etc/apt/ra-orig
+              sudo cp -a /etc/apt/sources.list.d /etc/apt/ra-orig/
+              [ ! -f /etc/apt/sources.list ] || sudo cp -a /etc/apt/sources.list /etc/apt/ra-orig/
+            fi
             for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
               [ -f "$f" ] || continue
               sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
                 -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
             done
-            sudo timeout 90 apt-get update -y \
-              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 || true
+            # A refresh cut short or refused leaves apt no package lists: it
+            # is retried, without translations or command-not-found data, and
+            # the mirror is put back when the archive will not answer either.
+            upd="-o Acquire::Retries=3 -o Acquire::http::Timeout=30
+              -o Acquire::Languages=none
+              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false
+              -o APT::Update::Error-Mode=any"
+            ok=0
+            for j in 1 2; do
+              sudo timeout 120 apt-get update -y $upd && { ok=1; break; }
+            done
+            if [ $ok = 0 ]; then
+              sudo rm -rf /etc/apt/sources.list.d
+              sudo cp -a /etc/apt/ra-orig/sources.list.d /etc/apt/
+              [ ! -f /etc/apt/ra-orig/sources.list ] || sudo cp -a /etc/apt/ra-orig/sources.list /etc/apt/
+              sudo rm -rf /etc/apt/ra-orig
+              sudo timeout 120 apt-get update -y $upd || true
+            fi
           done
           sudo apt-get install -y \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \

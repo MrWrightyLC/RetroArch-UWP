@@ -659,7 +659,6 @@ static const struct
    char s_ccfe26d1[18];
    char s_728ca1d3[3];
    char s_5f612db6[11];
-   char s_9f29f708[20];
    char s_b30b56ad[3];
    char s_2c04084b[16];
    char s_404e69aa[10];
@@ -845,6 +844,7 @@ static const struct
    char s_71747541[11];
    char s_ff960910[18];
    char s_61213f1d[13];
+   char s_60258de0[7];
    char s_317b17ed[11];
    char s_94c8d15f[11];
    char s_1f66aac3[10];
@@ -1237,6 +1237,7 @@ static const struct
    char s_ed159cd6[16];
    char s_a56efbe2[7];
    char s_543fcabd[12];
+   char s_a63c824a[14];
    char s_a9f3b2c3[18];
    char s_0e7aca8a[17];
    char s_ab1afe7c[16];
@@ -1937,7 +1938,6 @@ static const struct
    "Heltall skalering",
    "AV",
    "Startmappe",
-   "Konfigurasjonsfiler",
    "AV",
    "Vis Startskjerm",
    "Biline\303\246r",
@@ -2123,6 +2123,7 @@ static const struct
    "GPU indeks",
    "Varslingsbakgrunn",
    "Skjermindeks",
+   "Alltid",
    "180 grader",
    "270 grader",
    "90 grader",
@@ -2569,6 +2570,7 @@ static const struct
    "Fil ikke funnet",
    "indeks",
    "Tidsavbrudd",
+   "\303\230yeblikkelig",
    "Skriv inn passord",
    "Ugyldig passord.",
    "Passord riktig.",
@@ -2623,7 +2625,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_no_blob_check[
-      (sizeof(msg_hash_no_blob) == (29315u
+      (sizeof(msg_hash_no_blob) == (29316u
 #ifdef HAVE_LAKKA
        + 178u
 #endif
@@ -3412,7 +3414,6 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_INTEGER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_PARTICLE_EFFECT_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_SHOW_START_SCREEN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_THUMB_SCALE_BILINEAR,
@@ -3598,6 +3599,7 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_GPU_INDEX,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_BGCOLOR_ENABLE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MONITOR_INDEX,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED_ROTATED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_VERTICAL,
@@ -3990,6 +3992,7 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MSG_FILE_NOT_FOUND,
    (uint32_t)MSG_INDEX_FILE,
    (uint32_t)MSG_INPUT_BIND_TIMEOUT,
+   (uint32_t)MSG_INPUT_COMBO_INSTANT,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_NOK,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_OK,

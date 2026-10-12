@@ -53,6 +53,7 @@ typedef struct pipewire_audio
    uint32_t frame_size;
    uint32_t layout;      /* the frontend's mask the stream carries */
    struct spa_ringbuffer ring;
+   uint32_t lend_idx;    /* where the outstanding lend began */
    uint8_t buffer[RINGBUFFER_SIZE];
    /* Frames handed to the graph since the stream started, for the sink
     * rate estimate. The process callback is the graph asking for a
@@ -297,10 +298,15 @@ static void pwire_microphone_close_mic(void *driver_context, void *mic_context)
    if (pw && mic)
    {
       size_t xruns;
-      pw_thread_loop_lock(pw->thread_loop);
-      pw_stream_destroy(mic->stream);
-      mic->stream = NULL;
-      pw_thread_loop_unlock(pw->thread_loop);
+      /* A failed open closes before the stream exists, and
+       * pw_stream_destroy() does not take NULL. */
+      if (mic->stream)
+      {
+         pw_thread_loop_lock(pw->thread_loop);
+         pw_stream_destroy(mic->stream);
+         mic->stream = NULL;
+         pw_thread_loop_unlock(pw->thread_loop);
+      }
       xruns = retro_atomic_load_acquire_size(&mic->xruns);
       if (xruns)
          RARCH_WARN("[Microphone] [PipeWire] %lu capture cycles overran, underran or found no buffer.\n",
@@ -539,7 +545,9 @@ unlock_error:
    pw_thread_loop_unlock(mic->pw->thread_loop);
 error:
    RARCH_ERR("[Microphone] [PipeWire] Failed to initialize microphone.\n");
-   pwire_microphone_close_mic(mic->pw, mic);
+   /* mic is NULL when there was no driver context or the calloc failed */
+   if (mic)
+      pwire_microphone_close_mic(mic->pw, mic);
    return NULL;
 }
 
@@ -996,6 +1004,46 @@ static ssize_t pwire_write(void *data, const void *buf_, size_t len)
    return (ssize_t)written;
 }
 
+/* The lend pair: the ring the process callback drains, handed out to
+ * its wrap. spa_ringbuffer is single-producer, single-consumer, so the
+ * lend takes no loop lock; write() takes it only for its wait. */
+static size_t pwire_write_begin(void *data, size_t len, void **region)
+{
+   pipewire_audio_t *audio = (pipewire_audio_t*)data;
+   const char       *error = NULL;
+   uint32_t idx;
+   int32_t  filled;
+   size_t   span;
+   *region = NULL;
+   if (     !audio || !audio->stream || !audio->frame_size
+         || pw_stream_get_state(audio->stream, &error) != PW_STREAM_STATE_STREAMING)
+      return 0;
+   filled = spa_ringbuffer_get_write_index(&audio->ring, &idx);
+   if (filled < 0 || (uint32_t)filled >= audio->highwater_mark)
+      return 0;
+   span = audio->highwater_mark - (uint32_t)filled;
+   if (span > RINGBUFFER_SIZE - (idx & RINGBUFFER_MASK))
+      span = RINGBUFFER_SIZE - (idx & RINGBUFFER_MASK);
+   if (span > len)
+      span = len;
+   span -= span % audio->frame_size;
+   if (!span)
+      return 0;
+   audio->lend_idx = idx;
+   *region         = audio->buffer + (idx & RINGBUFFER_MASK);
+   return span;
+}
+
+static ssize_t pwire_write_end(void *data, size_t len)
+{
+   pipewire_audio_t *audio = (pipewire_audio_t*)data;
+   len -= len % audio->frame_size;
+   if (len)
+      spa_ringbuffer_write_update(&audio->ring,
+            audio->lend_idx + (uint32_t)len);
+   return (ssize_t)len;
+}
+
 static bool pwire_stop(void *data)
 {
    pipewire_audio_t *audio = (pipewire_audio_t*)data;
@@ -1279,5 +1327,8 @@ audio_driver_t audio_pipewire = {
       pwire_underruns,
       pwire_layout,
       NULL, /* frames_consumed_fallback */
-      pwire_device_clock_ppm
+      pwire_device_clock_ppm,
+      NULL, /* thread_grant */
+      pwire_write_begin,
+      pwire_write_end
 };

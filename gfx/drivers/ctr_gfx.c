@@ -36,6 +36,7 @@
 #endif
 #ifdef HAVE_GFX_WIDGETS
 #include "../gfx_widgets.h"
+#include "../gfx_surface.h"
 #endif
 
 #include "../font_driver.h"
@@ -126,6 +127,8 @@ typedef struct ctr_video
       void* bottom;
    }drawbuffers;
    void* depthbuffer;
+   /* Sampled by a quad drawn with no texture: solid colour */
+   struct ctr_texture* white_texture;
 
    struct
    {
@@ -183,6 +186,8 @@ typedef struct ctr_video
 #ifdef HAVE_OVERLAY
    bool overlay_enabled;
    bool overlay_full_screen;
+   /* overlay[].texture are the overlay pack's (load_textures) */
+   bool overlay_borrowed;
 #endif
    bool rgb32;
    bool vsync;
@@ -260,6 +265,8 @@ static bool ctr_bottom_screen_enabled  = true;
 
 #ifdef HAVE_OVERLAY
 static void ctr_render_overlay(ctr_video_t *ctr);
+static uintptr_t ctr_load_texture(void *video_data, void *data,
+      bool threaded, enum texture_filter_type filter_type);
 #endif
 static void ctr_set_bottom_screen_enable(bool enabled, bool idle);
 
@@ -281,7 +288,8 @@ static void gfx_display_ctr_draw(gfx_display_ctx_draw_t *draw,
    if (!ctr || !draw)
       return;
 
-   texture            = (struct ctr_texture*)draw->texture;
+   texture            = draw->texture
+      ? (struct ctr_texture*)draw->texture : ctr->white_texture;
    color              = draw->coords->color;
 
    if (!texture)
@@ -304,7 +312,7 @@ static void gfx_display_ctr_draw(gfx_display_ctx_draw_t *draw,
    v     = ctr->vertex_cache.current++;
 
    v->x0 = VIDEO_POS_X(draw->pos);
-   v->y0 = 240 - VIDEO_SCALE_H(draw->dims) - VIDEO_POS_Y(draw->pos);
+   v->y0 = VIDEO_POS_FLIP_Y(240, draw->pos, draw->dims);
    v->x1 = v->x0 + VIDEO_SCALE_W(draw->dims);
    v->y1 = v->y0 + VIDEO_SCALE_H(draw->dims);
    v->u0 = 0;
@@ -381,10 +389,13 @@ static void gfx_display_ctr_draw(gfx_display_ctx_draw_t *draw,
 /* Swizzles the atlas's rectangle into the font texture, in place in
  * the linear memory the GPU samples, and flushes it out of the cache */
 static void ctr_font_upload(ctr_font_t *font,
-      const struct font_atlas *atlas,
-      unsigned x0, unsigned y0, unsigned x1, unsigned y1)
+      const struct font_atlas *atlas, unsigned xy0, unsigned xy1)
 {
    unsigned i, j;
+   unsigned x0        = VIDEO_SCALE_W(xy0);
+   unsigned y0        = VIDEO_SCALE_H(xy0);
+   unsigned x1        = VIDEO_SCALE_W(xy1);
+   unsigned y1        = VIDEO_SCALE_H(xy1);
    uint8_t       *tex = (uint8_t*)font->texture.data;
    const uint8_t *src = atlas->buffer;
 
@@ -400,8 +411,6 @@ static void ctr_font_upload(ctr_font_t *font,
       for (i = x0; i < x1; i++)
          tex[ctrgu_swizzle_coords(i, j, font->texture.width)] =
             src[i + j * atlas->width];
-
-   GSPGPU_FlushDataCache(tex, font->texture.width * font->texture.height);
 }
 
 /* Texture memory holding all of @atlas, sized up to powers of two,
@@ -420,7 +429,10 @@ static void *ctr_font_make_texture(ctr_font_t *font,
    font->texture.width  = width;
    font->texture.height = height;
    font->texture.data   = data;
-   ctr_font_upload(font, atlas, 0, 0, atlas->width, atlas->height);
+   ctr_font_upload(font, atlas, 0,
+         VIDEO_SCALE_PACK(atlas->width, atlas->height));
+   GSPGPU_FlushDataCache(font->texture.data,
+         font->texture.width * font->texture.height);
 
    CTR_SET_SCALE_VECTOR(
          &font->scale_vector_top,
@@ -440,7 +452,6 @@ static void* ctr_font_init(void* data, const char* font_path,
 {
    struct font_atlas* atlas       = NULL;
    ctr_font_t* font               = (ctr_font_t*)calloc(1, sizeof(*font));
-   ctr_video_t* ctr               = (ctr_video_t*)data;
 
    if (!font)
       return NULL;
@@ -456,8 +467,7 @@ static void* ctr_font_init(void* data, const char* font_path,
 
    atlas                = font->font_driver->get_atlas(font->font_data);
    /* The atlas may grow, to the 3DS GPU's largest texture */
-   atlas->max_width     = 1024;
-   atlas->max_height    = 1024;
+   atlas->max_dims = VIDEO_SCALE_PACK(1024, 1024);
 
    if (!(font->texture.data = ctr_font_make_texture(font, atlas)))
    {
@@ -606,10 +616,10 @@ static void ctr_font_render_message(
    { \
       int off_x  = (glyph)->draw_offset_x; \
       int off_y  = (glyph)->draw_offset_y; \
-      int tex_x  = (glyph)->atlas_offset_x; \
-      int tex_y  = (glyph)->atlas_offset_y; \
-      int g_w    = (glyph)->width; \
-      int g_h    = (glyph)->height; \
+      int tex_x  = VIDEO_SCALE_W((glyph)->atlas_pos); \
+      int tex_y  = VIDEO_SCALE_H((glyph)->atlas_pos); \
+      int g_w    = VIDEO_SCALE_W((glyph)->dims); \
+      int g_h    = VIDEO_SCALE_H((glyph)->dims); \
       v->x0      = x + (off_x + (pen_x)) * scale; \
       v->y0      = y + (off_y + (pen_y)) * scale; \
       v->u0      = tex_x; \
@@ -669,8 +679,14 @@ static void ctr_font_render_msg(
       }
       if (atlas->dirty)
       {
-         ctr_font_upload(font, atlas, atlas->dirty_x0, atlas->dirty_y0,
-               atlas->dirty_x1, atlas->dirty_y1);
+         unsigned r, xy0, xy1;
+         for (r = 0; r < font_atlas_dirty_rects(atlas); r++)
+         {
+            font_atlas_dirty_rect(atlas, r, &xy0, &xy1);
+            ctr_font_upload(font, atlas, xy0, xy1);
+         }
+         GSPGPU_FlushDataCache(font->texture.data,
+               font->texture.width * font->texture.height);
          atlas->dirty = false;
       }
    }
@@ -835,12 +851,14 @@ static void ctr_free_overlay(ctr_video_t *ctr)
    for (i = 0; i < ctr->overlays; i++)
    {
       linearFree(ctr->overlay[i].frame_coords);
-      linearFree(ctr->overlay[i].texture.data);
+      if (!ctr->overlay_borrowed)
+         linearFree(ctr->overlay[i].texture.data);
    }
 
    free(ctr->overlay);
-   ctr->overlay  = NULL;
-   ctr->overlays = 0;
+   ctr->overlay          = NULL;
+   ctr->overlays         = 0;
+   ctr->overlay_borrowed = false;
 }
 #endif
 
@@ -851,6 +869,27 @@ static void ctr_update_viewport(ctr_video_t* ctr)
    ctr_set_screen_coords(ctr);
 
    ctr->should_resize = false;
+}
+
+/* The png at @name under @dir, decoded here and uploaded through the
+ * driver's own load. False when there is no such file. */
+static bool ctr_load_png_texture(const char *name, const char *dir,
+      uintptr_t *tex)
+{
+   char path[PATH_MAX_LENGTH];
+   struct texture_image ti;
+   bool ok;
+
+   if (!name || !*name)
+      return false;
+   fill_pathname_join_special(path, dir, name, sizeof(path));
+   memset(&ti, 0, sizeof(ti));
+   ti.supports_rgba = gfx_surface_wants_rgba();
+   if (!image_texture_load(&ti, path))
+      return false;
+   ok = video_driver_texture_load(&ti, TEXTURE_FILTER_MIPMAP_LINEAR, tex);
+   image_texture_free(&ti);
+   return ok;
 }
 
 static const char *ctr_texture_path(unsigned id)
@@ -933,7 +972,6 @@ error:
 static void ctr_state_thumbnail_geom(void *data)
 {
    float scale;
-   unsigned width, height;
    int x_offset, y_offset;
    ctr_scale_vector_t *vec           = NULL;
    ctr_texture_t *texture            = NULL;
@@ -994,10 +1032,8 @@ static bool ctr_load_bottom_texture(void *data)
       else
          dir_assets = settings->paths.directory_bottom_assets;
 
-      if (gfx_display_reset_textures_list(
-         ctr_texture_path(i), dir_assets,
-         &ctr->bottom_textures[i].texture,
-         TEXTURE_FILTER_MIPMAP_LINEAR, NULL))
+      if (ctr_load_png_texture(ctr_texture_path(i), dir_assets,
+            &ctr->bottom_textures[i].texture))
       {
          struct ctr_bottom_texture_data *o = &ctr->bottom_textures[i];
          o->frame_coords = linearAlloc(sizeof(ctr_vertex_t));
@@ -1041,7 +1077,6 @@ static bool ctr_load_bottom_texture(void *data)
 static void save_state_to_file(void *data)
 {
    char state_path[PATH_MAX_LENGTH];
-   ctr_video_t *ctr = (ctr_video_t*)data;
    runloop_get_current_savestate_path(state_path, sizeof(state_path));
 
    command_event(CMD_EVENT_RAM_STATE_TO_FILE, state_path);
@@ -1181,7 +1216,6 @@ static void ctr_bottom_menu_control(void* data,
                if (settings->bools.savestate_thumbnail_enable)
                {
                   char screenshot_full_path[PATH_MAX_LENGTH];
-                  video_driver_state_t *video_st = video_state_get_ptr();
                   fill_pathname_join_special(screenshot_full_path,
                      dir_get_ptr(RARCH_DIR_SAVESTATE),
                      ctr_texture_path(CTR_TEXTURE_STATE_THUMBNAIL),
@@ -1239,11 +1273,9 @@ static void ctr_bottom_menu_control(void* data,
 
       if (ctr_update_state_date_from_file(ctr))
       {
-         if (gfx_display_reset_textures_list(
+         if (ctr_load_png_texture(
                   ctr_texture_path(CTR_TEXTURE_STATE_THUMBNAIL),
-                  dir_get_ptr(RARCH_DIR_SAVESTATE),
-                  &o->texture,
-                  TEXTURE_FILTER_MIPMAP_LINEAR, NULL))
+                  dir_get_ptr(RARCH_DIR_SAVESTATE), &o->texture))
          {
             o->frame_coords = linearAlloc(sizeof(ctr_vertex_t));
             ctr_state_thumbnail_geom(ctr);
@@ -1626,10 +1658,8 @@ task_finder_data_t ctr_tasks_finder_data = {ctr_tasks_finder, NULL};
 #endif
 
 
-static void* ctr_init(const video_info_t* video,
-      input_driver_t** input, void** input_data)
+static void* ctr_init(const video_info_t* video)
 {
-   size_t i;
    float refresh_rate;
    ctr_scale_vector_t *vec         = NULL;
    ctr_scale_vector_t *menu_vec    = NULL;
@@ -1708,6 +1738,17 @@ static void* ctr_init(const video_info_t* video,
          linearMemAlign(ctr->menu.texture_width * ctr->menu.texture_height * sizeof(uint16_t), 128);
 
    ctr->menu.frame_coords          = linearAlloc(sizeof(ctr_vertex_t));
+
+   {
+      static const uint32_t white = 0xffffffffu;
+      struct texture_image image;
+      memset(&image, 0, sizeof(image));
+      image.pixels       = (uint32_t*)&white;
+      image.width        = 1;
+      image.height       = 1;
+      ctr->white_texture = (struct ctr_texture*)ctr_load_texture(ctr,
+            &image, false, TEXTURE_FILTER_NEAREST);
+   }
 
    ctr->menu.frame_coords->x0      = 40;
    ctr->menu.frame_coords->y0      = 0;
@@ -1788,7 +1829,7 @@ static void* ctr_init(const video_info_t* video,
 
    /* no input driver of this driver's own: the frontend starts the
     * platform's */
-   input_driver_left_to_frontend(INPUT_WINDOW_PLATFORM, input, input_data);
+   input_driver_video_window(INPUT_WINDOW_PLATFORM, NULL);
 
    ctr->keep_aspect           = true;
    ctr->should_resize         = true;
@@ -1837,15 +1878,19 @@ static bool ctr_frame(void* data, const void* frame,
 {
    unsigned width = VIDEO_SCALE_W(dims);
    unsigned height = VIDEO_SCALE_H(dims);
+#ifdef CONSOLE_LOG
    static uint64_t current_tick, last_tick;
-   extern GSPGPU_FramebufferInfo topFramebufferInfo, bottomFramebufferInfo;
-   extern u8* gfxSharedMemory;
-   extern u8 gfxThreadID;
    uint32_t diff;
-   ctr_video_t       *ctr         = (ctr_video_t*)data;
    static float        fps        = 0.0;
    static int total_frames        = 0;
    static int       frames        = 0;
+#endif
+#ifndef USE_CTRULIB_2
+   extern GSPGPU_FramebufferInfo topFramebufferInfo, bottomFramebufferInfo;
+   extern u8* gfxSharedMemory;
+   extern u8 gfxThreadID;
+#endif
+   ctr_video_t       *ctr         = (ctr_video_t*)data;
    settings_t    *settings        = config_get_ptr();
    unsigned disp_mode             = settings->uints.video_3ds_display_mode;
    bool statistics_show           = video_info->statistics_show;
@@ -1853,10 +1898,6 @@ static bool ctr_frame(void* data, const void* frame,
    float video_refresh_rate       = video_info->refresh_rate;
    struct font_params *osd_params = (struct font_params*)
       &video_info->osd_stat_params;
-   int custom_vp_x                = video_info->custom_vp_x;
-   int custom_vp_y                = video_info->custom_vp_y;
-   unsigned custom_vp_width       = VIDEO_SCALE_W(video_info->custom_vp_dims);
-   unsigned custom_vp_height      = VIDEO_SCALE_H(video_info->custom_vp_dims);
 #ifdef HAVE_MENU
    bool menu_is_alive             = (video_info->menu_st_flags & MENU_ST_FLAG_ALIVE) ? true : false;
 #endif
@@ -2466,6 +2507,11 @@ static void ctr_free(void* data)
    linearFree(ctr->menu.texture_swizzled);
    linearFree(ctr->menu.frame_coords);
    linearFree(ctr->vertex_cache.buffer);
+   if (ctr->white_texture)
+   {
+      linearFree(ctr->white_texture->data);
+      free(ctr->white_texture);
+   }
    linearFree(ctr);
 #if 0
    gfxExit();
@@ -2574,13 +2620,13 @@ static uintptr_t ctr_load_texture(void *video_data, void *data,
    ctr_texture_t *texture      = NULL;
    ctr_video_t            *ctr = (ctr_video_t*)video_data;
    struct texture_image *image = (struct texture_image*)data;
-   u32 size                    = image->width
-      * image->height * sizeof(uint32_t);
-
-   if ((u64)size * 3 > linearSpaceFree())
-      return 0;
+   u32 size;
 
    if (!ctr || !image || image->width > 2048 || image->height > 2048)
+      return 0;
+
+   size = image->width * image->height * sizeof(uint32_t);
+   if ((u64)size * 3 > linearSpaceFree())
       return 0;
 
    texture                     = (ctr_texture_t*)
@@ -2665,6 +2711,43 @@ static uintptr_t ctr_load_texture(void *video_data, void *data,
    return (uintptr_t)texture;
 }
 
+/* Swizzled on the CPU straight into the texture: no staging copy,
+ * and nothing for the transfer engine to finish. */
+static enum video_texture_update ctr_update_texture(void *video_data,
+      uintptr_t id, const struct texture_image *ti, bool threaded)
+{
+   unsigned int i, j;
+   const uint32_t *src;
+   uint32_t       *dst;
+   ctr_video_t     *ctr     = (ctr_video_t*)video_data;
+   ctr_texture_t   *texture = (ctr_texture_t*)id;
+
+   if (     !ctr || !texture || !texture->data
+         || !ti || !ti->pixels || ti->pix10 || ti->fp16
+         || texture->active_width  != ti->width
+         || texture->active_height != ti->height)
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+
+   /* A load's transfer may still be writing it; the frame retires it */
+   if (ctr->ppf_event_pending)
+      return VIDEO_TEXTURE_UPDATE_DROPPED;
+
+   src = ti->pixels;
+   dst = (uint32_t*)texture->data;
+   for (j = 0; j < ti->height; j++)
+      for (i = 0; i < ti->width; i++)
+      {
+         dst[ctrgu_swizzle_coords(i, j, texture->width)] =
+                 ((*src << 8)  & 0xFFFFFF00)
+               | ((*src >> 24) & 0x000000FF);
+         src++;
+      }
+   GSPGPU_FlushDataCache(texture->data, texture->width
+         * texture->height * sizeof(uint32_t));
+
+   return VIDEO_TEXTURE_UPDATE_DONE;
+}
+
 static void ctr_unload_texture(void *data, bool threaded,
       uintptr_t handle)
 {
@@ -2733,7 +2816,6 @@ static bool ctr_overlay_load(void *data,
 {
    unsigned int i, j;
    void *tmpdata;
-   ctr_texture_t       *texture = NULL;
    ctr_video_t             *ctr = (ctr_video_t *)data;
    struct texture_image *images = (struct texture_image *)image_data;
 
@@ -2820,6 +2902,56 @@ static bool ctr_overlay_load(void *data,
    return true;
 }
 
+/* A page of the pack's textures: ctr_load_texture's, in the layout
+ * load()'s own have, uploaded once for every page */
+static bool ctr_overlay_load_textures(void *data,
+      const uintptr_t *textures, unsigned num_textures)
+{
+   unsigned int i;
+   ctr_video_t *ctr = (ctr_video_t *)data;
+
+   if (!ctr)
+      return false;
+
+   ctr_free_overlay(ctr);
+
+   if (!num_textures)
+      return true;
+   if (!(ctr->overlay = (struct ctr_overlay_data *)calloc(num_textures,
+         sizeof(*ctr->overlay))))
+      return false;
+   ctr->overlays         = num_textures;
+   ctr->overlay_borrowed = true;
+
+   for (i = 0; i < num_textures; i++)
+   {
+      ctr_scale_vector_t    *vec = NULL;
+      struct ctr_overlay_data *o = &ctr->overlay[i];
+
+      if (!(o->frame_coords = linearAlloc(sizeof(ctr_vertex_t))))
+      {
+         ctr_free_overlay(ctr);
+         return false;
+      }
+      if (textures[i])
+         o->texture = *(const ctr_texture_t*)textures[i];
+
+      ctr_overlay_tex_geom(ctr, i, 0, 0, 1, 1);
+      ctr_overlay_vertex_geom(ctr, i, 0, 0, 1, 1);
+
+      vec = &o->scale_vector;
+      CTR_SET_SCALE_VECTOR(vec,
+                       CTR_TOP_FRAMEBUFFER_WIDTH,
+                       CTR_TOP_FRAMEBUFFER_HEIGHT,
+                       o->texture.width,
+                       o->texture.height);
+
+      o->alpha_mod = 1.0f;
+   }
+
+   return true;
+}
+
 static void ctr_overlay_enable(void *data, bool state)
 {
    ctr_video_t *ctr = (ctr_video_t *)data;
@@ -2843,6 +2975,8 @@ static void ctr_render_overlay(ctr_video_t *ctr)
 
    for (i = 0; i < ctr->overlays; i++)
    {
+      if (!ctr->overlay[i].frame_coords || !ctr->overlay[i].texture.data)
+         continue;
       ctrGuSetTexture(GPU_TEXUNIT0, VIRT_TO_PHYS(ctr->overlay[i].texture.data), ctr->overlay[i].texture.width, ctr->overlay[i].texture.height,
                       GPU_TEXTURE_MAG_FILTER(GPU_LINEAR) | GPU_TEXTURE_MIN_FILTER(GPU_LINEAR) |
                       GPU_TEXTURE_WRAP_S(GPU_CLAMP_TO_EDGE) | GPU_TEXTURE_WRAP_T(GPU_CLAMP_TO_EDGE),
@@ -2872,7 +3006,7 @@ static void ctr_render_overlay(ctr_video_t *ctr)
 static const video_overlay_interface_t ctr_overlay = {
    ctr_overlay_enable,
    ctr_overlay_load,
-   NULL, /* load_textures */
+   ctr_overlay_load_textures,
    ctr_overlay_tex_geom,
    ctr_overlay_vertex_geom,
    ctr_overlay_full_screen,
@@ -2932,7 +3066,22 @@ static const video_poke_interface_t ctr_poke_interface = {
    NULL, /* set_hdr_paper_white_nits */
    NULL, /* set_hdr_expand_gamut */
    NULL, /* set_hdr_scanlines */
-   NULL  /* set_hdr_subpixel_layout */
+   NULL, /* set_hdr_subpixel_layout */
+   NULL, /* supports_texture_format */
+   NULL, /* load_texture_compressed */
+   NULL, /* present_last */
+   NULL, /* get_last_present_time */
+   NULL, /* hw_ring_install */
+   NULL, /* hw_ring_fence_new */
+   NULL, /* hw_ring_fence_free */
+   NULL, /* hw_ring_fence_signal */
+   NULL, /* hw_ring_fence_wait */
+   NULL, /* hw_ring_capture */
+   NULL, /* hw_ring_present_slot */
+   NULL, /* hw_ring_context_new */
+   NULL, /* hw_ring_context_free */
+   NULL, /* hw_ring_framebuffer */
+   ctr_update_texture
 };
 
 static void ctr_get_poke_interface(void* data,

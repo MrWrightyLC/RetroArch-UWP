@@ -14,8 +14,9 @@
  * If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <objc/objc-runtime.h>
+#import <objc/objc-runtime.h>
 #include "../../apple_runtime.h"
+#include <dlfcn.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -75,6 +76,26 @@
 #include "../../steam/steam.h"
 #endif
 
+/* Selectors this file names with @selector() for methods newer than an
+ * old SDK (each call is behind -respondsToSelector: or a version
+ * check): declared for -Wundeclared-selector only where the SDK has
+ * none, and never implemented, so @selector() stays a constant. */
+#if !defined(MAC_OS_X_VERSION_10_6) || MAC_OS_X_VERSION_MAX_ALLOWED < MAC_OS_X_VERSION_10_6
+@interface NSObject (RetroArchSelectors106)
+- (void)setDirectoryURL:(NSURL *)url;
+- (void)setActivationPolicy:(NSInteger)policy;
+@end
+#endif
+@interface NSObject (RetroArchSelectors107)
+- (void)toggleFullScreen:(id)sender;
+@end
+#if !defined(MAC_OS_X_VERSION_10_9) || MAC_OS_X_VERSION_MAX_ALLOWED < MAC_OS_X_VERSION_10_9
+@interface NSObject (RetroArchSelectors109)
+- (id)beginActivityWithOptions:(unsigned long long)options reason:(NSString *)reason;
+- (void)endActivity:(id)activity;
+@end
+#endif
+
 typedef struct ui_application_cocoa
 {
    void *empty;
@@ -83,6 +104,8 @@ typedef struct ui_application_cocoa
 /* TODO/FIXME - static global variables */
 static int waiting_argc;
 static char **waiting_argv;
+static bool cocoa_termination_pending;
+static bool cocoa_window_restored;
 
 extern id<ApplePlatform> apple_platform;
 
@@ -214,7 +237,27 @@ static bool ui_browser_window_cocoa_open(ui_browser_window_state_t *state)
        * under ARC, required under MRC or the array leaks every time
        * the picker opens with a filter). */
       NSArray *filetypes = [[NSArray alloc] initWithObjects:BOXSTRING(state->filters), BOXSTRING(state->filters_title), nil];
-      [panel setAllowedFileTypes:filetypes];
+      id utt;
+      /* -setAllowedFileTypes: (10.3) is deprecated in 12.0 for
+       * -setAllowedContentTypes: and UTTypes (11.0): 11 on gives the
+       * panel content types, earlier releases the extensions; both by
+       * selector. */
+      if (     apple_runtime_available(APPLE_RUNTIME_VER(11, 0, 0), 0, 0)
+            && (utt = apple_rt_class("UTType")))
+      {
+         NSUInteger i;
+         NSMutableArray *types = [NSMutableArray array];
+         SEL by_ext            = sel_registerName("typeWithFilenameExtension:");
+         for (i = 0; i < [filetypes count]; i++)
+         {
+            id t = apple_rt_get_id_arg(utt, by_ext, [filetypes objectAtIndex:i]);
+            if (t)
+               [types addObject:t];
+         }
+         apple_rt_send_id(panel, sel_registerName("setAllowedContentTypes:"), types);
+      }
+      else
+         apple_rt_send_id(panel, sel_registerName("setAllowedFileTypes:"), filetypes);
       RARCH_RELEASE(filetypes);
    }
 
@@ -342,7 +385,7 @@ static enum ui_msg_window_response ui_msg_window_cocoa_dialog(ui_msg_window_stat
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
       [alert beginSheetModalForWindow:main_window
                         modalDelegate:apple_platform
-                       didEndSelector:@selector(alertDidEnd:returnCode:contextInfo:)
+                       didEndSelector:sel_registerName("alertDidEnd:returnCode:contextInfo:")
                           contextInfo:nil];
 #pragma GCC diagnostic pop
       response = [[NSApplication sharedApplication] runModalForWindow:[alert window]];
@@ -574,29 +617,8 @@ static ui_application_t ui_application_cocoa = {
             CGFloat delta_x             = [event deltaX];
             CGFloat delta_y             = [event deltaY];
             NSPoint pos                 = CONVERT_POINT();
-            cocoa_input_data_t
-               *apple                   = (cocoa_input_data_t*)
-               input_state_get_ptr()->current_data;
-            if (!apple)
-               return;
-            /* Relative */
-            apple->mouse_rel_x         += (int16_t)delta_x;
-            apple->mouse_rel_y         += (int16_t)delta_y;
-
-            /* Absolute */
-            apple->touches[0].screen_x  = (int16_t)pos.x;
-            apple->touches[0].screen_y  = (int16_t)pos.y;
-
-            if (apple->mouse_grabbed)
-            {
-               apple->window_pos_x      += (int16_t)delta_x;
-               apple->window_pos_y      += (int16_t)delta_y;
-            }
-            else
-            {
-               apple->window_pos_x       = (int16_t)pos.x;
-               apple->window_pos_y       = (int16_t)pos.y;
-            }
+            cocoa_input_mouse_moved((int16_t)delta_x, (int16_t)delta_y,
+                  (int16_t)pos.x, (int16_t)pos.y);
          }
          break;
       case NSEventTypeScrollWheel:
@@ -608,13 +630,9 @@ static ui_application_t ui_application_cocoa = {
        {
            NSInteger number      = [event buttonNumber];
            NSPoint pos           = CONVERT_POINT();
-           cocoa_input_data_t
-              *apple             = (cocoa_input_data_t*)
-              input_state_get_ptr()->current_data;
-           if (!apple || pos.y < 0)
+           if (pos.y < 0)
                return;
-           apple->mouse_buttons |= (1 << number);
-           apple->touch_count    = 1;
+           cocoa_input_mouse_button((unsigned)number, true, true);
        }
            break;
       case NSEventTypeLeftMouseUp:
@@ -623,13 +641,9 @@ static ui_application_t ui_application_cocoa = {
          {
             NSInteger number      = [event buttonNumber];
             NSPoint pos           = CONVERT_POINT();
-            cocoa_input_data_t
-              *apple              = (cocoa_input_data_t*)
-              input_state_get_ptr()->current_data;
-            if (!apple || pos.y < 0)
+            if (pos.y < 0)
                return;
-            apple->mouse_buttons &= ~(1 << number);
-            apple->touch_count    = 0;
+            cocoa_input_mouse_button((unsigned)number, false, true);
          }
          break;
       default:
@@ -654,7 +668,7 @@ static ui_application_t ui_application_cocoa = {
  * a panel. Every key that is down right now will be released into that
  * window, so this window never sees the key-up: the key stays "held" in
  * apple_key_state, and a held key is exactly what the menu's flush-and-
- * wait-for-release (menu_st->input_driver_flushing_input) waits on -
+ * wait-for-release (input_driver_hold_held_input()) waits on -
  * for ever, since the release never arrives. That was the desktop
  * companion's "keyboard does not come back after closing it": the hotkey
  * that opened it was still down when the companion took the keyboard.
@@ -705,6 +719,23 @@ static ui_application_t ui_application_cocoa = {
 
 
 @implementation RetroArch_OSX
+
+#if defined(__BLOCKS__)
++ (void)restoreWindowWithIdentifier:(NSString *)identifier
+                             state:(NSCoder *)state
+                 completionHandler:(void (^)(NSWindow *, NSError *))completionHandler
+{
+   RetroArch_OSX *delegate = (RetroArch_OSX *)[NSApp delegate];
+   (void)state;
+   if ([identifier isEqualToString:@"RetroArchMainWindow"] && delegate.window)
+   {
+      cocoa_window_restored = true;
+      completionHandler(delegate.window, nil);
+   }
+   else
+      completionHandler(nil, nil);
+}
+#endif
 
 /* Written out rather than synthesized: a synthesized retain property
  * calls objc_setProperty / objc_getProperty, which the 10.4 runtime
@@ -764,16 +795,9 @@ static ui_application_t ui_application_cocoa = {
    apple_platform   = self;
    [self.window setAcceptsMouseMovedEvents: YES];
 
-   /* Full-screen-primary is 10.7; the property is on NSWindow from
-    * 10.5, so ask whether this system knows the behaviour rather than
-    * whether the build SDK declared the constant, which is spelled out
-    * above. Setting it on 10.5 or 10.6 would leave a window the system
-    * cannot full-screen anyway; there the bit is left alone. */
-   /* NSAppKitVersionNumber10_6 is 1038; 10.7 is 1138. */
-   if (     [self.window respondsToSelector:@selector(setCollectionBehavior:)]
-         && NSAppKitVersionNumber >= 1138.0)
-      [self.window setCollectionBehavior:
-            NS_WINDOW_COLLECTION_BEHAVIOR_FULLSCREEN_PRIMARY];
+   if (!cocoa_window_restored)
+      [self.window makeKeyAndOrderFront:nil];
+   [NSApp activateIgnoringOtherApps:YES];
 
    _listener = [WindowListener new];
    [_listener setWindow:self.window];
@@ -794,14 +818,15 @@ static ui_application_t ui_application_cocoa = {
    if (rarch_main(waiting_argc, waiting_argv, NULL))
       [[NSApplication sharedApplication] terminate:nil];
 
+   cocoa_window_restored = false;
    waiting_argc = 0;
 
    [self setupMainWindow];
 
 #if HAVE_SWIFT
-   if (apple_runtime_available(APPLE_RUNTIME_VER(13, 0, 0), 0, 0)) {
-      [RetroArchAppShortcuts updateAppShortcuts];
-   }
+   if (apple_runtime_available(APPLE_RUNTIME_VER(13, 0, 0), 0, 0))
+      apple_rt_send_void(apple_rt_class("RetroArchAppShortcuts"),
+            sel_registerName("updateAppShortcuts"));
 #endif
 
 #ifdef HAVE_QT
@@ -1011,6 +1036,10 @@ static ui_application_t ui_application_cocoa = {
 {
    BOOL is_fullscreen = [self isFullScreen];
 
+   /* AppKit owns the restored frame and full-screen transition at launch. */
+   if (cocoa_window_restored)
+      return;
+
    if (mode.fullscreen)
    {
       if (!is_fullscreen)
@@ -1189,13 +1218,20 @@ void cocoa_publish_focus(bool focused);
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)theApplication { return YES; }
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender
 {
-   NSApplicationTerminateReply reply = NSTerminateNow;
+   if (!runloop_is_inited())
+      return NSTerminateNow;
 
-   command_event(CMD_EVENT_QUIT, NULL);
+   if (!cocoa_termination_pending)
+   {
+      cocoa_termination_pending = true;
+      command_event(CMD_EVENT_QUIT, NULL);
+#ifdef HAVE_QT
+      /* AppKit's pending termination runs a modal loop, not the Qt loop. */
+      rarch_start_draw_observer();
+#endif
+   }
 
-   rarch_stop_draw_observer();
-
-   return reply;
+   return NSTerminateLater;
 }
 
 - (void)application:(NSApplication *)sender openFiles:(NSArray *)filenames
@@ -1362,7 +1398,9 @@ static void open_document_handler(
 {
    settings_t          *settings = config_get_ptr();
    const char *path_dir_libretro = settings->paths.directory_libretro;
-   [[NSWorkspace sharedWorkspace] openFile:BOXSTRING(path_dir_libretro)];
+   /* -openFile: is deprecated in 11.0; -openURL: with a file URL opens
+    * the folder the same way on every release. */
+   [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:BOXSTRING(path_dir_libretro)]];
 }
 
 - (IBAction)basicEvent:(id)sender
@@ -1641,8 +1679,9 @@ static NSMenu *cocoa_create_help_menu(void)
     * help menu still appears in the menu bar via setMainMenu; this
     * call is only about telling AppKit which one to route Spotlight-
     * for-Help into. */
-   if ([NSApp respondsToSelector:@selector(setHelpMenu:)])
-      [NSApp setHelpMenu:menu];
+   if ([NSApp respondsToSelector:sel_registerName("setHelpMenu:")])
+      ((void (*)(id, SEL, id))objc_msgSend)(NSApp,
+            sel_registerName("setHelpMenu:"), menu);
    RARCH_AUTORELEASE(menu);
    return menu;
 }
@@ -1712,6 +1751,32 @@ static NSWindow *cocoa_create_main_window(void)
    [window setReleasedWhenClosed:NO];
    [window setAllowsToolTipsWhenApplicationIsInactive:NO];
    [window center];
+   /* Set before AppKit restores a native full-screen window (10.7+). */
+   if (     [window respondsToSelector:@selector(setCollectionBehavior:)]
+         && NSAppKitVersionNumber >= 1138.0)
+      [window setCollectionBehavior:
+            NS_WINDOW_COLLECTION_BEHAVIOR_FULLSCREEN_PRIMARY];
+#if defined(__BLOCKS__)
+   SEL set_identifier = sel_registerName("setIdentifier:");
+   SEL set_restoration = sel_registerName("setRestorationClass:");
+   if (     [window respondsToSelector:set_identifier]
+         && [window respondsToSelector:set_restoration])
+   {
+      Protocol *(*get_protocol)(const char *) =
+            (Protocol *(*)(const char *))dlsym(RTLD_DEFAULT, "objc_getProtocol");
+      BOOL (*add_protocol)(Class, Protocol *) =
+            (BOOL (*)(Class, Protocol *))dlsym(RTLD_DEFAULT, "class_addProtocol");
+      Protocol *protocol = get_protocol
+            ? get_protocol("NSWindowRestoration") : nil;
+      Class restoration_class = [RetroArch_OSX class];
+      apple_rt_send_id(window, set_identifier, @"RetroArchMainWindow");
+      if (protocol && ([restoration_class conformsToProtocol:protocol]
+               || (add_protocol && add_protocol(restoration_class, protocol))))
+         apple_rt_send_id(window, set_restoration, restoration_class);
+      else
+         RARCH_WARN("[Cocoa] Window restoration protocol unavailable.\n");
+   }
+#endif
    return window;
 }
 
@@ -1767,8 +1832,6 @@ int main(int argc, char *argv[])
 
       cocoa_create_menu_bar(delegate);
 
-      [window makeKeyAndOrderFront:nil];
-      [NSApp activateIgnoringOtherApps:YES];
       [NSApp run];
    RARCH_AUTORELEASEPOOL_END
    return 0;
@@ -1776,7 +1839,13 @@ int main(int argc, char *argv[])
 
 static void ui_companion_cocoa_deinit(void *data)
 {
-   [[NSApplication sharedApplication] terminate:nil];
+   if (cocoa_termination_pending)
+   {
+      cocoa_termination_pending = false;
+      [[NSApplication sharedApplication] replyToApplicationShouldTerminate:YES];
+   }
+   else
+      [[NSApplication sharedApplication] terminate:nil];
 }
 
 static void *ui_companion_cocoa_init(void) { return (void*)-1; }

@@ -18,6 +18,8 @@
 #   make check SANITIZER=address
 #   make check SANITIZER=undefined
 
+include ../../sample_objdir.mk
+
 TARGET            := cloudsync_savefile_owner_test
 PATH_TARGET       := cloudsync_path_safety_test
 CORE_DIR          := ../../..
@@ -42,7 +44,7 @@ SOURCES := \
 	$(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
 	$(LIBRETRO_COMM_DIR)/compat/compat_strcasestr.c
 
-OBJS := $(SOURCES:.c=.o)
+OBJS := $(call sample_objs,$(SOURCES:.c=.o))
 
 PATH_OBJS := cloudsync_path_safety_test.o
 
@@ -80,6 +82,11 @@ ASYNC_DEFS    := -DHAVE_THREADS -DRARCH_INTERNAL -DHAVE_CLOUDSYNC \
 
 ADDS_DEFS    := -DHAVE_THREADS -DRARCH_INTERNAL -DHAVE_CLOUDSYNC \
 	-DHAVE_NETWORKING -I$(CORE_DIR)/deps
+# FORCE_LOCK=1: the hand-over under tcs_manifest_lock, as a backend with
+# no pointer atomics builds it, on this host's backend
+ifneq ($(FORCE_LOCK),)
+   ADDS_DEFS += -DTASK_CLOUDSYNC_FORCE_LOCK
+endif
 
 CFLAGS += -Wall -pedantic -std=gnu99 -g -O1 -fno-omit-frame-pointer \
           -I$(LIBRETRO_COMM_DIR)/include -I$(CORE_DIR)
@@ -92,6 +99,10 @@ endif
 all: $(TARGET) $(PATH_TARGET) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET)
 
 %.o: %.c
+	$(CC) -c -o $@ $< $(CFLAGS)
+
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
 	$(CC) -c -o $@ $< $(CFLAGS)
 
 $(TARGET): $(OBJS)
@@ -117,6 +128,7 @@ check: $(TARGET) $(PATH_TARGET) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET)
 	./$(ASYNC_TARGET)
 
 clean:
+	rm -rf $(SAMPLE_OBJDIR)
 	rm -f $(TARGET) $(OBJS) $(PATH_TARGET) $(PATH_OBJS) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET)
 
 .PHONY: all check clean

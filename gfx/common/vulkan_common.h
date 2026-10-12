@@ -131,7 +131,13 @@ enum vk_flags
    /* Held across creating a frame texture to lend the core: it stays in
     * cached system memory, never video memory, because the core and the
     * frontend may read a lent frame back. */
-   VK_FLAG_TEXTURE_FOR_LEND     = (1 << 21)
+   VK_FLAG_TEXTURE_FOR_LEND     = (1 << 21),
+   /* frontend uses openxr */
+   VK_FLAG_OPEN_XR              = (1 << 22),
+   /* core opted into VR via SET_VIDEO_VIEWS */
+   VK_FLAG_XR_STEREO            = (1 << 23),
+   /* Held across creating a texture a compute shader writes */
+   VK_FLAG_TEXTURE_FOR_STORAGE  = (1 << 24)
 };
 
 enum vk_texture_type
@@ -181,7 +187,10 @@ enum vulkan_context_flags
    /* Whether HDR colorspaces are supported by the instance */
    VK_CTX_FLAG_HDR_SUPPORT                  = (1 << 5),
    /* scRGB mode: RGBA16F swapchain with extended linear sRGB colour space */
-   VK_CTX_FLAG_HDR_SCRGB                    = (1 << 6)
+   VK_CTX_FLAG_HDR_SCRGB                    = (1 << 6),
+   /* The device was made with timeline semaphores, which imported
+    * frames are synchronised with */
+   VK_CTX_FLAG_TIMELINE_SEMAPHORE           = (1 << 7)
 };
 
 enum gfx_ctx_vulkan_data_flags
@@ -209,10 +218,30 @@ enum vk_texture_flags
    VK_TEX_FLAG_BAR_MAPPED                   = (1 << 3)
 };
 
+/* The settings a swapchain is made from.  The thread that draws can
+ * make one (a lost swapchain is remade on the next acquire), so it is
+ * made from this copy: seeded when the context is made, and taken
+ * from each frame after that, never read from the settings there. */
+typedef struct vulkan_swapchain_settings
+{
+   float    display_peak;        /* nits; 0 for the fixed metadata  */
+   unsigned hdr_mode;
+   unsigned bit_depth;           /* video_swapchain_bit_depth       */
+   unsigned max_images;
+   unsigned fse_negotiation;
+   bool     vsync;
+   bool     adaptive_vsync;
+   bool     windowed_fullscreen;
+   bool     dxgi_present;
+} vulkan_swapchain_settings_t;
+
 typedef struct vulkan_context
 {
    slock_t *queue_lock;
    retro_vulkan_destroy_device_t destroy_device;   /* ptr alignment */
+   /* Headset output, or NULL. Always present, like debug_callback: every
+    * translation unit that includes this header shares the layout. */
+   struct vulkan_openxr *xr;
 
    VkInstance instance;
    VkPhysicalDevice gpu;
@@ -235,6 +264,7 @@ typedef struct vulkan_context
    unsigned swapchain_never_presented;
    /* The device in use, as the GPU list numbers it */
    int gpu_index;
+   bool swapchain_external;
    VkImage swapchain_images[VULKAN_MAX_SWAPCHAIN_IMAGES];
    VkFence swapchain_fences[VULKAN_MAX_SWAPCHAIN_IMAGES];
    VkFormat swapchain_format;
@@ -283,6 +313,7 @@ typedef struct vulkan_context
 
    unsigned swapchain_dims;      /* VIDEO_SCALE_PACK */
    unsigned num_recycled_acquire_semaphores;
+   vulkan_swapchain_settings_t swapchain_settings;
    /* Present mode the current swapchain was created with; compared
     * against the mode a new swap_interval resolves to so a request
     * that would not change the swapchain does not recreate it. */
@@ -337,6 +368,9 @@ typedef struct gfx_ctx_vulkan_data
    VkSurfaceKHR vk_surface;      /* ptr alignment */
    VkSwapchainKHR swapchain;     /* ptr alignment */
    struct vulkan_emulated_mailbox mailbox;
+   void *dxgi_presenter;
+   void *dxgi_window;
+   bool dxgi_failed;
    uint8_t flags;
    enum vulkan_wsi_type wsi_type;
    bool fse_supported;
@@ -362,6 +396,17 @@ typedef struct gfx_ctx_vulkan_data
    PFN_vkSetHdrMetadataEXT set_hdr_metadata;
 #endif
 } gfx_ctx_vulkan_data_t;
+
+static INLINE bool vulkan_has_swapchain(const gfx_ctx_vulkan_data_t *vk)
+{
+   return vk->swapchain != VK_NULL_HANDLE || vk->context.swapchain_external;
+}
+
+static INLINE VkImageLayout vulkan_swapchain_layout(const vulkan_context_t *ctx)
+{
+   return ctx->swapchain_external ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+}
+
 
 struct vulkan_display_surface_info
 {
@@ -441,6 +486,15 @@ void vulkan_debug_mark_buffer(VkDevice device, VkBuffer buffer);
 
 bool vulkan_context_init(gfx_ctx_vulkan_data_t *vk,
       enum vulkan_wsi_type type);
+
+#ifdef HAVE_OPENXR
+bool vulkan_context_init_headless_device(gfx_ctx_vulkan_data_t *vk);
+#endif
+#if defined(HAVE_OPENXR) && defined(ANDROID)
+bool vulkan_context_create_android_surface(gfx_ctx_vulkan_data_t *vk,
+   void *window);
+void vulkan_context_advance_frame(gfx_ctx_vulkan_data_t *vk);
+#endif
 
 #ifdef __APPLE__
 /* Returns the version string of the MoltenVK implementation in use,

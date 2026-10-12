@@ -282,6 +282,14 @@ platform_video "gx video" "-DGEKKO -DHW_RVL" "-I$STUBS/gx" \
 # Wii's configuration; nothing compiled that branch.
 platform_video "gx video (GameCube)" "-DGEKKO -DHW_DOL" "-I$STUBS/gx" \
    gfx/drivers/gx_gfx_libogc.c ""
+# Their overlays, and os/gekko's own driver against its headers: no
+# lane compiled either until the textures and overlay packs reached them.
+platform_video "gx video: overlay" "-DGEKKO -DHW_RVL -DHAVE_OVERLAY" \
+   "-I$STUBS/gx" gfx/drivers/gx_gfx_libogc.c ""
+platform_video "gekko video" "$HOSTOFF -DGEKKO -DHW_RVL -DHAVE_OVERLAY" \
+   "-Ios/gekko/include" gfx/drivers/gekko_gfx.c ""
+platform_video "gekko video (GameCube)" "$HOSTOFF -DGEKKO -DHW_DOL -DHAVE_OVERLAY" \
+   "-Ios/gekko/include" gfx/drivers/gekko_gfx.c ""
 platform_video "switch video" \
    "-DHAVE_LIBNX -DSWITCH -D__SWITCH__" "-I$STUBS/libnx" \
    gfx/drivers/switch_nx_gfx.c ""
@@ -542,6 +550,12 @@ check "gl3: desktop" \
    "$GL3DEFS $GLINC" gfx/drivers/gl3.c
 check "gl3: GLES3" \
    "$GL3DEFS -DHAVE_OPENGLES -DHAVE_OPENGLES3 -DHAVE_EGL $GLINC" gfx/drivers/gl3.c
+# The planar converter both GL drivers share: legacy and core GLSL, a
+# VAO and row lengths only where the API has them
+check "gl_common: GLES2" \
+   "$GLDEFS -DHAVE_OPENGLES -DHAVE_OPENGLES2 -DHAVE_EGL $GLINC" gfx/common/gl_common.c
+check "gl_common: GLES3" \
+   "$GL3DEFS -DHAVE_OPENGLES -DHAVE_OPENGLES3 -DHAVE_EGL $GLINC" gfx/common/gl_common.c
 # gl3 is not in the C89 job's configuration, so its C89 lane is here.
 # The flags the Makefile's C89_BUILD lane uses, _GNU_SOURCE included:
 # -ansi hides the C99 math names otherwise.
@@ -593,6 +607,15 @@ win32_audio "wasapi: C89, microphone" "-DHAVE_WASAPI -DHAVE_MICROPHONE" \
    audio/drivers/wasapi.c
 win32_audio "wasapi: C89, no microphone" "-DHAVE_WASAPI" \
    audio/drivers/wasapi.c
+win32_audio "wdmks: C89" "-DHAVE_WDMKS -DHAVE_MICROPHONE" \
+   audio/drivers/wdmks.c
+# WDM-KS keeps an inline path for builds without threads, which no
+# Windows job builds.
+SAVED_BASE=$BASE
+BASE=$NOTHREADS_BASE
+win32_audio "wdmks: C89, no threads" "-DHAVE_WDMKS -DHAVE_MICROPHONE" \
+   audio/drivers/wdmks.c
+BASE=$SAVED_BASE
 check "hw ring: OpenGL only" \
    "-DHAVE_OPENGL $GLINC" gfx/video_thread_hw.c
 check "hw ring: GLES only" \
@@ -671,8 +694,8 @@ check "features_cpu: emscripten" "$HOSTOFF -Itools/platform_stubs/emscripten -D_
 # the stubs already here and shed the host identity like the ones
 # above.
 MENUGFX="gfx/video_driver.c gfx/gfx_display.c gfx/gfx_widgets.c \
- gfx/gfx_thumbnail.c gfx/gfx_surface.c gfx/video_thread_wrapper.c \
- menu/drivers/xmb.c menu/drivers/ozone.c menu/drivers/materialui.c"
+ gfx/gfx_thumbnail.c gfx/gfx_surface.c gfx/gfx_surface_player.c \
+ gfx/video_thread_wrapper.c menu/drivers/xmb.c menu/drivers/ozone.c menu/drivers/materialui.c"
 MG_BASE="-DHAVE_XMB -DHAVE_OZONE -DHAVE_MATERIALUI -DHAVE_RGUI \
  -DHAVE_GFX_WIDGETS -DHAVE_OVERLAY -DHAVE_CONFIGFILE -DRARCH_CONSOLE \
  -DRARCH_INTERNAL -Iinput/include"
@@ -770,10 +793,18 @@ for tu in libretro-common/crypto/crypto.c libretro-common/crypto/kdf.c libretro-
       libretro-common/vfs/vfs_prefetch.c network/tls_log.c; do
    android_clang "android clang/aarch64: $(basename $tu)" "$ANDROID_NET" "$tu"
 done
+android_clang "android clang/aarch64: camera" "-Itools/platform_stubs/android -DHAVE_OPENGLES -DHAVE_OPENGLES2 -DHAVE_CAMERA -DRARCH_INTERNAL -include tools/platform_stubs/android/jni.h -include frontend/drivers/platform_unix.h -include verbosity.h" camera/drivers/android.c
 # rwebaudio is its own translation unit in the emscripten build, not
 # part of griffin's, and nothing else compiles it at all.
 check "emscripten: rwebaudio"  "$HOSTOFF -Itools/platform_stubs/emscripten -D__EMSCRIPTEN__ -DEMSCRIPTEN -DHAVE_RWEBAUDIO $CDECL" audio/drivers/rwebaudio.c
 check "emscripten: rwebcam"    "$HOSTOFF -Itools/platform_stubs/emscripten -D__EMSCRIPTEN__ -DEMSCRIPTEN $CDECL" camera/drivers/rwebcam.c
+# The Android camera driver is only ever compiled inside griffin on the
+# Android job, after platform_unix.h; the same shape here, so the C of
+# it is checked on every push.
+check "android: camera"        "$HOSTOFF -Itools/platform_stubs/android -DANDROID -DHAVE_OPENGLES -DHAVE_OPENGLES2 -DHAVE_CAMERA -include tools/platform_stubs/android/jni.h -include frontend/drivers/platform_unix.h -include verbosity.h $CDECL" camera/drivers/android.c
+[ -f /usr/include/linux/videodev2.h ] \
+   && check "camera: v4l2"     "-DHAVE_V4L2 -DHAVE_CAMERA $CDECL" camera/drivers/video4linux2.c \
+   || echo "skip  camera: v4l2 (no /usr/include/linux/videodev2.h)"
 
 # Two more that no job here compiles: the S3 cloud-sync backend, which
 # only griffin includes and which nothing defines HAVE_S3 for, and the
@@ -842,8 +873,8 @@ check "dingux: rgui" "-DDINGUX -DHAVE_MENU -DHAVE_RGUI" menu/drivers/rgui.c
 # colour conversion sit behind HAVE_THREADS; both shapes compile.
 check "vp9/h265/video streams: threads" "-DHAVE_RVP9 -DHAVE_RVP8 -DHAVE_RWEBM -DHAVE_RMP4 -DHAVE_RH264 -DHAVE_RH265" libretro-common/formats/vp9/rvp9.c libretro-common/formats/h265/rh265.c libretro-common/formats/webm/rwebm_video.c libretro-common/formats/mp4/rmp4_video.c libretro-common/formats/image/image_blit_bands.c
 check_nothreads "no threads: vp9/h265/video streams" "-DHAVE_RVP9 -DHAVE_RVP8 -DHAVE_RWEBM -DHAVE_RMP4 -DHAVE_RH264 -DHAVE_RH265" libretro-common/formats/vp9/rvp9.c libretro-common/formats/h265/rh265.c libretro-common/formats/webm/rwebm_video.c libretro-common/formats/mp4/rmp4_video.c libretro-common/formats/image/image_blit_bands.c
-check "gfx_surface: threads" "$GLINC" gfx/gfx_surface.c gfx/gfx_thumbnail.c
-check_nothreads "no threads: gfx_surface" "$GLINC" gfx/gfx_surface.c gfx/gfx_thumbnail.c
+check "gfx_surface: threads" "$GLINC" gfx/gfx_surface.c gfx/gfx_thumbnail.c gfx/gfx_surface_player.c libretro-common/formats/video_player.c
+check_nothreads "no threads: gfx_surface" "$GLINC" gfx/gfx_surface.c gfx/gfx_thumbnail.c gfx/gfx_surface_player.c libretro-common/formats/video_player.c
 check_nothreads "no threads: gl2"          "$GLDEFS $GLINC"       gfx/drivers/gl2.c
 check_nothreads "no threads: video_driver" "$GLINC"               gfx/video_driver.c
 check_nothreads "no threads: retroarch"    "$GLINC -DHAVE_COMMAND -DHAVE_STDIN_CMD" retroarch.c
@@ -1149,5 +1180,8 @@ check "unity: gl2 + gl3 + vulkan in one translation unit" \
    "-Igfx/include -DHAVE_OPENGL -DHAVE_OPENGL_CORE -DHAVE_GLSL -DHAVE_VULKAN -DHAVE_SLANG -DHAVE_SHADERPIPELINE -DHAVE_SPIRV_CROSS -DHAVE_GFX_WIDGETS -DHAVE_OVERLAY -DHAVE_X11" \
    "$UNITY_DIR/unity_gfx.c"
 rm -rf "$UNITY_DIR"
+
+check "image YUV: PS2 C89" "-DPS2 -DRARCH_CONSOLE $HOSTOFF -std=c89" \
+   libretro-common/formats/image/image_yuv_blit.c
 
 exit $fail

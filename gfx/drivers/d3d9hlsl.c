@@ -921,7 +921,7 @@ static void gfx_display_d3d9_hlsl_draw(gfx_display_ctx_draw_t *draw,
        * (the packed y is height - y - h). The Y-flip here undoes that,
        * then topdown_ortho applies the correct top-down mapping. */
       x1 = VIDEO_POS_X(draw->pos) / (float)video_width;
-      y1 = ((float)video_height - VIDEO_POS_Y(draw->pos) - VIDEO_SCALE_H(draw->dims)) / (float)video_height;
+      y1 = (float)VIDEO_POS_FLIP_Y(video_height, draw->pos, draw->dims) / (float)video_height;
       x2 = (VIDEO_POS_X(draw->pos) + VIDEO_SCALE_W(draw->dims))  / (float)video_width;
       y2 = ((float)video_height - VIDEO_POS_Y(draw->pos)) / (float)video_height;
 
@@ -948,7 +948,7 @@ static void gfx_display_d3d9_hlsl_draw(gfx_display_ctx_draw_t *draw,
       {
          float cx     = (x1 + x2) * 0.5f;
          float cy     = (y1 + y2) * 0.5f;
-         float half_w = VIDEO_SCALE_W(draw->dims)  * 0.5f;
+         float half_w = VIDEO_SCALE_W(draw->dims) * 0.5f;
          float half_h = VIDEO_SCALE_H(draw->dims) * 0.5f;
          if (draw->scale_factor && draw->scale_factor != 1.0f)
          {
@@ -1397,8 +1397,7 @@ typedef struct
    const font_renderer_driver_t *font_driver;
    void                         *font_data;
    struct font_atlas             *atlas;
-   unsigned                      tex_width;
-   unsigned                      tex_height;
+   unsigned                      tex_dims;
    /* Scratch buffer to avoid per-line malloc/free in font rendering */
    Vertex                       *scratch_verts;
    unsigned                      scratch_capacity; /* in Vertex count */
@@ -1431,20 +1430,18 @@ static void *d3d9_font_init(void *data,
       if (     SUCCEEDED(IDirect3DDevice9_GetDeviceCaps(d3d->dev, &caps))
             && caps.MaxTextureWidth  > 0
             && caps.MaxTextureHeight > 0)
-      {
-         font->atlas->max_width  = caps.MaxTextureWidth;
-         font->atlas->max_height = caps.MaxTextureHeight;
-      }
+         font->atlas->max_dims = VIDEO_SCALE_PACK(
+               caps.MaxTextureWidth, caps.MaxTextureHeight);
    }
-   font->tex_width  = font->atlas->width;
-   font->tex_height = font->atlas->height;
+   font->tex_dims   = VIDEO_SCALE_PACK(font->atlas->width,
+         font->atlas->height);
 
    /* Create an A8R8G8B8 texture from the A8 atlas buffer.
     * D3D9 doesn't universally support D3DFMT_A8
     * as a texture format, so we expand it. */
    font->texture    = NULL;
    IDirect3DDevice9_CreateTexture(d3d->dev,
-         font->tex_width, font->tex_height, 1,
+         VIDEO_SCALE_W(font->tex_dims), VIDEO_SCALE_H(font->tex_dims), 1,
          0, D3DFMT_A8R8G8B8,
          D3DPOOL_MANAGED,
          (struct IDirect3DTexture9**)&font->texture, NULL);
@@ -1681,18 +1678,18 @@ static void d3d9_font_render_msg(
        * will have wrong UVs or missing data. */
       bool respecified = false;
 
-      if (   font->atlas->width  != font->tex_width
-          || font->atlas->height != font->tex_height)
+      if (font->tex_dims != VIDEO_SCALE_PACK(font->atlas->width,
+               font->atlas->height))
       {
          respecified      = true;
          if (font->texture)
             IDirect3DTexture9_Release(font->texture);
 
-         font->tex_width  = font->atlas->width;
-         font->tex_height = font->atlas->height;
+         font->tex_dims   = VIDEO_SCALE_PACK(font->atlas->width,
+               font->atlas->height);
          font->texture    = NULL;
          IDirect3DDevice9_CreateTexture(d3d->dev,
-               font->tex_width, font->tex_height, 1,
+               VIDEO_SCALE_W(font->tex_dims), VIDEO_SCALE_H(font->tex_dims), 1,
                0, D3DFMT_A8R8G8B8,
                D3DPOOL_MANAGED,
                (struct IDirect3DTexture9**)&font->texture, NULL);
@@ -1700,46 +1697,54 @@ static void d3d9_font_render_msg(
 
       if (font->texture)
       {
-         unsigned i, j;
-         D3DLOCKED_RECT lr;
-         RECT rect;
-         unsigned x0 = font->atlas->dirty_x0;
-         unsigned y0 = font->atlas->dirty_y0;
-         unsigned x1 = font->atlas->dirty_x1;
-         unsigned y1 = font->atlas->dirty_y1;
-
+         unsigned r;
          /* A recreated texture has no previous contents, so the whole
-          * atlas must be converted; otherwise only the dirty
-          * rectangle tracked by the font renderers needs it. Managed
-          * pool textures track locked sub-rects natively. */
-         if (     respecified
-               || x1 <= x0 || y1 <= y0
-               || x1 > (unsigned)font->atlas->width
-               || y1 > (unsigned)font->atlas->height)
+          * atlas is converted; otherwise each dirty rectangle the font
+          * renderers tracked. Managed pool textures track locked
+          * sub-rects natively. */
+         unsigned rects = respecified
+            ? 1 : font_atlas_dirty_rects(font->atlas);
+         for (r = 0; r < rects; r++)
          {
-            x0 = 0;
-            y0 = 0;
-            x1 = font->atlas->width;
-            y1 = font->atlas->height;
-         }
-         rect.left   = (LONG)x0;
-         rect.top    = (LONG)y0;
-         rect.right  = (LONG)x1;
-         rect.bottom = (LONG)y1;
+            unsigned i, j, xy0, xy1, x0, y0, x1, y1;
+            D3DLOCKED_RECT lr;
+            RECT rect;
+            font_atlas_dirty_rect(font->atlas, r, &xy0, &xy1);
+            x0 = VIDEO_SCALE_W(xy0);
+            y0 = VIDEO_SCALE_H(xy0);
+            x1 = VIDEO_SCALE_W(xy1);
+            y1 = VIDEO_SCALE_H(xy1);
 
-         if (SUCCEEDED(IDirect3DTexture9_LockRect(
-                     font->texture, 0, &lr, &rect, 0)))
-         {
-            /* lr.pBits addresses the top-left of the locked rect */
-            for (j = 0; j < y1 - y0; j++)
+            if (     respecified
+                  || x1 <= x0 || y1 <= y0
+                  || x1 > (unsigned)font->atlas->width
+                  || y1 > (unsigned)font->atlas->height)
             {
-               uint32_t       *dst = (uint32_t*)((uint8_t*)lr.pBits + j * lr.Pitch);
-               const uint8_t  *src = font->atlas->buffer
-                     + (size_t)(y0 + j) * font->atlas->width + x0;
-               for (i = 0; i < x1 - x0; i++)
-                  dst[i] = D3DCOLOR_ARGB(src[i], 0xFF, 0xFF, 0xFF);
+               x0 = 0;
+               y0 = 0;
+               x1 = font->atlas->width;
+               y1 = font->atlas->height;
             }
-            IDirect3DTexture9_UnlockRect(font->texture, 0);
+            rect.left   = (LONG)x0;
+            rect.top    = (LONG)y0;
+            rect.right  = (LONG)x1;
+            rect.bottom = (LONG)y1;
+
+            if (SUCCEEDED(IDirect3DTexture9_LockRect(
+                        font->texture, 0, &lr, &rect, 0)))
+            {
+               /* lr.pBits addresses the top-left of the locked rect */
+               for (j = 0; j < y1 - y0; j++)
+               {
+                  uint32_t       *dst = (uint32_t*)((uint8_t*)lr.pBits
+                        + j * lr.Pitch);
+                  const uint8_t  *src = font->atlas->buffer
+                        + (size_t)(y0 + j) * font->atlas->width + x0;
+                  for (i = 0; i < x1 - x0; i++)
+                     dst[i] = D3DCOLOR_ARGB(src[i], 0xFF, 0xFF, 0xFF);
+               }
+               IDirect3DTexture9_UnlockRect(font->texture, 0);
+            }
          }
       }
       font->atlas->dirty = false;
@@ -1796,12 +1801,12 @@ static void d3d9_font_render_msg(
       d3d9_font_emit_quad(dst, \
             ((px) + (glyph)->draw_offset_x * scale) * inv_vp_w, \
             ((py) + (glyph)->draw_offset_y * scale) * inv_vp_h, \
-            (glyph)->width  * scale * inv_vp_w, \
-            (glyph)->height * scale * inv_vp_h, \
-            (glyph)->atlas_offset_x * inv_tex_w, \
-            (glyph)->atlas_offset_y * inv_tex_h, \
-            (glyph)->width  * inv_tex_w, \
-            (glyph)->height * inv_tex_h, \
+            VIDEO_SCALE_W((glyph)->dims) * scale * inv_vp_w, \
+            VIDEO_SCALE_H((glyph)->dims) * scale * inv_vp_h, \
+            VIDEO_SCALE_W((glyph)->atlas_pos) * inv_tex_w, \
+            VIDEO_SCALE_H((glyph)->atlas_pos) * inv_tex_h, \
+            VIDEO_SCALE_W((glyph)->dims) * inv_tex_w, \
+            VIDEO_SCALE_H((glyph)->dims) * inv_tex_h, \
             col)
 #define FONT_LAYOUT_ALIGNED (text_align == TEXT_ALIGN_RIGHT \
             || text_align == TEXT_ALIGN_CENTER)
@@ -1819,8 +1824,8 @@ static void d3d9_font_render_msg(
          verts_f   = verts_s + (bytes) * 6; \
          inv_vp_w  = 1.0f / (float)width; \
          inv_vp_h  = 1.0f / (float)height; \
-         inv_tex_w = 1.0f / (float)font->tex_width; \
-         inv_tex_h = 1.0f / (float)font->tex_height; \
+         inv_tex_w = 1.0f / (float)VIDEO_SCALE_W(font->tex_dims); \
+         inv_tex_h = 1.0f / (float)VIDEO_SCALE_H(font->tex_dims); \
          if (text_align == TEXT_ALIGN_RIGHT) \
             fx -= (float)((line_width) * scale) / (float)width; \
          else if (text_align == TEXT_ALIGN_CENTER) \
@@ -7081,8 +7086,7 @@ static bool d3d9_hlsl_initialize(
    if (!d3d->menu_display.buffer)
       return false;
 
-   /* Create a 1x1 white fallback texture for draws with no texture
-    * (e.g. widget background quads when gfx_white_texture is not loaded) */
+   /* Sampled by a quad drawn with no texture: solid colour */
    if (!d3d9_hlsl_white_texture)
    {
       IDirect3DDevice9_CreateTexture(d3d->dev, 1, 1, 1,
@@ -7178,8 +7182,7 @@ static bool d3d9_hlsl_set_shader(void *data,
 }
 
 static bool d3d9_hlsl_init_internal(d3d9_video_t *d3d,
-      const video_info_t *info, input_driver_t **input,
-      void **input_data)
+      const video_info_t *info)
 {
 #ifdef HAVE_MONITOR
    bool windowed_full;
@@ -7265,7 +7268,7 @@ static bool d3d9_hlsl_init_internal(d3d9_video_t *d3d,
 
    /* no input driver of this driver's own: the frontend starts the
     * one that goes with a Windows window */
-   input_driver_left_to_frontend(INPUT_WINDOW_WINDOWS, input, input_data);
+   input_driver_video_window(INPUT_WINDOW_WINDOWS, NULL);
 
    {
       char version_str[128];
@@ -7289,8 +7292,7 @@ static bool d3d9_hlsl_init_internal(d3d9_video_t *d3d,
    return true;
 }
 
-static void *d3d9_hlsl_init(const video_info_t *info,
-      input_driver_t **input, void **input_data)
+static void *d3d9_hlsl_init(const video_info_t *info)
 {
    d3d9_video_t *d3d = (d3d9_video_t*)calloc(1, sizeof(*d3d));
 
@@ -7314,7 +7316,7 @@ static void *d3d9_hlsl_init(const video_info_t *info,
    d3d->should_resize        = false;
    d3d->menu                 = NULL;
 
-   if (!d3d9_hlsl_init_internal(d3d, info, input, input_data))
+   if (!d3d9_hlsl_init_internal(d3d, info))
       goto error;
 
    d3d->keep_aspect       = info->force_aspect;
@@ -7345,13 +7347,15 @@ static void d3d9_hlsl_free_overlays(d3d9_video_t *d3d)
 
    for (i = 0; i < d3d->overlays_size; i++)
    {
-      if ((LPDIRECT3DTEXTURE9)d3d->overlays[i].tex)
+      if (     (LPDIRECT3DTEXTURE9)d3d->overlays[i].tex
+            && !d3d->overlays_borrowed)
          IDirect3DTexture9_Release((LPDIRECT3DTEXTURE9)d3d->overlays[i].tex);
       d3d9_vertex_buffer_free(d3d->overlays[i].vert_buf, NULL);
    }
    free(d3d->overlays);
-   d3d->overlays      = NULL;
-   d3d->overlays_size = 0;
+   d3d->overlays          = NULL;
+   d3d->overlays_size     = 0;
+   d3d->overlays_borrowed = false;
 }
 
 static void d3d9_hlsl_overlay_tex_geom(
@@ -7456,6 +7460,44 @@ static bool d3d9_hlsl_overlay_load(void *data,
    return true;
 }
 
+/* A page of the pack's textures: d3d9_hlsl_load_texture's, in the same
+ * format and pool as load()'s own, uploaded once for every page */
+static bool d3d9_hlsl_overlay_load_textures(void *data,
+      const uintptr_t *textures, unsigned num_textures)
+{
+   unsigned i;
+   d3d9_video_t *d3d = (d3d9_video_t*)data;
+
+   if (!d3d)
+      return false;
+
+   d3d9_hlsl_free_overlays(d3d);
+   if (!num_textures)
+      return true;
+   if (!(d3d->overlays = (overlay_t*)calloc(num_textures,
+         sizeof(*d3d->overlays))))
+      return false;
+   d3d->overlays_size     = num_textures;
+   d3d->overlays_borrowed = true;
+
+   for (i = 0; i < num_textures; i++)
+   {
+      D3DSURFACE_DESC desc;
+      LPDIRECT3DTEXTURE9 tex = (LPDIRECT3DTEXTURE9)textures[i];
+
+      if (!tex || FAILED(IDirect3DTexture9_GetLevelDesc(tex, 0, &desc)))
+         continue;
+      d3d->overlays[i].tex      = tex;
+      d3d->overlays[i].tex_dims = VIDEO_SCALE_PACK(desc.Width, desc.Height);
+
+      /* Default. Stretch to whole screen. */
+      d3d9_hlsl_overlay_tex_geom(d3d, i, 0, 0, 1, 1);
+      d3d9_hlsl_overlay_vertex_geom(d3d, i, 0, 0, 1, 1);
+   }
+
+   return true;
+}
+
 static void d3d9_hlsl_overlay_enable(void *data, bool state)
 {
    d3d9_video_t            *d3d = (d3d9_video_t*)data;
@@ -7492,7 +7534,7 @@ static void d3d9_hlsl_overlay_set_alpha(void *data, unsigned index, float mod)
 static const video_overlay_interface_t d3d9_hlsl_overlay_interface = {
    d3d9_hlsl_overlay_enable,
    d3d9_hlsl_overlay_load,
-   NULL, /* load_textures */
+   d3d9_hlsl_overlay_load_textures,
    d3d9_hlsl_overlay_tex_geom,
    d3d9_hlsl_overlay_vertex_geom,
    d3d9_hlsl_overlay_full_screen,
@@ -8188,8 +8230,8 @@ static uintptr_t d3d9_hlsl_update_texture_wrap(void *data)
 }
 #endif
 
-static bool d3d9_hlsl_update_texture(void *video_data, uintptr_t id,
-      const struct texture_image *ti, bool threaded)
+static enum video_texture_update d3d9_hlsl_update_texture(void *video_data,
+      uintptr_t id, const struct texture_image *ti, bool threaded)
 {
    (void)video_data;
 #ifdef HAVE_THREADS
@@ -8198,11 +8240,13 @@ static bool d3d9_hlsl_update_texture(void *video_data, uintptr_t id,
       struct d3d9_hlsl_update_cmd cmd;
       cmd.ti = ti;
       cmd.id = id;
-      return video_thread_texture_handle(&cmd,
-            d3d9_hlsl_update_texture_wrap) != 0;
+      return (video_thread_texture_handle(&cmd,
+            d3d9_hlsl_update_texture_wrap) != 0)
+            ? VIDEO_TEXTURE_UPDATE_DONE : VIDEO_TEXTURE_UPDATE_REFUSED;
    }
 #endif
-   return d3d9_hlsl_update_texture_internal(id, ti);
+   return (d3d9_hlsl_update_texture_internal(id, ti))
+      ? VIDEO_TEXTURE_UPDATE_DONE : VIDEO_TEXTURE_UPDATE_REFUSED;
 }
 
 static void d3d9_hlsl_unload_texture(void *data,

@@ -14,6 +14,7 @@
 
 #include <features/features_cpu.h>
 #include <file/file_path.h>
+#include <retro_dirent.h>
 #include <formats/rjson.h>
 #include <formats/rjson_stream.h>
 #include <lists/dir_list.h>
@@ -37,6 +38,15 @@
 #include <compat/strl.h>
 
 #include "task_cloudsync_path.h"
+
+/* Completion callbacks hand manifest entries and downloads to the task
+ * thread on lock-free lists where the atomics backend has pointer
+ * operations, and under tcs_manifest_lock where it does not.
+ * TASK_CLOUDSYNC_FORCE_LOCK takes the locked path on any backend, for
+ * the tests that cover it on hosts whose backends all have them. */
+#if defined(HAVE_THREADS) && defined(RETRO_ATOMIC_HAS_PTR) && !defined(TASK_CLOUDSYNC_FORCE_LOCK)
+#define TCS_LOCK_FREE 1
+#endif
 
 #define CSPFX "[CloudSync] "
 
@@ -103,7 +113,7 @@ typedef struct
    file_list_t *updated_server_manifest;
    /* local manifest is sometimes different due to conflicts */
    file_list_t *updated_local_manifest;
-#if defined(HAVE_THREADS) && defined(RETRO_ATOMIC_HAS_PTR)
+#if defined(TCS_LOCK_FREE)
    /* Entries on their way into the two lists above; see
     * tcs_manifest_add_t. */
    retro_atomic_ptr_t manifest_adds;
@@ -118,12 +128,22 @@ typedef struct
    /* Downloads waiting to be hashed: handed over by the fetch callback,
     * on whatever thread it runs (fetched_in), and taken by the task
     * thread, which works through them in order (fetched). */
-#if defined(HAVE_THREADS) && defined(RETRO_ATOMIC_HAS_PTR)
+#if defined(TCS_LOCK_FREE)
    retro_atomic_ptr_t fetched_in;
 #else
    struct tcs_fetched *fetched_in;
 #endif
    struct tcs_fetched *fetched;
+   /* The walk of the synced directories that builds current_manifest,
+    * a few entries per run: the directories open from the root of
+    * dirlist[walk_root_idx] down, each with the length of its path in
+    * walk_path; walk_bufs holds walk_root, walk_path and two scratch
+    * paths, PATH_MAX_LENGTH each. */
+   struct tcs_walk_dir *walk;
+   size_t walk_depth;
+   size_t walk_cap;
+   size_t walk_root_idx;
+   char *walk_bufs;
    bool need_manifest_uploaded;
    bool failures;
    bool conflicts;
@@ -142,6 +162,9 @@ typedef struct
     * than a process-wide cache: a fresh list per sync is a handful of
     * strdups, and it cannot go stale against the sync toggles. */
    struct string_list *dirlist;
+   /* Whoever pushed the sync, told when it is done. */
+   retro_task_callback_t cb;
+   void *cb_data;
 } task_cloud_sync_state_t;
 
 /* An entry for updated_server_manifest or updated_local_manifest, on
@@ -155,7 +178,7 @@ typedef struct
  *
  * A backend with no pointer atomics appends under a lock instead. */
 #ifdef HAVE_THREADS
-#ifdef RETRO_ATOMIC_HAS_PTR
+#ifdef TCS_LOCK_FREE
 typedef struct tcs_manifest_add
 {
    struct tcs_manifest_add *next;
@@ -240,6 +263,7 @@ static void task_cloud_sync_begin_handler(void *user_data, const char *path, boo
    else
    {
       RARCH_WARN(CSPFX "Begin failed.\n");
+      sync_state->failures = true;
       task_free_title(task);
       task_set_title(task, strdup("Cloud Sync failed"));
       task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
@@ -479,85 +503,131 @@ static bool task_cloud_sync_should_ignore_file(const char *filename)
        return true;
 
    /* a download still being written, or left by one that never
-    * finished (network/cloud_sync/nfs.c) */
+    * finished (CS_FETCHING_SUFFIX) */
    if (string_ends_with(filename, ".rafetching"))
+       return true;
+
+   /* a save, state or disk index still being written, or left by one
+    * that never finished (filestream_atomic_temp_name) */
+   if (string_ends_with(filename, ".tmp"))
        return true;
 
    return false;
 }
 
-/**
- * task_cloud_sync_manifest_append_dir:
- * @manifest         : pointer to the current file_list
- * @dir_fullpath     : the full path to the directory to be added
- * @dir_name         : the name of the directory to be added
- *
- * Adds all the files within the given directory to the provided
- * file list, with the exception of the ones that should be ignored
- */
-static bool task_cloud_sync_manifest_append_dir(file_list_t *manifest,
-      const char *dir_fullpath, char *dir_name)
+/* A directory open in the walk, and the length of its path. */
+struct tcs_walk_dir
 {
-   size_t i;
-   struct string_list *dir_list;
-   /* the directory, a file's path under it and its key: on the heap,
-    * one block per directory, as the task runs on small stacks */
-   char               *dir_fullpath_slash = (char*)malloc(3 * PATH_MAX_LENGTH);
-   char               *relative_path      = dir_fullpath_slash + PATH_MAX_LENGTH;
-   char               *alt                = relative_path + PATH_MAX_LENGTH;
+   struct RDIR *dir;
+   size_t       len;
+};
 
-   if (!dir_fullpath_slash)
+#define CS_WALK_ROOT(s) ((s)->walk_bufs)
+#define CS_WALK_PATH(s) ((s)->walk_bufs + PATH_MAX_LENGTH)
+#define CS_WALK_REL(s)  ((s)->walk_bufs + 2 * PATH_MAX_LENGTH)
+#define CS_WALK_ALT(s)  ((s)->walk_bufs + 3 * PATH_MAX_LENGTH)
+
+static void task_cloud_sync_walk_free(task_cloud_sync_state_t *sync_state)
+{
+   while (sync_state->walk_depth)
+      retro_closedir(sync_state->walk[--sync_state->walk_depth].dir);
+   free(sync_state->walk);
+   free(sync_state->walk_bufs);
+   sync_state->walk      = NULL;
+   sync_state->walk_cap  = 0;
+   sync_state->walk_bufs = NULL;
+}
+
+/* Opens CS_WALK_PATH(sync_state), @len long, as the next level down. */
+static bool task_cloud_sync_walk_push(task_cloud_sync_state_t *sync_state,
+      size_t len)
+{
+   struct RDIR *dir;
+   if (sync_state->walk_depth == sync_state->walk_cap)
+   {
+      size_t cap = sync_state->walk_cap ? sync_state->walk_cap * 2 : 8;
+      struct tcs_walk_dir *walk = (struct tcs_walk_dir*)realloc(
+            sync_state->walk, cap * sizeof(*walk));
+      if (!walk)
+         return false;
+      sync_state->walk     = walk;
+      sync_state->walk_cap = cap;
+   }
+   if (!(dir = retro_opendir_include_hidden(CS_WALK_PATH(sync_state), true)))
       return false;
-   strlcpy(dir_fullpath_slash, dir_fullpath, PATH_MAX_LENGTH);
-   fill_pathname_slash(dir_fullpath_slash, PATH_MAX_LENGTH);
-
-   /* A root that cannot be opened is what dir_list_new() reports NULL
-    * for, and it is not the same as an empty directory: an empty one
-    * says every file under it is gone, which is a statement the diff
-    * acts on by deleting the server's copies. A directory that could
-    * not be read says nothing at all, so the caller stops rather than
-    * letting the manifest claim a deletion that never happened. */
-   if (!(dir_list = dir_list_new(dir_fullpath_slash, NULL, false, true, true, true)))
+   if (retro_dirent_error(dir))
    {
-      RARCH_ERR(CSPFX "Could not read \"%s\".\n", dir_fullpath_slash);
-      free(dir_fullpath_slash);
+      retro_closedir(dir);
       return false;
    }
-
-   if (dir_list->size == 0)
-   {
-      string_list_free(dir_list);
-      free(dir_fullpath_slash);
-      return true;
-   }
-
-   file_list_reserve(manifest, manifest->size + dir_list->size);
-   for (i = 0; i < dir_list->size; i++)
-   {
-      size_t      idx = manifest->size;
-      const char *full_path = dir_list->elems[i].data;
-
-      path_relative_to(relative_path, full_path, dir_fullpath_slash, PATH_MAX_LENGTH);
-      fill_pathname_join_special(alt, dir_name, relative_path, PATH_MAX_LENGTH);
-
-      if (task_cloud_sync_should_ignore_file(alt))
-         continue;
-
-      /* The "alt" refers to the relative path of whatever we're syncing relative to the retroarch folder
-       * whereas the full_path is the absolute disk path of the file. When building the manifest, adhere
-       * to a portable standard, but use that as the portable representation of paths. While the actual
-       * "manifest" is comprised of full, local-style paths associated with "alt"s which are portable. */
-      pathname_make_slashes_portable(alt);
-      file_list_append(manifest, full_path, NULL, 0, 0, 0);
-      file_list_set_alt_at_offset(manifest, idx, alt);
-   }
-
-   /* TODO Is this freed anywhere else? Am I missing something? The dir_list's contents are strdup'ed, so freeing this shouldn't break anything
-    * Remove this comment once a decision has been taken*/
-   string_list_free(dir_list);
-   free(dir_fullpath_slash);
-
+   sync_state->walk[sync_state->walk_depth].dir = dir;
+   sync_state->walk[sync_state->walk_depth].len = len;
+   sync_state->walk_depth++;
    return true;
+}
+
+/* One entry of the walk: the next name in the deepest open directory,
+ * which adds a file to current_manifest or opens a subdirectory, or
+ * the end of that directory. Lists what dir_list_new() lists for the
+ * root, recursively, hidden entries included and directories left
+ * out; a subdirectory that cannot be opened is skipped as it skips
+ * one. */
+static void task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
+{
+   struct tcs_walk_dir *top  = &sync_state->walk[sync_state->walk_depth - 1];
+   char                *path = CS_WALK_PATH(sync_state);
+   const char          *name;
+   size_t               len;
+   size_t               idx;
+   bool                 is_dir;
+
+   if (!retro_readdir(top->dir))
+   {
+      retro_closedir(top->dir);
+      sync_state->walk_depth--;
+      return;
+   }
+   name = retro_dirent_get_name(top->dir);
+   if (     (name[0] == '.' || name[0] == '$')
+         && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+      return;
+
+   len = top->len;
+   if (len && path[len - 1] != '/' && path[len - 1] != '\\')
+      path[len++] = '/';
+   len += strlcpy(path + len, name, PATH_MAX_LENGTH - len);
+   if (len >= PATH_MAX_LENGTH)
+      return;
+
+   is_dir = retro_dirent_is_dir(top->dir, NULL);
+#if TARGET_OS_IPHONE || TARGET_OS_OSX
+   /* listed as a file, as dir_list_new() lists it */
+   if (is_dir && len >= 10 && !memcmp(path + len - 10, ".framework", 10))
+      is_dir = false;
+#endif
+   if (is_dir)
+   {
+      task_cloud_sync_walk_push(sync_state, len);
+      return;
+   }
+
+   path_relative_to(CS_WALK_REL(sync_state), path, CS_WALK_ROOT(sync_state),
+         PATH_MAX_LENGTH);
+   fill_pathname_join_special(CS_WALK_ALT(sync_state),
+         sync_state->dirlist->elems[sync_state->walk_root_idx].data,
+         CS_WALK_REL(sync_state), PATH_MAX_LENGTH);
+   if (task_cloud_sync_should_ignore_file(CS_WALK_ALT(sync_state)))
+      return;
+
+   /* The "alt" refers to the relative path of whatever we're syncing relative to the retroarch folder
+    * whereas the full_path is the absolute disk path of the file. When building the manifest, adhere
+    * to a portable standard, but use that as the portable representation of paths. While the actual
+    * "manifest" is comprised of full, local-style paths associated with "alt"s which are portable. */
+   pathname_make_slashes_portable(CS_WALK_ALT(sync_state));
+   idx = sync_state->current_manifest->size;
+   file_list_append(sync_state->current_manifest, path, NULL, 0, 0, 0);
+   file_list_set_alt_at_offset(sync_state->current_manifest, idx,
+         CS_WALK_ALT(sync_state));
 }
 
 /**
@@ -677,10 +747,14 @@ static size_t task_cloud_sync_count_out_of_scope(
  *
  * Create an in-memory manifest of actual, current disk data
  */
-static void task_cloud_sync_build_current_manifest(task_cloud_sync_state_t *sync_state)
+/* Builds current_manifest from the synced directories, as many entries
+ * per run as @b allows and at least one, so a large directory does not
+ * hold up one run of the handler - the frame loop, with Threaded Tasks
+ * off. */
+static void task_cloud_sync_build_current_manifest(
+      task_cloud_sync_state_t *sync_state, nbio_budget_t *b)
 {
    struct string_list *dirlist = sync_state->dirlist;
-   size_t i;
 
    if (!dirlist)
    {
@@ -688,41 +762,59 @@ static void task_cloud_sync_build_current_manifest(task_cloud_sync_state_t *sync
       return;
    }
 
-   if (!(sync_state->current_manifest = (file_list_t *)calloc(1, sizeof(file_list_t))))
+   if (!sync_state->current_manifest)
    {
-      task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
-      return;
-   }
-
-   if (!(sync_state->updated_server_manifest = (file_list_t *)calloc(1, sizeof(file_list_t))))
-   {
-      task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
-      return;
-   }
-
-   if (!(sync_state->updated_local_manifest = (file_list_t *)calloc(1, sizeof(file_list_t))))
-   {
-      task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
-      return;
-   }
-
-   /* The userdata of the elements is actually the full path to the directory, while data is the name of the folder itself */
-   /* The paths iterated here are not portable, because they are still used for iterating later on */
-   for (i = 0; i < dirlist->size; i++)
-   {
-      if (!task_cloud_sync_manifest_append_dir(sync_state->current_manifest,
-               (const char*)dirlist->elems[i].userdata, dirlist->elems[i].data))
+      if (     !(sync_state->current_manifest        = (file_list_t *)calloc(1, sizeof(file_list_t)))
+            || !(sync_state->updated_server_manifest = (file_list_t *)calloc(1, sizeof(file_list_t)))
+            || !(sync_state->updated_local_manifest  = (file_list_t *)calloc(1, sizeof(file_list_t)))
+            || !(sync_state->walk_bufs               = (char*)malloc(4 * PATH_MAX_LENGTH)))
       {
-         /* Half a picture of local state is worse than none: every file
-          * the unread directory holds would look deleted, and the diff
-          * would remove the server's copy of each one. */
+         task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
+         return;
+      }
+      sync_state->walk_root_idx = 0;
+   }
+
+   while (task_nbio_slice_within_budget(b, 0, 0))
+   {
+      if (sync_state->walk_depth)
+      {
+         task_cloud_sync_walk_step(sync_state);
+         if (!sync_state->walk_depth)
+            sync_state->walk_root_idx++;
+         continue;
+      }
+      if (sync_state->walk_root_idx >= dirlist->size)
+         break;
+
+      /* The userdata of the elements is actually the full path to the directory, while data is the name of the folder itself */
+      /* The paths iterated here are not portable, because they are still used for iterating later on */
+      strlcpy(CS_WALK_ROOT(sync_state),
+            (const char*)dirlist->elems[sync_state->walk_root_idx].userdata,
+            PATH_MAX_LENGTH);
+      fill_pathname_slash(CS_WALK_ROOT(sync_state), PATH_MAX_LENGTH);
+      strlcpy(CS_WALK_PATH(sync_state), CS_WALK_ROOT(sync_state), PATH_MAX_LENGTH);
+      /* A root that cannot be opened is not the same as an empty
+       * directory: an empty one says every file under it is gone, which
+       * is a statement the diff acts on by deleting the server's copies.
+       * A directory that could not be read says nothing at all, and half
+       * a picture of local state is worse than none, so the sync stops
+       * rather than letting the manifest claim a deletion that never
+       * happened. */
+      if (!task_cloud_sync_walk_push(sync_state, strlen(CS_WALK_PATH(sync_state))))
+      {
+         RARCH_ERR(CSPFX "Could not read \"%s\".\n", CS_WALK_ROOT(sync_state));
          RARCH_ERR(CSPFX "Not syncing, the current state of the disk could not be established.\n");
+         task_cloud_sync_walk_free(sync_state);
          sync_state->failures = true;
          task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
          return;
       }
    }
+   if (sync_state->walk_depth || sync_state->walk_root_idx < dirlist->size)
+      return;
 
+   task_cloud_sync_walk_free(sync_state);
    file_list_sort_on_alt(sync_state->current_manifest);
    sync_state->server_out_of_scope =
       task_cloud_sync_count_out_of_scope(sync_state);
@@ -770,7 +862,7 @@ static void task_cloud_sync_update_progress(retro_task_t *task)
 	   task_set_progress(task, 100);
 }
 
-#if defined(HAVE_THREADS) && defined(RETRO_ATOMIC_HAS_PTR)
+#if defined(TCS_LOCK_FREE)
 static void task_cloud_sync_add_to_updated_manifest(task_cloud_sync_state_t *sync_state, const char *key, const char *hash, bool server)
 {
    void *head;
@@ -1142,7 +1234,66 @@ typedef struct
 {
    task_cloud_sync_state_t *sync_state;
    struct item_file        *server_file;
+   /* Where the download goes once it is complete; the driver writes it
+    * beside that, under CS_FETCHING_SUFFIX. */
+   char                     local[PATH_MAX_LENGTH];
 } task_cloud_sync_fetch_state_t;
+
+/* A download is written here first and moved into place only once it
+ * is whole, so a transfer that fails part-way leaves the local file as
+ * it was, and a file a core took meanwhile is never replaced. The walk
+ * skips names ending in it. */
+#define CS_FETCHING_SUFFIX ".rafetching"
+
+/* @local's download, under CS_FETCHING_SUFFIX, into @s. False when the
+ * name does not fit. */
+static bool task_cloud_sync_fetching_path(char *s, size_t len,
+      const char *local)
+{
+   size_t _len = strlcpy(s, local, len);
+   return    _len < len
+          && strlcpy(s + _len, CS_FETCHING_SUFFIX, len - _len)
+               < len - _len;
+}
+
+/* Moves a whole download into place. A core that has taken the file
+ * since the fetch began keeps it, and the download goes, as at the
+ * start of the fetch. False when the download did not land. */
+static bool task_cloud_sync_fetch_commit(
+      task_cloud_sync_fetch_state_t *fetch_state, const char *key)
+{
+   char tmp[PATH_MAX_LENGTH];
+   task_cloud_sync_state_t *sync_state = fetch_state->sync_state;
+   const char *server_hash = CS_FILE_HASH(fetch_state->server_file);
+
+   if (!task_cloud_sync_fetching_path(tmp, sizeof(tmp), fetch_state->local))
+      return false;
+   if (content_savefile_is_live(fetch_state->local))
+   {
+      RARCH_LOG(CSPFX "Deferring \"%s\", the running core took it during the fetch.\n", key);
+      filestream_delete(tmp);
+      task_cloud_sync_carry_manifests_forward(sync_state, key, server_hash);
+      return false;
+   }
+   if (filestream_rename(tmp, fetch_state->local) != 0)
+   {
+      RARCH_WARN(CSPFX "Could not move the download of \"%s\" into place.\n", key);
+      filestream_delete(tmp);
+      task_cloud_sync_add_to_updated_manifest(sync_state, key, server_hash, true);
+      sync_state->failures = true;
+      return false;
+   }
+   return true;
+}
+
+/* What a fetch that never completed left beside its file. */
+static void task_cloud_sync_fetch_discard(
+      task_cloud_sync_fetch_state_t *fetch_state)
+{
+   char tmp[PATH_MAX_LENGTH];
+   if (task_cloud_sync_fetching_path(tmp, sizeof(tmp), fetch_state->local))
+      filestream_delete(tmp);
+}
 
 /* A download waiting to be hashed by the task thread. */
 typedef struct tcs_fetched
@@ -1176,7 +1327,7 @@ static bool task_cloud_sync_fetched_push(
    task_cloud_sync_state_t *sync_state = fetch_state->sync_state;
    size_t                   len        = strlen(path) + 1;
    tcs_fetched_t           *rec        = (tcs_fetched_t*)malloc(sizeof(*rec) + len);
-#if defined(HAVE_THREADS) && defined(RETRO_ATOMIC_HAS_PTR)
+#if defined(TCS_LOCK_FREE)
    void                    *head;
 #endif
 
@@ -1186,7 +1337,7 @@ static bool task_cloud_sync_fetched_push(
    rec->file        = file;
    rec->path        = (char*)(rec + 1);
    memcpy(rec->path, path, len);
-#if defined(HAVE_THREADS) && defined(RETRO_ATOMIC_HAS_PTR)
+#if defined(TCS_LOCK_FREE)
    do
    {
       head      = retro_atomic_load_acquire_ptr(&sync_state->fetched_in);
@@ -1210,7 +1361,7 @@ static bool task_cloud_sync_fetched_push(
 static void task_cloud_sync_fetched_take(task_cloud_sync_state_t *sync_state)
 {
    tcs_fetched_t *in, *rev = NULL, **tail;
-#if defined(HAVE_THREADS) && defined(RETRO_ATOMIC_HAS_PTR)
+#if defined(TCS_LOCK_FREE)
    in = (tcs_fetched_t*)retro_atomic_exchange_ptr(&sync_state->fetched_in, NULL);
 #else
 #ifdef HAVE_THREADS
@@ -1266,8 +1417,9 @@ static void task_cloud_sync_fetched_run(task_cloud_sync_state_t *sync_state,
          free(h);
       }
       filestream_close(rec->file);
-      task_cloud_sync_fetched(sync_state, rec->fetch_state->server_file,
-            rec->path, hash);
+      if (task_cloud_sync_fetch_commit(rec->fetch_state, rec->path))
+         task_cloud_sync_fetched(sync_state, rec->fetch_state->server_file,
+               rec->path, hash);
       sync_state->fetched = rec->next;
       free(rec->fetch_state);
       free(rec);
@@ -1296,7 +1448,8 @@ static void task_cloud_sync_fetch_cb(void *user_data, const char *path, bool suc
          return;
       hash = task_cloud_sync_md5_rfile(file);
       filestream_close(file);
-      task_cloud_sync_fetched(sync_state, server_file, path, hash);
+      if (task_cloud_sync_fetch_commit(fetch_state, path))
+         task_cloud_sync_fetched(sync_state, server_file, path, hash);
       free(hash);
    }
    else if (success)
@@ -1314,6 +1467,9 @@ static void task_cloud_sync_fetch_cb(void *user_data, const char *path, bool suc
    {
       /* on failure, don't add it to local manifest, that will cause a fetch again next time */
       RARCH_WARN(CSPFX "Failed to fetch \"%s\".\n", path);
+      if (file)
+         filestream_close(file);
+      task_cloud_sync_fetch_discard(fetch_state);
       task_cloud_sync_add_to_updated_manifest(sync_state, path, CS_FILE_HASH(server_file), true);
       sync_state->failures = true;
    }
@@ -1327,6 +1483,7 @@ static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_stat
 {
    size_t                         i;
    char                           filename[PATH_MAX_LENGTH];
+   char                           fetching[PATH_MAX_LENGTH];
    char                           directory[DIR_MAX_LENGTH];
    struct string_list            *dirlist     = sync_state->dirlist;
    struct item_file              *server_file = &sync_state->server_manifest->list[sync_state->server_idx];
@@ -1417,7 +1574,9 @@ static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_stat
    }
    fetch_state->sync_state  = sync_state;
    fetch_state->server_file = server_file;
-   if (cloud_sync_read(key, filename, task_cloud_sync_fetch_cb, fetch_state))
+   strlcpy(fetch_state->local, filename, sizeof(fetch_state->local));
+   if (     task_cloud_sync_fetching_path(fetching, sizeof(fetching), filename)
+         && cloud_sync_read(key, fetching, task_cloud_sync_fetch_cb, fetch_state))
       task_cloud_sync_waiting_inc(sync_state);
    else
    {
@@ -2152,6 +2311,7 @@ static void task_cloud_sync_task_step(retro_task_t *task,
          if (!cloud_sync_begin(task_cloud_sync_begin_handler, task))
          {
             RARCH_WARN(CSPFX "Could not begin.\n");
+            sync_state->failures = true;
             task_free_title(task);
             task_set_title(task, strdup("Cloud Sync failed"));
             goto task_finished;
@@ -2164,7 +2324,7 @@ static void task_cloud_sync_task_step(retro_task_t *task,
          task_cloud_sync_read_local_manifest(sync_state);
          break;
       case CLOUD_SYNC_PHASE_BUILD_CURRENT_MANIFEST:
-         task_cloud_sync_build_current_manifest(sync_state);
+         task_cloud_sync_build_current_manifest(sync_state, b);
          break;
       case CLOUD_SYNC_PHASE_DIFF:
          {
@@ -2191,6 +2351,7 @@ static void task_cloud_sync_task_step(retro_task_t *task,
          if (!cloud_sync_end(task_cloud_sync_end_handler, task))
          {
             RARCH_WARN(CSPFX "Could not end?!\n");
+            sync_state->failures = true;
             goto task_finished;
          }
          break;
@@ -2215,17 +2376,31 @@ static void task_cloud_sync_task_handler(retro_task_t *task)
       return;
    }
 
-   /* Results of calls a blocking driver finished on its worker: their
+   /* One window per run, shared by the results of calls a blocking
+    * driver finished on its worker, the downloads being hashed and the
+    * diff; every run makes at least one unit of progress. The results'
     * handlers run here, on this thread, before the in-flight count is
     * read. */
-   cloud_sync_poll();
-
-   /* One window per run, shared by the downloads being hashed and the
-    * diff; every run makes at least one unit of progress. */
    task_nbio_slice_open(&b);
+   cloud_sync_poll(task_nbio_slice_within_budget, &b);
    task_cloud_sync_fetched_run(sync_state, &b);
    task_cloud_sync_task_step(task, sync_state, &b);
    task_nbio_slice_close(&b);
+}
+
+/* Runs on the main thread before the state is released. A sync that
+ * failed, or finished with failures or conflicts, reports its title -
+ * the sync's own summary - as the error. */
+static void task_cloud_sync_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *error)
+{
+   task_cloud_sync_state_t *sync_state = (task_cloud_sync_state_t *)task->state;
+
+   if (!sync_state || !sync_state->cb)
+      return;
+   if (!error && (sync_state->failures || sync_state->conflicts))
+      error = task->title ? task->title : "Cloud Sync failed";
+   sync_state->cb(task, NULL, sync_state->cb_data, error);
 }
 
 /* Releases the sync's state when the task retires. Every manifest owns
@@ -2257,6 +2432,7 @@ static void task_cloud_sync_cleanup(retro_task_t *task)
     * elems[i].data, so the strdup'd directories go with it. */
    if (sync_state->dirlist)
       string_list_free(sync_state->dirlist);
+   task_cloud_sync_walk_free(sync_state);
    if (sync_state->hash_cur.file)
       filestream_close(sync_state->hash_cur.file);
    task_cloud_sync_fetched_take(sync_state);
@@ -2265,6 +2441,7 @@ static void task_cloud_sync_cleanup(retro_task_t *task)
       tcs_fetched_t *rec  = sync_state->fetched;
       sync_state->fetched = rec->next;
       filestream_close(rec->file);
+      task_cloud_sync_fetch_discard(rec->fetch_state);
       free(rec->fetch_state);
       free(rec);
    }
@@ -2280,6 +2457,7 @@ static void task_cloud_sync_task_setup(retro_task_t *task,
    task->state       = sync_state;
    task->title       = strdup(title);
    task->handler     = task_cloud_sync_task_handler;
+   task->callback    = task_cloud_sync_cb;
    task->cleanup     = task_cloud_sync_cleanup;
    task->progress_cb = task_window_progress_cb;
 }
@@ -2293,7 +2471,8 @@ static bool task_cloud_sync_task_finder(retro_task_t *task, void *user_data)
    return task->handler == task_cloud_sync_task_handler;
 }
 
-static void task_push_cloud_sync_with_mode(int conflict_resolution)
+static bool task_push_cloud_sync_with_mode(int conflict_resolution,
+      retro_task_callback_t cb, void *cb_data)
 {
    char task_title[128];
    task_finder_data_t       find_data;
@@ -2302,9 +2481,9 @@ static void task_push_cloud_sync_with_mode(int conflict_resolution)
    bool cloud_sync_enable              = config_get_ptr()->bools.cloud_sync_enable;
 
    if (!cloud_sync_enable)
-      return;
+      return false;
 
-#if defined(HAVE_THREADS) && !defined(RETRO_ATOMIC_HAS_PTR)
+#if defined(HAVE_THREADS) && !defined(TCS_LOCK_FREE)
    if (!tcs_manifest_lock)
       tcs_manifest_lock = slock_new();
 #endif
@@ -2313,12 +2492,12 @@ static void task_push_cloud_sync_with_mode(int conflict_resolution)
    if (task_queue_find(&find_data))
    {
       RARCH_LOG(CSPFX "Already in progress.\n");
-      return;
+      return false;
    }
 
    sync_state = (task_cloud_sync_state_t *)calloc(1, sizeof(task_cloud_sync_state_t));
    if (!sync_state)
-      return;
+      return false;
 
    /* Captured here, on the main thread, for the worker the threaded
     * task queue runs the handler on. */
@@ -2330,17 +2509,18 @@ static void task_push_cloud_sync_with_mode(int conflict_resolution)
             sizeof(sync_state->dir_core_assets));
       sync_state->dirlist     = task_cloud_sync_directory_map_new(settings);
    }
+   cloud_sync_capture();
    if (!sync_state->dirlist)
    {
       free(sync_state);
-      return;
+      return false;
    }
 
    if (!(task = task_init()))
    {
       string_list_free(sync_state->dirlist);
       free(sync_state);
-      return;
+      return false;
    }
 
    /* calloc zero-fill is not a portable initializer for an atomic
@@ -2352,17 +2532,20 @@ static void task_push_cloud_sync_with_mode(int conflict_resolution)
    task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_BEGIN);
    sync_state->start_time          = cpu_features_get_time_usec();
    sync_state->conflict_resolution = conflict_resolution;
+   sync_state->cb                  = cb;
+   sync_state->cb_data             = cb_data;
 
    strlcpy_lit(task_title, "Cloud Sync in progress", sizeof(task_title));
 
    task_cloud_sync_task_setup(task, sync_state, task_title);
 
    task_queue_push(task);
+   return true;
 }
 
-void task_push_cloud_sync(void)
+bool task_push_cloud_sync(retro_task_callback_t cb, void *cb_data)
 {
-   task_push_cloud_sync_with_mode(0);
+   return task_push_cloud_sync_with_mode(0, cb, cb_data);
 }
 
 void task_push_cloud_sync_update_driver(void)
@@ -2385,11 +2568,11 @@ void task_push_cloud_sync_update_driver(void)
 void task_push_cloud_sync_resolve_keep_local(void)
 {
    RARCH_LOG(CSPFX "Starting sync with conflict resolution: keep local.\n");
-   task_push_cloud_sync_with_mode(1);
+   task_push_cloud_sync_with_mode(1, NULL, NULL);
 }
 
 void task_push_cloud_sync_resolve_keep_server(void)
 {
    RARCH_LOG(CSPFX "Starting sync with conflict resolution: keep server.\n");
-   task_push_cloud_sync_with_mode(2);
+   task_push_cloud_sync_with_mode(2, NULL, NULL);
 }

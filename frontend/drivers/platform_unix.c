@@ -119,8 +119,6 @@ enum platform_android_flags
    PLAT_ANDROID_FLAG_XPERIA_PLAY_DEVICE  = (1 << 2)
 };
 
-static sthread_tls_t thread_key;
-static bool thread_key_inited            = false;
 static char app_dir[DIR_MAX_LENGTH];
 static char apk_dir[DIR_MAX_LENGTH];
 static char android_config_path[PATH_MAX_LENGTH];
@@ -582,57 +580,11 @@ static void onContentRectChanged(ANativeActivity *activity,
    retro_atomic_store_release_int(&instance->content_rect.changed, 1);
 }
 
+/* Kept as the tree-wide entry point name; the caching, the attach and
+ * the detach-at-thread-exit all live in libretro-common's rjni now. */
 JNIEnv *jni_thread_getenv(void)
 {
-   JNIEnv *env;
-   struct android_app* android_app;
-   int status;
-
-   /* Fast path. A JNIEnv is valid for the entire lifetime of the thread
-    * it was handed to, and this is called on only two threads (the app
-    * thread and, via the activity callbacks, the Java UI thread), so the
-    * cached pointer answers virtually every call.
-    *
-    * AttachCurrentThread on an already-attached thread is not free: it
-    * still crosses into the VM to look the thread up. The TLS slot was
-    * already being written below but never read back, so every one of
-    * the ~25 call sites - including the per-keystroke KeyCharacterMap
-    * lookup - paid for an attach it did not need. */
-   if (thread_key_inited)
-      if ((env = (JNIEnv*)sthread_tls_get(&thread_key)))
-         return env;
-
-   android_app = (struct android_app*)g_android;
-   status      = (*android_app->activity->vm)->
-      AttachCurrentThread(android_app->activity->vm, &env, 0);
-
-   if (status < 0)
-   {
-      RARCH_ERR("jni_thread_getenv: Failed to attach current thread.\n");
-      return NULL;
-   }
-
-   /* Without a key there is nowhere to cache, and jni_thread_destruct
-    * will never run to detach - but the env is still usable, so return
-    * it rather than failing the call. */
-   if (thread_key_inited)
-      sthread_tls_set(&thread_key, (void*)env);
-
-   return env;
-}
-
-static void jni_thread_destruct(void *value)
-{
-   JNIEnv *env = (JNIEnv*)value;
-   struct android_app *android_app = (struct android_app*)g_android;
-
-   if (!env)
-      return;
-
-   if (android_app)
-      (*android_app->activity->vm)->
-         DetachCurrentThread(android_app->activity->vm);
-   sthread_tls_set(&thread_key, NULL);
+   return rjni_env();
 }
 
 static void android_app_entry(void *data)
@@ -816,10 +768,7 @@ void ANativeActivity_onCreate(ANativeActivity* activity,
    ANativeActivity_setWindowFlags(activity, AWINDOW_FLAG_KEEP_SCREEN_ON
          | AWINDOW_FLAG_FULLSCREEN, 0);
 
-   if (sthread_tls_create_with_dtor(&thread_key, jni_thread_destruct))
-      thread_key_inited = true;
-   else
-      RARCH_ERR("Error initializing thread-local storage key.\n");
+   rjni_set_vm(activity->vm);
 
    activity->instance = android_app_create(activity,
          savedState, savedStateSize);
@@ -1736,9 +1685,11 @@ static void check_proc_acpi_battery(const char * node, bool * have_battery,
       }
       else if (string_is_equal(key, "remaining capacity"))
       {
+         /* "<number> mAh": parse, then check what follows */
          char *endptr = NULL;
-         if (endptr && *endptr == ' ')
-            remaining = (int)strtol(val, &endptr, 10);
+         long  _val   = strtol(val, &endptr, 10);
+         if (endptr != val && *endptr == ' ')
+            remaining = (int)_val;
       }
    }
 
@@ -1746,14 +1697,17 @@ static void check_proc_acpi_battery(const char * node, bool * have_battery,
 
    while (make_proc_acpi_key_val(&ptr, &key, &val))
    {
-      char      *endptr = NULL;
-
       if (string_is_equal(key, "design capacity"))
-         if (endptr && *endptr == ' ')
-            maximum = (int)strtol(val, &endptr, 10);
+      {
+         char *endptr = NULL;
+         long  _val   = strtol(val, &endptr, 10);
+         if (endptr != val && *endptr == ' ')
+            maximum = (int)_val;
+      }
    }
 
-   if ((maximum >= 0) && (remaining >= 0))
+   /* maximum is the divisor */
+   if ((maximum > 0) && (remaining >= 0))
    {
       pct = (int) ((((float) remaining) / ((float) maximum)) * 100.0f);
       if (pct < 0)
@@ -3414,7 +3368,8 @@ static void frontend_unix_init(void *data)
     * the Java side has resolved the runtime permission state.  The
     * wait pumps lifecycle commands, so a pause or rotation while a
     * permission dialog is up cannot block the UI thread's
-    * synchronized window teardown (ANR).  A launch with the
+    * synchronized window teardown (ANR).  Settings may remove the
+    * window, so wait for its replacement as well.  A launch with the
     * permission already settled signals before this loop is reached
     * and never waits. */
    for (;;)
@@ -3423,7 +3378,7 @@ static void frontend_unix_init(void *data)
 
       resolved = (android_lifecycle_flags(&android_app->lc)
             & ANDROID_LC_PERM_RESOLVED) != 0;
-      if (resolved)
+      if (resolved && android_app_window(android_app))
          break;
 
       if (!android_run_events(android_app))
@@ -3476,6 +3431,8 @@ static void frontend_unix_init(void *data)
          "getUserLanguageString", "()Ljava/lang/String;");
    GET_METHOD_ID(env, android_app->isPlayStoreBuild, class,
          "isPlayStoreBuild", "()Z");
+   GET_METHOD_ID(env, android_app->isMetaQuestBuild, class,
+         "isMetaQuestBuild", "()Z");
    GET_METHOD_ID(env, android_app->getAvailableCores, class,
          "getAvailableCores", "()[Ljava/lang/String;");
    GET_METHOD_ID(env, android_app->getInstalledCores, class,
@@ -3503,7 +3460,8 @@ static void frontend_unix_init(void *data)
 
    CALL_BOOLEAN_METHOD(env, android_app->is_play_store_build,
          android_app->activity->clazz, android_app->isPlayStoreBuild);
-
+   CALL_BOOLEAN_METHOD(env, android_app->is_meta_quest_build,
+         android_app->activity->clazz, android_app->isMetaQuestBuild);
 #ifdef HAVE_SAF
    GET_METHOD_ID(env, android_app->requestOpenDocumentTree, class,
          "requestOpenDocumentTree", "()V");
@@ -3973,7 +3931,11 @@ static void frontend_unix_sighandler(int sig)
       retroarch_ctl(RARCH_CTL_SET_SHUTDOWN, NULL);
 #endif
    }
-   if (quit == 2) exit(1);
+   /* _exit, not exit: exit() runs atexit handlers and frees memory,
+    * which deadlocks on the allocator's lock when this signal lands
+    * inside free() - as it does during a slow shutdown, the very case
+    * a second Ctrl+C is meant to force. */
+   if (quit == 2) _exit(1);
    /* in case there's a second deadlock in a C++ destructor or something */
    if (quit >= 3) abort();
 }

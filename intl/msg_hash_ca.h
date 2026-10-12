@@ -708,6 +708,7 @@ static const struct
    char s_52dea05d[17];
    char s_7ec63ffc[38];
    char s_7f004a36[153];
+   char s_fcd0c0d6[221];
    char s_a3825f18[13];
    char s_ef2d0a03[19];
    char s_ad17a194[12];
@@ -858,6 +859,8 @@ static const struct
    char s_8b9af73a[29];
    char s_66389548[36];
    char s_926f9e93[37];
+   char s_539024ed[18];
+   char s_3703a97b[13];
    char s_c6b760c9[33];
    char s_1d5a27f5[45];
    char s_18029d7e[22];
@@ -1031,6 +1034,7 @@ static const struct
    char s_88226df7[31];
    char s_4c92f60e[27];
    char s_9c702ee1[38];
+   char s_b8abf5ac[28];
    char s_b8b18b90[14];
    char s_efa8d516[47];
    char s_d7c1d887[27];
@@ -1088,6 +1092,7 @@ static const struct
    char s_ff1b8ce5[21];
 #if defined(HAVE_DINPUT) || defined(HAVE_WINRAWINPUT)
 #if defined(_WIN32) && defined(HAVE_WINRAWINPUT)
+   char s_8033e2a5[32];
    char s_19f5e3bc[45];
 #endif
 #endif
@@ -1137,6 +1142,7 @@ static const struct
    char s_dc362405[10];
    char s_e2f51ded[10];
    char s_d9685b01[16];
+   char s_88d4b1c5[40];
    char s_74b6dd31[12];
    char s_3e39918c[18];
    char s_96380b84[17];
@@ -1933,7 +1939,6 @@ static const struct
    char s_ccfe26d1[16];
    char s_728ca1d3[3];
    char s_5f612db6[18];
-   char s_9f29f708[25];
    char s_a9145c83[15];
    char s_22f52844[10];
    char s_06842e2b[14];
@@ -2421,6 +2426,18 @@ static const struct
    char s_4b582a0c[41];
    char s_61213f1d[18];
    char s_95e4b29f[71];
+   char s_1ee69db0[30];
+   char s_0cfd4fd0[9];
+   char s_d64659c4[8];
+   char s_0861dea4[26];
+   char s_83217fd0[14];
+   char s_60258de0[7];
+   char s_caf61308[11];
+   char s_34b2592a[7];
+   char s_c7a27b20[11];
+   char s_740ed6e5[22];
+   char s_c7ab7873[46];
+   char s_83ecb279[23];
    char s_317b17ed[6];
    char s_94c8d15f[6];
    char s_1f66aac3[5];
@@ -2440,6 +2457,7 @@ static const struct
    char s_eb4eab83[4];
    char s_c6d5bcb5[5];
    char s_7e8c6399[4];
+   char s_a9ef6377[29];
    char s_74dcbca5[29];
    char s_3ea80887[28];
    char s_c0cdc638[39];
@@ -2461,7 +2479,10 @@ static const struct
    char s_f57f6158[15];
    char s_69b801ef[17];
    char s_a40653a7[25];
+   char s_e67b672d[63];
    char s_52e3d6ea[47];
+   char s_f387bafb[27];
+   char s_2c868ae4[12];
    char s_c992346c[30];
    char s_580e244f[7];
    char s_a9c8430e[18];
@@ -2490,6 +2511,13 @@ static const struct
    char s_552163d9[40];
    char s_ef3d53d8[16];
    char s_6dcc2f9f[12];
+   char s_7a23be94[14];
+   char s_07483307[23];
+   char s_166f5c6e[13];
+   char s_33da1d6d[24];
+   char s_33dae115[23];
+   char s_b2b1563a[18];
+   char s_2bf7c29f[18];
    char s_48431da6[14];
    char s_d2fe3ed2[30];
    char s_1edf58ee[34];
@@ -2502,6 +2530,7 @@ static const struct
    char s_258060bf[16];
    char s_3bbc8b05[47];
    char s_e595f6df[47];
+   char s_2a5f7cd7[40];
    char s_f90edcc2[75];
    char s_ad14307a[18];
 #if defined(RARCH_MOBILE)
@@ -2542,6 +2571,8 @@ static const struct
    char s_e0609921[17];
    char s_b3c7fa93[21];
    char s_f6a0db44[21];
+   char s_a9af29b1[29];
+   char s_2cdaeb21[48];
    char s_4eecff92[36];
    char s_0ca1128d[22];
    char s_65e6ea7c[4];
@@ -2672,7 +2703,6 @@ static const struct
    char s_f46c7b83_1[104];
    char s_cb67f2a4[33];
    char s_3c3598a9[51];
-   char s_3bac47bd[425];
    char s_90e7db40[450];
    char s_b07cd572_0[500];
    char s_b07cd572_1[70];
@@ -3084,6 +3114,7 @@ static const struct
    char s_47df0525[63];
    char s_03e272fc[61];
    char s_5c2cc60f[79];
+   char s_d6d33eda[189];
    char s_d6d8d4be[140];
    char s_e86d2704[81];
    char s_dda608b5[312];
@@ -3132,6 +3163,7 @@ static const struct
    char s_eaa7274b[59];
 #if defined(HAVE_DINPUT) || defined(HAVE_WINRAWINPUT)
 #if defined(_WIN32) && defined(HAVE_WINRAWINPUT)
+   char s_2172fd53[348];
    char s_bb34fe6a[274];
 #endif
 #endif
@@ -3583,7 +3615,6 @@ static const struct
    char s_c7c09eb0[98];
    char s_7d4adfaf[39];
    char s_6f122164[58];
-   char s_61942cf6[72];
    char s_6b7e9271[104];
    char s_68b6e245[72];
    char s_3bb4fbf9[129];
@@ -4179,12 +4210,14 @@ static const struct
    char s_b0e4eb88[34];
    char s_9589cc66[61];
    char s_a0cd3533[24];
+   char s_29ffdb0d[49];
    char s_135957cd[35];
    char s_96b546df[56];
    char s_731e9836[36];
    char s_ffb4111b[34];
    char s_a363d07a[32];
    char s_9e5bd759[36];
+   char s_b880bab5[58];
    char s_8d7296ed[28];
    char s_21580d7c[100];
    char s_fc5e1d2c[59];
@@ -4254,6 +4287,11 @@ static const struct
    char s_543fcabd[23];
    char s_59212b5f[15];
    char s_f26b6cff[38];
+   char s_58909bc7[16];
+   char s_bd1fdff6[13];
+   char s_d9d9a1be[10];
+   char s_a63c824a[13];
+   char s_a3f6ebc3[16];
    char s_a9f3b2c3[26];
    char s_0e7aca8a[24];
    char s_ab1afe7c[22];
@@ -4265,6 +4303,7 @@ static const struct
    char s_51df877a[49];
    char s_136098cd[29];
    char s_f482576f[46];
+   char s_d2b9475b[83];
    char s_0408afc3[18];
    char s_654f5308[24];
    char s_c4a8e97c[12];
@@ -4381,6 +4420,7 @@ static const struct
    char s_8ab54d62[111];
    char s_aa554847[16];
    char s_ac2c797c[22];
+   char s_272dccbd[18];
    char s_80528b14[47];
    char s_eae21890[72];
    char s_1451fe0d[41];
@@ -5485,6 +5525,9 @@ static const struct
    "Nom\303\251s es pot llegir una part de EDID",
    "Un panell integrat de port\303\240til o d'ordinador \302\253tot en un\302\273 no disposa d'EDID."
    " En canvi, una pantalla externa connectada mitjan\303\247ant DDC s\303\255 que en t\303\251.",
+   "Android no permet que les aplicacions llegeixin l'EDID de la pantalla integrada d'un tel\303\250"
+   "fon o tauleta. Un dispositiu de tipus TV box que controla una pantalla mitjan\303\247ant HDMI l'"
+   "exposa all\303\240 on el dispositiu ho permet.",
    "Versi\303\263 EDID",
    "Mostra informaci\303\263",
    "Orientaci\303\263",
@@ -5635,6 +5678,8 @@ static const struct
    "Temps d'espera d'assignaci\303\263",
    "Temps l\303\255mit pel bloqueig d'entrada",
    "Llindar de l'eix del bot\303\263 d'entrada",
+   "Temps de resposta",
+   "Mantenir per",
    "Amaga les descripcions de nuclis",
    "Mostrar etiquetes amb descripcions d'entrada",
    "\303\215ndex del dispositiu",
@@ -5808,6 +5853,7 @@ static const struct
    "Sortir (combinaci\303\263 de botons)",
    "Reassignacions d\342\200\231entrada",
    "Re-mapeja els controls d'aquest nucli",
+   "Troba un bot\303\263 en clicar-lo",
    "Port assignat",
    "Endre\303\247a les assignacions per cada controlador",
    "Assignacions dels RetroPad",
@@ -5865,6 +5911,7 @@ static const struct
    "Controls del port %u",
 #if defined(HAVE_DINPUT) || defined(HAVE_WINRAWINPUT)
 #if defined(_WIN32) && defined(HAVE_WINRAWINPUT)
+   "Llums de jugador al controlador",
    "XInput per controladors Xbox (Cal reiniciar)",
 #endif
 #endif
@@ -5914,6 +5961,7 @@ static const struct
    "2 (Av\303\255s)",
    "Principal",
    "Men\303\272 principal",
+   "Augmenta la prioritat del fil principal",
    "Administrar",
    "Nucli per defecte",
    "<No especificat>",
@@ -6722,7 +6770,6 @@ static const struct
    "Escalat d'enter",
    "No",
    "Directori d'inici",
-   "Fitxers de configuraci\303\263",
    "Color del tema",
    "Verd poma",
    "Blau cl\303\240ssic",
@@ -7212,6 +7259,18 @@ static const struct
    "Posici\303\263 de les notificacions (vertical)",
    "\303\215ndex de monitor",
    "Activa la pantalla completa sobre l'osca als dispositius Android i iOS",
+   "Configuraci\303\263 dels auriculars",
+   "Combinat",
+   "Separat",
+   "Dist\303\240ncia de la pantalla",
+   "Punter L\303\240ser",
+   "Sempre",
+   "Autom\303\240tic",
+   "Apagat",
+   "Autom\303\240tic",
+   "Segons els auriculars",
+   "Freq\303\274\303\250ncia d'actualitzaci\303\263 dels auriculars",
+   "Amplada de la pantalla",
    "180\302\272",
    "270\302\272",
    "90\302\272",
@@ -7231,6 +7290,7 @@ static const struct
    "Alt",
    "Baix",
    "Mig",
+   "Nom\303\251s enregistra la partida",
    "Qualitat de l'enregistrament",
    "Fils per a l'enregistrament",
    "Freq\303\274\303\250ncia d'actualitzaci\303\263 vertical",
@@ -7252,7 +7312,10 @@ static const struct
    "Redu\303\257r escala",
    "Escalat d'imatge",
    "Sincronitzaci\303\263 Scanline",
+   "Despla\303\247ament de la sincronitzaci\303\263 de les l\303\255nies d'escombrat",
    "Simulaci\303\263 de la l\303\255nia d'escaneig en moviment",
+   "Disposici\303\263 de la pantalla",
+   "Horitzontal",
    "Mostra el mode d'alternar SDL",
    "V\303\255deo",
    "Shaders de V\303\255deo",
@@ -7281,6 +7344,13 @@ static const struct
    "Activar context compartit per maquinari",
    "Filtre bilineal",
    "Filtre suau",
+   "Mode Est\303\250reo",
+   "Anaglif (Vermell/Cian)",
+   "Entrella\303\247at",
+   "En paral\302\267lel (Complet)",
+   "En paral\302\267lel (Meitat)",
+   "Superior-Inferior",
+   "Intercanviar Ulls",
    "Personalitzat",
    "Qualitat de la retransmissi\303\263",
    "Profunditat de la sortida en bits",
@@ -7293,6 +7363,7 @@ static const struct
    "V\303\255deo multifil",
    "Ritme de visualitzaci\303\263 amb el v\303\255deo multifil",
    "Repetici\303\263 de fotogrames en el v\303\255deo multifil",
+   "Augmenta la prioritat del fil de v\303\255deo",
    "Fes servir la mem\303\262ria interm\303\250dia pels arguments de Metal (Cal reiniciar)",
    "Antipampallugueig",
 #if defined(RARCH_MOBILE)
@@ -7335,6 +7406,8 @@ static const struct
    "Activant la WIFI",
    "Connecta a una xarxa",
    "Connecta a una xarxa",
+   "Pla d'energia de baix consum",
+   "Desactiva l'estat d'inactivitat del processador",
    "Factor d'opacitat del tema de color",
    "Icona de men\303\272 actual",
    "Cap",
@@ -7543,11 +7616,6 @@ static const struct
    "com a \"Sink\".",
    "Sincronitza l'\303\240udio. Recomanat.",
    "Canvia les opcions de sincronitzaci\303\263 de l'\303\240udio.",
-   "Remostreja, filtra i mescla l'\303\240udio al fil d'\303\240udio en comptes de dins de cada foto"
-   "grama. La mateixa lat\303\250ncia que la ruta s\303\255ncrona amb fotogrames a qualsevol configu"
-   "raci\303\263 de lat\303\250ncia d'\303\240udio, amb el control de velocitat mesurat al ritme pro"
-   "pi del dispositiu i el remostrejador fora del pressupost de fotogrames. Els controladors d'\303"
-   "\240udio que no es poden activar al dispositiu mantenen la ruta s\303\255ncrona amb fotogrames.",
    "Demana al sistema operatiu que programi el fil d'\303\240udio per davant de la resta del fronten"
    "d, de manera que sigui menys probable que un marc ocupat deixi el dispositiu d'\303\240udio sens"
    "e servei. Permet que la lat\303\250ncia d'\303\240udio disminueixi en els sistemes que la conced"
@@ -8193,6 +8261,9 @@ static const struct
    "Combinaci\303\263 de botons del controlador per sortir de RetroArch.",
    "Les reassignacions d\342\200\231entrada es desen en aquest directori.",
    "Sobreescriu les assignacions d'entrada amb les establertes per a aquest nucli.",
+   "Prem un bot\303\263 o mou una palanca del comandament d'aquesta adaptaci\303\263 \342\200\224o b"
+   "\303\251 prem una tecla assignada a alguna d'aquestes accions\342\200\224 i la llista de sota sa"
+   "ltar\303\240 a l'element corresponent.",
    "Especificia quin port del nucli rebr\303\240 l'entrada des del port del controlador %u del front"
    "-end. 'Cap' envia la senyal a cap port del nucli.",
    "Les assignacions s'aplicaran nom\303\251s al controlador actiu en el qual s'han desat.",
@@ -8282,6 +8353,10 @@ static const struct
    "Canvia les assignacions d'entrada espec\303\255fiques pel nucli.",
 #if defined(HAVE_DINPUT) || defined(HAVE_WINRAWINPUT)
 #if defined(_WIN32) && defined(HAVE_WINRAWINPUT)
+   "Amb el controlador de comandament \302\253raw\302\273, mostra el port de cada comandament mitjan"
+   "\303\247ant els seus propis indicadors lluminosos: els llums de jugador del DualSense o el color"
+   " de la barra de llum del DualShock 4 (blau, vermell, verd, rosa). Aquests indicadors segueixen e"
+   "l comandament quan en canvia el port i s'apaguen quan el comandament s'apaga.",
    "Amb el controlador de dispositius \302\253raw\302\273, els comandaments compatibles amb Xbox es "
    "llegeixen mitjan\303\247ant XInput: els gallets es tracten per separat i s'utilitza la disposici"
    "\303\263 de botons d'XInput. La resta de comandaments es continuen llegint mitjan\303\247ant l'e"
@@ -9044,7 +9119,6 @@ static const struct
    ".",
    "Canvia la configuraci\303\263 del rebobinat.",
    "Selecciona la carpeta inicial de l'explorador de fitxers.",
-   "El fitxer de configuraci\303\263 predeterminat s'ha desat en aquesta carpeta.",
    "Selecciona un tema de colors diferent. 'Personalitzat' permet fer servir fitxers d'ajustament de"
    " temes.",
    "Selecciona un ajustament del tema del men\303\272 en l'explorador de fitxers.",
@@ -9947,12 +10021,14 @@ static const struct
    "Error en acceptar a l'espectador.",
    "No s\342\200\231ha pogut assignar mem\303\262ria pel contingut apeda\303\247at...",
    "Error en afegir el disc",
+   "Error en activar el pla d'energia de baix consum",
    "No s\342\200\231ha pogut aplicar el shader.",
    "No s\342\200\231ha pogut aplicar el valor predefinit del shader:",
    "No s\342\200\231ha pogut vincular el s\303\262col.",
    "Error en connectar amb el client.",
    "Error en connectar al servidor.",
    "No s\342\200\231ha pogut crear el directori.",
+   "Error en desactivar l'estat d'inactivitat del processador",
    "Error en entrar al GameMode",
    "Error en entrar a GameMode - comprova que el servei de GameMode est\303\240 instal\302\267lat i "
    "en funcionament",
@@ -10024,6 +10100,11 @@ static const struct
    "Temps d'espera superat",
    "Introduir truc",
    "Introdueix el nom del fitxer de trucs",
+   "Tria una acci\303\263",
+   "Mantenir per",
+   "%s Segons",
+   "Instant\303\240nia",
+   "Establir botons",
    "Introdu\303\257u la contrasenya",
    "Contrasenya incorrecta.",
    "Contrasenya correcta.",
@@ -10035,6 +10116,7 @@ static const struct
    "Introdueix el nom del fitxer de personalitzaci\303\263",
    "Introdueix el nom del fitxer",
    "Introdueix el nom del fitxer de reassignaci\303\263",
+   "Clica un bot\303\263 o mou una palanca del controlador del port %u\n(Retard de %u segons)",
    "Reanomenar t\303\255tol",
    "Instal\302\267lant el nucli: ",
    "Interf\303\255cie",
@@ -10163,6 +10245,7 @@ static const struct
    "sta de reproducci\303\263.",
    "Nuclis omesos: ",
    "Nuclis actualitzats: ",
+   "Punter L\303\240ser: %s",
    "No s'ha configurat la superposici\303\263 de teclat.",
    "La funci\303\263 desat est\303\240 bloquejada. Les personalitzacions estan actives.",
    "Error en eliminar les personalitzacions.",
@@ -10358,7 +10441,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_ca_blob_check[
-      (sizeof(msg_hash_ca_blob) == (228637u
+      (sizeof(msg_hash_ca_blob) == (229495u
 #ifdef ANDROID
        + 281u
 #endif
@@ -10439,6 +10522,7 @@ typedef char msg_hash_ca_blob_check[
 #endif
 #if defined(HAVE_DINPUT) || defined(HAVE_WINRAWINPUT)
 #if defined(_WIN32) && defined(HAVE_WINRAWINPUT)
+       + 32u
        + 45u
 #endif
 #endif
@@ -10696,6 +10780,7 @@ typedef char msg_hash_ca_blob_check[
 #endif
 #if defined(HAVE_DINPUT) || defined(HAVE_WINRAWINPUT)
 #if defined(_WIN32) && defined(HAVE_WINRAWINPUT)
+       + 348u
        + 274u
 #endif
 #endif
@@ -11601,6 +11686,7 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_STANDARD_TIMINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_TRUNCATED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_UNAVAILABLE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_UNAVAILABLE_ANDROID,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_VERSION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_INFORMATION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_INFO_ORIENTATION,
@@ -11751,6 +11837,8 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_BIND_TIMEOUT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_BLOCK_TIMEOUT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_BUTTON_AXIS_THRESHOLD,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_COMBO_HOLD,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_COMBO_HOLD_TIME,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_DESCRIPTOR_HIDE_UNBOUND,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_DESCRIPTOR_LABEL_SHOW,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_DEVICE_INDEX,
@@ -11924,6 +12012,7 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_QUIT_GAMEPAD_COMBO,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_REMAPPING_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_REMAP_BINDS_ENABLE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_REMAP_FIND,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_REMAP_PORT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_REMAP_SORT_BY_CONTROLLER_ENABLE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_RETROPAD_BINDS,
@@ -11981,6 +12070,7 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_USER_BINDS,
 #if defined(HAVE_DINPUT) || defined(HAVE_WINRAWINPUT)
 #if defined(_WIN32) && defined(HAVE_WINRAWINPUT)
+   (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_WINRAW_PLAYER_LIGHTS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_WINRAW_XINPUT_ENABLE,
 #endif
 #endif
@@ -12030,6 +12120,7 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_LOG_VERBOSITY_WARNING,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MAIN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MAIN_MENU,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_MAIN_THREAD_PRIORITY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MANAGE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MANUAL_CONTENT_SCAN_CORE_NAME,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MANUAL_CONTENT_SCAN_CORE_NAME_DETECT,
@@ -12825,7 +12916,6 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_INTEGER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_APPLE_GREEN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_CLASSIC_BLUE,
@@ -13313,6 +13403,18 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_Y,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MONITOR_INDEX,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_NOTCH_WRITE_OVER,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_CONTROLLERS,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_CONTROLLERS_COMBINED,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_CONTROLLERS_SEPARATE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_DISTANCE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_AUTO,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_OFF,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_AUTO,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_HEADSET,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_RATE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_WIDTH,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED_ROTATED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_VERTICAL,
@@ -13332,6 +13434,7 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_RECORD_CONFIG_TYPE_STREAMING_HIGH_QUALITY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_RECORD_CONFIG_TYPE_STREAMING_LOW_QUALITY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_RECORD_CONFIG_TYPE_STREAMING_MED_QUALITY,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_RECORD_GAME_ONLY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_RECORD_QUALITY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_RECORD_THREADS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_REFRESH_RATE,
@@ -13353,7 +13456,10 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCALE_INTEGER_SCALING_UNDERSCALE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCALING_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCANLINE_SYNC,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCANLINE_SYNC_OFFSET,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCAN_SUBFRAMES,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_HORIZONTAL,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SDL_DISPLAY_SERVER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADERS_ENABLE,
@@ -13382,6 +13488,13 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHARED_CONTEXT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SMOOTH,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SOFT_FILTER,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_STEREO_MODE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_STEREO_MODE_ANAGLYPH,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_STEREO_MODE_INTERLACED,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_STEREO_MODE_SBS_FULL,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_STEREO_MODE_SBS_HALF,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_STEREO_MODE_TOP_BOTTOM,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_STEREO_SWAP_EYES,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_STREAMING_MODE_CUSTOM,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_STREAM_QUALITY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SWAPCHAIN_BIT_DEPTH,
@@ -13394,6 +13507,7 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_THREADED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_THREADED_DISPLAY_PACING,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_THREADED_PRESENT_REPEAT,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_THREAD_PRIORITY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_USE_METAL_ARG_BUFFERS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_VFILTER,
 #if defined(RARCH_MOBILE)
@@ -13434,6 +13548,8 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_WIFI_ENABLED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_WIFI_NETWORKS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_WIFI_NETWORK_SCAN,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_WIN32_POWER_PLAN,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_WIN32_POWER_PLAN_IDLE_DISABLE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_XMB_ALPHA_FACTOR,
    (uint32_t)MENU_ENUM_LABEL_VALUE_XMB_CURRENT_MENU_ICON,
    (uint32_t)MENU_ENUM_LABEL_VALUE_XMB_CURRENT_MENU_ICON_NONE,
@@ -13559,7 +13675,6 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_SINK_RATE_ESTIMATION,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_SYNC,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_SYNCHRONIZATION_SETTINGS,
-   (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_THREADED_PIPELINE,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_THREAD_PRIORITY,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_TIME_STRETCH,
    (uint32_t)MENU_ENUM_SUBLABEL_AUDIO_TIME_STRETCH_LOWPASS,
@@ -13970,6 +14085,7 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_QUIT_GAMEPAD_COMBO,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_REMAPPING_DIRECTORY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_REMAP_BINDS_ENABLE,
+   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_REMAP_FIND,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_REMAP_PORT,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_REMAP_SORT_BY_CONTROLLER_ENABLE,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_RETROPAD_BINDS,
@@ -14018,6 +14134,7 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_USER_REMAPS,
 #if defined(HAVE_DINPUT) || defined(HAVE_WINRAWINPUT)
 #if defined(_WIN32) && defined(HAVE_WINRAWINPUT)
+   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_WINRAW_PLAYER_LIGHTS,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_WINRAW_XINPUT_ENABLE,
 #endif
 #endif
@@ -14469,7 +14586,6 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_GRANULARITY,
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_SUBLABEL_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_THEME_PRESET,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_SHOW_START_SCREEN,
@@ -15062,12 +15178,14 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MSG_FAILED_TO_ACCEPT_INCOMING_SPECTATOR,
    (uint32_t)MSG_FAILED_TO_ALLOCATE_MEMORY_FOR_PATCHED_CONTENT,
    (uint32_t)MSG_FAILED_TO_APPEND_DISK,
+   (uint32_t)MSG_FAILED_TO_APPLY_POWER_PLAN,
    (uint32_t)MSG_FAILED_TO_APPLY_SHADER,
    (uint32_t)MSG_FAILED_TO_APPLY_SHADER_PRESET,
    (uint32_t)MSG_FAILED_TO_BIND_SOCKET,
    (uint32_t)MSG_FAILED_TO_CONNECT_TO_CLIENT,
    (uint32_t)MSG_FAILED_TO_CONNECT_TO_HOST,
    (uint32_t)MSG_FAILED_TO_CREATE_THE_DIRECTORY,
+   (uint32_t)MSG_FAILED_TO_DISABLE_IDLE_STATES,
    (uint32_t)MSG_FAILED_TO_ENTER_GAMEMODE,
    (uint32_t)MSG_FAILED_TO_ENTER_GAMEMODE_LINUX,
    (uint32_t)MSG_FAILED_TO_EXTRACT_CONTENT_FROM_COMPRESSED_FILE,
@@ -15137,6 +15255,11 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MSG_INPUT_BIND_TIMEOUT,
    (uint32_t)MSG_INPUT_CHEAT,
    (uint32_t)MSG_INPUT_CHEAT_FILENAME,
+   (uint32_t)MSG_INPUT_COMBO_CHOOSE_ACTION,
+   (uint32_t)MSG_INPUT_COMBO_HOLD_FOR,
+   (uint32_t)MSG_INPUT_COMBO_HOLD_SECONDS,
+   (uint32_t)MSG_INPUT_COMBO_INSTANT,
+   (uint32_t)MSG_INPUT_COMBO_SET_BUTTONS,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_NOK,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_OK,
@@ -15148,6 +15271,7 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MSG_INPUT_OVERRIDE_FILENAME,
    (uint32_t)MSG_INPUT_PRESET_FILENAME,
    (uint32_t)MSG_INPUT_REMAP_FILENAME,
+   (uint32_t)MSG_INPUT_REMAP_FIND_PRESS,
    (uint32_t)MSG_INPUT_RENAME_ENTRY,
    (uint32_t)MSG_INSTALLING_CORE,
    (uint32_t)MSG_INTERFACE,
@@ -15264,6 +15388,7 @@ static const uint32_t msg_hash_ca_ids[] =
    (uint32_t)MSG_NO_THUMBNAIL_DOWNLOAD_POSSIBLE,
    (uint32_t)MSG_NUM_CORES_LOCKED,
    (uint32_t)MSG_NUM_CORES_UPDATED,
+   (uint32_t)MSG_OPENXR_LASER_POINTER,
    (uint32_t)MSG_OSK_OVERLAY_NOT_SET,
    (uint32_t)MSG_OVERRIDES_ACTIVE_NOT_SAVING,
    (uint32_t)MSG_OVERRIDES_ERROR_REMOVING,

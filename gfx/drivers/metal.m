@@ -33,6 +33,7 @@
 #include <gfx/scaler/scaler.h>
 #include <gfx/video_frame.h>
 #include <formats/image.h>
+#include <formats/image_yuv_blit.h>
 #include <retro_inline.h>
 #include <retro_miscellaneous.h>
 #include <retro_math.h>
@@ -164,6 +165,45 @@ typedef NS_ENUM(NSUInteger, ViewportResetMode) {
 };
 
 /*! @brief Context contains the render state used by various components */
+/* HDR availability gate.
+ *
+ * Compile-time: the SDK must expose CAMetalLayer's
+ * wantsExtendedDynamicRangeContent property and the PQ colour space name.
+ * The PQ colour space name (kCGColorSpaceITUR_2100_PQ) is the binding
+ * constraint on macOS — introduced in 10.15.4 but gated to macOS 11.0 in
+ * the public headers.  On iOS the EDR surface area on CAMetalLayer was
+ * only exposed in the 16.x SDKs.  tvOS never got a public EDR path:
+ * wantsExtendedDynamicRangeContent / edrMetadata are not part of the
+ * public tvOS interface regardless of SDK version, so HDR is unsupported
+ * there and the driver stays in SDR.
+ *
+ * We key the compile gate off the Availability.h __MAC_... / __IPHONE_...
+ * version tokens rather than AvailabilityMacros.h MAC_OS_X_VERSION_*
+ * constants: the former are defined consistently across all recent SDKs,
+ * while the latter were phased out for newer point releases and checking
+ * them fails silently even when the APIs are in fact present.
+ *
+ * Runtime: the HDR paths are still guarded with cached runtime version
+ * checks (apple_runtime_available) because RetroArch's Apple deployment
+ * targets (macOS 10.13, iOS 11) are lower than the first HDR-capable OS
+ * release on each platform.  When the runtime gate is false the driver
+ * stays in SDR mode.
+ *
+ * METAL_HDR_AVAILABLE guards compile-time only. Whenever we touch an
+ * HDR-specific API inside those blocks, an apple_runtime_available
+ * check guards runtime dispatch. */
+#include <Availability.h>
+#include <TargetConditionals.h>
+#if defined(TARGET_OS_TV) && TARGET_OS_TV
+#  define METAL_HDR_AVAILABLE 0
+#elif TARGET_OS_OSX && defined(__MAC_11_0)
+#  define METAL_HDR_AVAILABLE 1
+#elif defined(HAVE_COCOATOUCH) && defined(__IPHONE_16_0)
+#  define METAL_HDR_AVAILABLE 1
+#else
+#  define METAL_HDR_AVAILABLE 0
+#endif
+
 @interface Context : NSObject
 
 @property (nonatomic, readonly) id<MTLDevice> device;
@@ -194,12 +234,32 @@ typedef NS_ENUM(NSUInteger, ViewportResetMode) {
                        library:(id<MTLLibrary>)l;
 
 - (Texture *)newTexture:(struct texture_image)image filter:(enum texture_filter_type)filter;
+/* An RGBA8 texture the planar conversion writes, at @image's size; the
+ * frame is the caller's to put in (metal_planar_update). nil when the
+ * conversion cannot be had. */
+- (Texture *)newPlanarTexture:(const struct texture_image *)image filter:(enum texture_filter_type)filter;
+/* The planar conversion, compiled the first time it is asked for; nil
+ * from then on when it did not compile */
+- (id<MTLComputePipelineState>)planarKernel;
+/* False once the planar conversion has failed to compile: a flag, read
+ * from any thread */
+- (bool)planarAvailable;
 #if TARGET_OS_OSX
 - (Texture *)newTextureCompressed:(const struct texture_compressed *)tc filter:(enum texture_filter_type)filter;
 #endif
 - (id<MTLTexture>)newTexture:(struct texture_image)image mipmapped:(bool)mipmapped;
 - (void)convertFormat:(RPixelFormat)fmt from:(id<MTLTexture>)src to:(id<MTLTexture>)dst;
 - (id<MTLRenderPipelineState>)getStockShader:(int)index blend:(bool)blend;
+/* The overlay pipeline for an RGBA16Float (linear scRGB) texture while
+ * HDR is on; nil otherwise. Takes the menu nits and the composite's
+ * ExpandGamut as a float4 at fragment buffer 0. */
+- (id<MTLRenderPipelineState>)linearShader;
+/* What the menu composite pass shows the UI at: the menu nits and the
+ * gamut expansion, for stock_fragment_linear's inverse */
+- (float)hdrMenuNits;
+- (unsigned)hdrExpandGamut;
+/* The pipeline format of whatever UI draws now target */
+- (id<MTLRenderPipelineState>)twinF16:(MTLRenderPipelineDescriptor *)psd;
 
 /*! @brief resets the viewport for the main render encoder to \a mode */
 - (void)resetRenderViewport:(ViewportResetMode)mode;
@@ -250,9 +310,11 @@ typedef NS_ENUM(NSUInteger, ViewportResetMode) {
  * Viewport size is used to size the HDR offscreen + readback buffers. */
 @property (nonatomic, readonly) bool hdrEnabled;
 @property (nonatomic, readonly) unsigned hdrOutputMode;
+#if METAL_HDR_AVAILABLE
 - (void)setHDROutputMode:(unsigned)mode
              viewportWidth:(unsigned)w
             viewportHeight:(unsigned)h;
+#endif
 
 /* Composite the source texture into the current drawable via the HDR encode
  * pipeline (hdr_composite_fragment).  Must be called while a frame is in
@@ -269,9 +331,11 @@ typedef NS_ENUM(NSUInteger, ViewportResetMode) {
  * the current frame's mode / paper-white / expand-gamut state.  The
  * caller supplies the source explicitly: the shader-chain's last-pass RT
  * if a preset is active, or the raw frame texture for the no-shader path. */
+#if METAL_HDR_AVAILABLE
 - (void)hdrComposite:(const HDRUniforms *)uniforms
           fromSource:(id<MTLTexture>)source
             rotation:(unsigned)rotation;
+#endif
 
 /* HDR-specific setters exposed for the poke interface. */
 - (void)setHDRPaperWhiteNits:(float)nits;
@@ -284,7 +348,9 @@ typedef NS_ENUM(NSUInteger, ViewportResetMode) {
  * SDR UI overlay) to match a new drawable size.  Called from
  * setViewportDims: on window resize; cheap no-op when the
  * current allocations already match. */
+#if METAL_HDR_AVAILABLE
 - (void)resizeHDRResourcesForWidth:(NSUInteger)w height:(NSUInteger)h;
+#endif
 
 /* Shader-emitted HDR path: set by FrameView after parsing a shader preset,
  * tells the composite fragment to pass the final pass through without
@@ -298,10 +364,12 @@ typedef NS_ENUM(NSUInteger, ViewportResetMode) {
  * readViewport:.  Reports the measured peak / average light levels and
  * which encoding the swapchain used.  Returns NO when HDR is off or
  * capture is unavailable; the caller then falls back to the SDR path. */
+#if METAL_HDR_AVAILABLE
 - (bool)readViewportHDR:(uint16_t *)buffer
                  maxCLL:(float *)outMaxCLL
                 maxFALL:(float *)outMaxFALL
                 isSCRGB:(bool *)outIsSCRGB;
+#endif
 
 /* Current HDRUniforms for composite pass — updated as settings change. */
 - (const HDRUniforms *)currentHDRUniforms;
@@ -421,6 +489,9 @@ typedef NS_ENUM(NSInteger, ViewDrawState)
 - (BOOL)setShaderFromPath:(NSString *)path;
 - (void)clearShader;
 - (void)updateFrame:(void const *)src pitch:(NSUInteger)pitch;
+/* The frames from now on are in @format (a software filter changed
+ * it): the 16-bit staging texture is made again or dropped */
+- (void)setSourceFormat:(RPixelFormat)format;
 /* GET_CURRENT_SOFTWARE_FRAMEBUFFER: lend the core a buffer the GPU
  * reads directly. See lendFramebuffer: in the implementation. */
 - (bool)lendFramebuffer:(struct retro_framebuffer *)fb;
@@ -475,9 +546,7 @@ typedef NS_ENUM(NSInteger, ViewDrawState)
  * declared on Context, where nothing referred to it. */
 @property(nonatomic, readwrite) bool frameMenuLinearFilter;
 
-- (instancetype)initWithVideo:(const video_info_t *)video
-                                       input:(input_driver_t **)input
-                                  inputData:(void **)inputData;
+- (instancetype)initWithVideo:(const video_info_t *)video;
 
 - (void)setVideo:(const video_info_t *)video;
 - (bool)renderFrame:(const void *)frame
@@ -521,45 +590,6 @@ typedef NS_ENUM(NSInteger, ViewDrawState)
  * RARCH_RETURN_INIT_FAILURE); see that header for the semantics of
  * each form and for why the file must compile under both modes. */
 
-/* HDR availability gate.
- *
- * Compile-time: the SDK must expose CAMetalLayer's
- * wantsExtendedDynamicRangeContent property and the PQ colour space name.
- * The PQ colour space name (kCGColorSpaceITUR_2100_PQ) is the binding
- * constraint on macOS — introduced in 10.15.4 but gated to macOS 11.0 in
- * the public headers.  On iOS the EDR surface area on CAMetalLayer was
- * only exposed in the 16.x SDKs.  tvOS never got a public EDR path:
- * wantsExtendedDynamicRangeContent / edrMetadata are not part of the
- * public tvOS interface regardless of SDK version, so HDR is unsupported
- * there and the driver stays in SDR.
- *
- * We key the compile gate off the Availability.h __MAC_... / __IPHONE_...
- * version tokens rather than AvailabilityMacros.h MAC_OS_X_VERSION_*
- * constants: the former are defined consistently across all recent SDKs,
- * while the latter were phased out for newer point releases and checking
- * them fails silently even when the APIs are in fact present.
- *
- * Runtime: the HDR paths are still guarded with cached runtime version
- * checks (apple_runtime_available) because RetroArch's Apple deployment
- * targets (macOS 10.13, iOS 11) are lower than the first HDR-capable OS
- * release on each platform.  When the runtime gate is false the driver
- * stays in SDR mode.
- *
- * METAL_HDR_AVAILABLE guards compile-time only. Whenever we touch an
- * HDR-specific API inside those blocks, an apple_runtime_available
- * check guards runtime dispatch. */
-#include <Availability.h>
-#include <TargetConditionals.h>
-#if defined(TARGET_OS_TV) && TARGET_OS_TV
-#  define METAL_HDR_AVAILABLE 0
-#elif TARGET_OS_OSX && defined(__MAC_11_0)
-#  define METAL_HDR_AVAILABLE 1
-#elif defined(HAVE_COCOATOUCH) && defined(__IPHONE_16_0)
-#  define METAL_HDR_AVAILABLE 1
-#else
-#  define METAL_HDR_AVAILABLE 0
-#endif
-
 /* video_hdr_mode values — must match the rest of RetroArch. */
 #define METAL_HDR_MODE_OFF    0u
 #define METAL_HDR_MODE_HDR10  1u
@@ -589,6 +619,47 @@ typedef NS_ENUM(NSInteger, ViewDrawState)
  * and iOS 16, at or below this file's EDR floor, so the compile-time
  * gate covers it; a display that ignores the metadata behaves as
  * before. */
+/* The EDR calls on the layer, sent by selector: the deployment floor
+ * is below the OS that introduced them, and every caller sits behind
+ * the apple_runtime_available() check above. */
+/* kCGColorSpaceITUR_2100_PQ is in CoreGraphics from 10.15.4 but declared
+ * for macOS 11, so it is looked up by name. NULL where it is not
+ * exported: the callers then make no colour space, which they handle. */
+static CFStringRef metal_colorspace_name_pq(void)
+{
+   static CFStringRef name;
+   if (!name)
+   {
+      void **p = apple_rt_constant_addr("kCGColorSpaceITUR_2100_PQ");
+      if (p)
+         name = (CFStringRef)*p;
+   }
+   return name;
+}
+
+static void metal_layer_set_wants_edr(CAMetalLayer *layer, BOOL v)
+{
+   apple_rt_send_bool(layer, sel_registerName(
+         "setWantsExtendedDynamicRangeContent:"), v);
+}
+
+static void metal_layer_set_edr_metadata(CAMetalLayer *layer, id metadata)
+{
+   apple_rt_send_id(layer, sel_registerName("setEDRMetadata:"), metadata);
+}
+
+/* +[CAEDRMetadata HDR10MetadataWithMinLuminance:maxLuminance:opticalOutputScale:] */
+static id metal_hdr10_metadata(float min_nits, float max_nits, float scale)
+{
+   id cls = apple_rt_class("CAEDRMetadata");
+   if (!cls)
+      return nil;
+   return ((id (*)(id, SEL, float, float, float))objc_msgSend)(cls,
+         sel_registerName(
+            "HDR10MetadataWithMinLuminance:maxLuminance:opticalOutputScale:"),
+         min_nits, max_nits, scale);
+}
+
 static void metal_apply_hdr_metadata(CAMetalLayer *layer, unsigned hdr_mode)
 {
    float peak;
@@ -601,11 +672,8 @@ static void metal_apply_hdr_metadata(CAMetalLayer *layer, unsigned hdr_mode)
    if ((peak = video_driver_get_hdr_max_nits()) <= 0.0f)
       return;
 
-   layer.EDRMetadata = [CAEDRMetadata
-      HDR10MetadataWithMinLuminance:0.005f
-                       maxLuminance:peak
-                 opticalOutputScale:(hdr_mode == METAL_HDR_MODE_SCRGB)
-                                    ? 80.0f : 10000.0f];
+   metal_layer_set_edr_metadata(layer, metal_hdr10_metadata(0.005f, peak,
+         (hdr_mode == METAL_HDR_MODE_SCRGB) ? 80.0f : 10000.0f));
 }
 
 static MTLPixelFormat metal_apply_hdr_layer_config(CAMetalLayer *layer,
@@ -625,9 +693,9 @@ static MTLPixelFormat metal_apply_hdr_layer_config(CAMetalLayer *layer,
             layer.colorspace = cs;
             CGColorSpaceRelease(cs);
          }
-         layer.wantsExtendedDynamicRangeContent = NO;
+         metal_layer_set_wants_edr(layer, NO);
          /* Claim no luminance range in SDR */
-         layer.EDRMetadata                      = nil;
+         metal_layer_set_edr_metadata(layer, nil);
       }
       return MTLPixelFormatBGRA8Unorm;
    }
@@ -639,16 +707,16 @@ static MTLPixelFormat metal_apply_hdr_layer_config(CAMetalLayer *layer,
          : MTLPixelFormatRGB10A2Unorm;
       CFStringRef csName = (hdr_mode == METAL_HDR_MODE_SCRGB)
          ? kCGColorSpaceExtendedLinearSRGB
-         : kCGColorSpaceITUR_2100_PQ;
+         : metal_colorspace_name_pq();
 
       layer.pixelFormat = fmt;
-      CGColorSpaceRef cs = CGColorSpaceCreateWithName(csName);
+      CGColorSpaceRef cs = csName ? CGColorSpaceCreateWithName(csName) : NULL;
       if (cs)
       {
          layer.colorspace = cs;
          CGColorSpaceRelease(cs);
       }
-      layer.wantsExtendedDynamicRangeContent = YES;
+      metal_layer_set_wants_edr(layer, YES);
       metal_apply_hdr_metadata(layer, hdr_mode);
       return fmt;
    }
@@ -674,8 +742,10 @@ static bool metal_display_supports_edr(void)
        * produce if EDR were enabled, not what's being used right now.
        * That's the right signal for "is HDR an available mode".  SDR-only
        * displays return exactly 1.0. */
+      /* CGFloat, a double: Metal builds are 64-bit only */
       if (screen)
-         return screen.maximumPotentialExtendedDynamicRangeColorComponentValue > 1.0;
+         return apple_rt_get_double(screen, sel_registerName(
+                  "maximumPotentialExtendedDynamicRangeColorComponentValue")) > 1.0;
    }
 #elif defined(HAVE_COCOATOUCH)
    /* TARGET_OS_TV / TARGET_OS_IOS are always defined to 0 or 1, not
@@ -694,7 +764,8 @@ static bool metal_display_supports_edr(void)
    {
       UIScreen *screen = [UIScreen mainScreen];
       if (screen)
-         return screen.potentialEDRHeadroom > 1.0;
+         return apple_rt_get_double(screen,
+               sel_registerName("potentialEDRHeadroom")) > 1.0;
    }
 #endif
 #endif
@@ -856,6 +927,12 @@ static void buffer_chain_discard(buffer_chain_t *chain);
     * thread Metal finishes on. */
    int      _stagingBusy[METAL_STAGING_SLOTS];
    unsigned _stagingNext;
+   /* Slots lent to a producer (metal_texture_lend), which writes them
+    * itself: an update from other memory never uses them. Touched
+    * only on the thread that updates. */
+   unsigned _stagingLent;
+   /* Made by newPlanarTexture: its updates are planar frames */
+   bool     _planar;
 }
 @property (nonatomic, readwrite, strong) id<MTLTexture> texture;
 @property (nonatomic, readwrite, strong) id<MTLSamplerState> sampler;
@@ -889,12 +966,23 @@ static void buffer_chain_discard(buffer_chain_t *chain);
 
    id<MTLCommandBuffer> _blitCommandBuffer;
 
+   /* The planar conversion (planarKernel) */
+   id<MTLComputePipelineState> _planarKernel;
+   volatile bool _planarFailed;
+
    NSUInteger _currentChain;
    buffer_chain_t _chain[CHAIN_LENGTH];
    MTLClearColor _clearColor;
 
    id<MTLRenderPipelineState> _states[GFX_MAX_SHADERS][2];
    id<MTLRenderPipelineState> _clearState;
+   /* The same for the HDR UI overlay, which is RGBA16Float: every UI
+    * draw goes there while HDR is on (see rce), and a pipeline's colour
+    * format must be its target's. getStockShader picks by hdrEnabled. */
+   id<MTLRenderPipelineState> _statesF16[GFX_MAX_SHADERS][2];
+   id<MTLRenderPipelineState> _clearStateF16;
+   /* An RGBA16Float texture, linear scRGB, into the overlay */
+   id<MTLRenderPipelineState> _linearStateF16;
 
    bool _captureEnabled;
    id<MTLTexture> _backBuffer;
@@ -974,7 +1062,8 @@ static void buffer_chain_discard(buffer_chain_t *chain);
 #endif
       /* Configure drawable pool for triple-buffering */
       if (apple_runtime_available(APPLE_RUNTIME_VER(10, 15, 4), APPLE_RUNTIME_VER(13, 0, 0), APPLE_RUNTIME_VER(13, 0, 0)))
-         _layer.maximumDrawableCount = MAX_INFLIGHT;
+         apple_rt_send_long(_layer,
+               sel_registerName("setMaximumDrawableCount:"), MAX_INFLIGHT);
       _library                   = RARCH_RETAIN(l);
       _commandQueue              = [_device newCommandQueue];
       _clearColor                = MTLClearColorMake(0, 0, 0, 1);
@@ -1055,14 +1144,20 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    int j;
    for (i = 0; i < (int)(TEXTURE_FILTER_MIPMAP_NEAREST + 1); i++)
       [(id)_samplers[i] release];
+   [(id)_planarKernel release];
    for (i = 0; i < (int)RPixelFormatCount; i++)
       [_filters[i] release];
    for (i = 0; i < GFX_MAX_SHADERS; i++)
    {
       for (j = 0; j < 2; j++)
+      {
          [(id)_states[i][j] release];
+         [(id)_statesF16[i][j] release];
+      }
    }
    [(id)_clearState release];
+   [(id)_clearStateF16 release];
+   [(id)_linearStateF16 release];
    [(id)_commandQueue release];
    [(id)_layer release];
    [(id)_device release];
@@ -1303,7 +1398,37 @@ static void buffer_chain_discard(buffer_chain_t *chain);
          break;
    }
 
-   return _states[index][blend ? 1 : 0];
+   return _hdrEnabled && _statesF16[index][blend ? 1 : 0]
+      ? _statesF16[index][blend ? 1 : 0]
+      : _states[index][blend ? 1 : 0];
+}
+
+- (id<MTLRenderPipelineState>)linearShader
+{
+   return _hdrEnabled ? _linearStateF16 : nil;
+}
+
+- (float)hdrMenuNits
+{
+   return _hdrUniforms.PaperWhiteNits;
+}
+
+- (unsigned)hdrExpandGamut
+{
+   return (unsigned)_hdrUniforms.ExpandGamut;
+}
+
+/* @psd as made for BGRA8, made again for the RGBA16Float HDR overlay;
+ * @psd is left as it was. */
+- (id<MTLRenderPipelineState>)twinF16:(MTLRenderPipelineDescriptor *)psd
+{
+   NSError *err = nil;
+   id<MTLRenderPipelineState> st;
+   MTLPixelFormat was = psd.colorAttachments[0].pixelFormat;
+   psd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+   st = [_device newRenderPipelineStateWithDescriptor:psd error:&err];
+   psd.colorAttachments[0].pixelFormat = was;
+   return st;
 }
 
 - (MTLVertexDescriptor *)_spriteVertexDescriptor
@@ -1342,6 +1467,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    }
 
    _clearState = [_device newRenderPipelineStateWithDescriptor:psd error:&err];
+   _clearStateF16 = [self twinF16:psd];
    if (err != nil)
    {
       RARCH_ERR("[Metal] Error creating clear pipeline state %s.\n", err.localizedDescription.UTF8String);
@@ -1381,6 +1507,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    }
 
    _states[VIDEO_SHADER_STOCK_BLEND][0] = [_device newRenderPipelineStateWithDescriptor:psd error:&err];
+   _statesF16[VIDEO_SHADER_STOCK_BLEND][0] = [self twinF16:psd];
    if (err != nil)
    {
       RARCH_ERR("[Metal] Error creating pipeline state %s.\n", err.localizedDescription.UTF8String);
@@ -1390,6 +1517,17 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    psd.label                            = @"stock_blend";
    ca.blendingEnabled                   = YES;
    _states[VIDEO_SHADER_STOCK_BLEND][1] = [_device newRenderPipelineStateWithDescriptor:psd error:&err];
+   _statesF16[VIDEO_SHADER_STOCK_BLEND][1] = [self twinF16:psd];
+   {
+      /* The blended stock pipeline with stock_fragment_linear, for the
+       * HDR overlay only */
+      id<MTLFunction> stockFrag = psd.fragmentFunction;
+      psd.fragmentFunction = RARCH_AUTORELEASE_R([_library
+            newFunctionWithName:@"stock_fragment_linear"]);
+      if (psd.fragmentFunction)
+         _linearStateF16 = [self twinF16:psd];
+      psd.fragmentFunction = stockFrag;
+   }
    if (err != nil)
    {
       RARCH_ERR("[Metal] Error creating pipeline state %s.\n", err.localizedDescription.UTF8String);
@@ -1413,6 +1551,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    }
    psd.fragmentFunction = RARCH_AUTORELEASE_R([_library newFunctionWithName:@"snow_fragment" constantValues:vals error:&err]);
    _states[VIDEO_SHADER_MENU_3][1] = [_device newRenderPipelineStateWithDescriptor:psd error:&err];
+   _statesF16[VIDEO_SHADER_MENU_3][1] = [self twinF16:psd];
    if (err != nil)
    {
       RARCH_ERR("[Metal] Error creating pipeline state %s.\n", err.localizedDescription.UTF8String);
@@ -1434,6 +1573,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    }
    psd.fragmentFunction = RARCH_AUTORELEASE_R([_library newFunctionWithName:@"snow_fragment" constantValues:vals error:&err]);
    _states[VIDEO_SHADER_MENU_4][1] = [_device newRenderPipelineStateWithDescriptor:psd error:&err];
+   _statesF16[VIDEO_SHADER_MENU_4][1] = [self twinF16:psd];
    if (err != nil)
    {
       RARCH_ERR("[Metal] Error creating pipeline state %s.\n", err.localizedDescription.UTF8String);
@@ -1444,6 +1584,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    ca.blendingEnabled              = YES;
    psd.fragmentFunction            = RARCH_AUTORELEASE_R([_library newFunctionWithName:@"bokeh_fragment"]);
    _states[VIDEO_SHADER_MENU_5][1] = [_device newRenderPipelineStateWithDescriptor:psd error:&err];
+   _statesF16[VIDEO_SHADER_MENU_5][1] = [self twinF16:psd];
    if (err != nil)
    {
       RARCH_ERR("[Metal] Error creating pipeline state %s.\n", err.localizedDescription.UTF8String);
@@ -1454,6 +1595,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    ca.blendingEnabled              = YES;
    psd.fragmentFunction            = RARCH_AUTORELEASE_R([_library newFunctionWithName:@"snowflake_fragment"]);
    _states[VIDEO_SHADER_MENU_6][1] = [_device newRenderPipelineStateWithDescriptor:psd error:&err];
+   _statesF16[VIDEO_SHADER_MENU_6][1] = [self twinF16:psd];
    if (err != nil)
    {
       RARCH_ERR("[Metal] Error creating pipeline state %s.\n", err.localizedDescription.UTF8String);
@@ -1465,6 +1607,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    psd.vertexFunction              = RARCH_AUTORELEASE_R([_library newFunctionWithName:@"ribbon_vertex"]);
    psd.fragmentFunction            = RARCH_AUTORELEASE_R([_library newFunctionWithName:@"ribbon_fragment"]);
    _states[VIDEO_SHADER_MENU][0]   = [_device newRenderPipelineStateWithDescriptor:psd error:&err];
+   _statesF16[VIDEO_SHADER_MENU][0] = [self twinF16:psd];
    if (err != nil)
    {
       RARCH_ERR("[Metal] Error creating pipeline state %s.\n", err.localizedDescription.UTF8String);
@@ -1476,6 +1619,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    ca.sourceRGBBlendFactor         = MTLBlendFactorOne;
    ca.destinationRGBBlendFactor    = MTLBlendFactorOne;
    _states[VIDEO_SHADER_MENU][1]   = [_device newRenderPipelineStateWithDescriptor:psd error:&err];
+   _statesF16[VIDEO_SHADER_MENU][1] = [self twinF16:psd];
    if (err != nil)
    {
       RARCH_ERR("[Metal] Error creating pipeline state %s.\n", err.localizedDescription.UTF8String);
@@ -1487,6 +1631,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    psd.vertexFunction              = RARCH_AUTORELEASE_R([_library newFunctionWithName:@"ribbon_simple_vertex"]);
    psd.fragmentFunction            = RARCH_AUTORELEASE_R([_library newFunctionWithName:@"ribbon_simple_fragment"]);
    _states[VIDEO_SHADER_MENU_2][0] = [_device newRenderPipelineStateWithDescriptor:psd error:&err];
+   _statesF16[VIDEO_SHADER_MENU_2][0] = [self twinF16:psd];
    if (err != nil)
    {
       RARCH_ERR("[Metal] Error creating pipeline state %s.\n", err.localizedDescription.UTF8String);
@@ -1498,6 +1643,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    ca.sourceRGBBlendFactor         = MTLBlendFactorOne;
    ca.destinationRGBBlendFactor    = MTLBlendFactorOne;
    _states[VIDEO_SHADER_MENU_2][1] = [_device newRenderPipelineStateWithDescriptor:psd error:&err];
+   _statesF16[VIDEO_SHADER_MENU_2][1] = [self twinF16:psd];
    if (err != nil)
    {
       RARCH_ERR("[Metal] Error creating pipeline state %s.\n", err.localizedDescription.UTF8String);
@@ -1698,10 +1844,13 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    _sdrOverlayH = h;
    {
       MTLTextureDescriptor *td = [MTLTextureDescriptor
-                                   texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                   texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
                                                                 width:w
                                                                height:h
                                                             mipmapped:NO];
+      /* RGBA16Float: the UI's alpha keeps every step, and a linear
+       * texture's values above menu white reach the composite. The UI
+       * pipelines draw here through their F16 twins (getStockShader). */
       td.storageMode = MTLStorageModePrivate;
       td.usage       = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
       id<MTLTexture> sdr = RARCH_AUTORELEASE_R([_device newTextureWithDescriptor:td]);
@@ -1742,8 +1891,9 @@ static void buffer_chain_discard(buffer_chain_t *chain);
       {
          if (mode == METAL_HDR_OUTPUT_HDR10)
          {
+            CFStringRef pq = metal_colorspace_name_pq();
             newFmt   = MTLPixelFormatRGB10A2Unorm;
-            newCS    = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_PQ);
+            newCS    = pq ? CGColorSpaceCreateWithName(pq) : NULL;
             wantEDR  = YES;
          }
          else /* scRGB */
@@ -1789,11 +1939,11 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    {
       if (newCS)
          _layer.colorspace = newCS;
-      _layer.wantsExtendedDynamicRangeContent = wantEDR;
+      metal_layer_set_wants_edr(_layer, wantEDR);
       if (wantEDR)
          metal_apply_hdr_metadata(_layer, mode);
       else
-         _layer.EDRMetadata = nil;
+         metal_layer_set_edr_metadata(_layer, nil);
    }
 #endif
    if (newCS)
@@ -2080,13 +2230,92 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    return tex;
 }
 
+- (bool)planarAvailable
+{
+   return !_planarFailed;
+}
+
+- (id<MTLComputePipelineState>)planarKernel
+{
+   NSError *err = nil;
+   id<MTLLibrary> lib;
+   id<MTLFunction> fn;
+   id<MTLComputePipelineState> k;
+   /* 8-bit 4:2:0 from a staging slot, where the update wrote it, into
+    * RGBA: each pixel takes the chroma its 2x2 block shares */
+   static NSString *src = @
+      "#include <metal_stdlib>\n"
+      "using namespace metal;\n"
+      "struct PlanarParams { uint w, h, y_off, y_stride, cb_off, cr_off,"
+      " c_stride, c_step; float k[8]; };\n"
+      "kernel void planar_yuv420(device const uchar *src [[buffer(0)]],"
+      " constant PlanarParams &p [[buffer(1)]],"
+      " texture2d<float, access::write> out [[texture(0)]],"
+      " uint2 id [[thread_position_in_grid]])\n"
+      "{\n"
+      "   if (id.x >= p.w || id.y >= p.h) return;\n"
+      "   uint  co = (id.y >> 1) * p.c_stride + (id.x >> 1) * p.c_step;\n"
+      "   float y  = float(src[p.y_off + id.y * p.y_stride + id.x]) / 255.0;\n"
+      "   float cb = float(src[p.cb_off + co]) / 255.0 - 128.0 / 255.0;\n"
+      "   float cr = float(src[p.cr_off + co]) / 255.0 - 128.0 / 255.0;\n"
+      "   float3 rgb = float3(p.k[0] * y + p.k[1]) + float3(p.k[2] * cr,"
+      " p.k[3] * cb + p.k[4] * cr, p.k[5] * cb);\n"
+      "   out.write(float4(saturate(rgb), 1.0), id);\n"
+      "}\n";
+   if (_planarKernel || _planarFailed)
+      return _planarKernel;
+   _planarFailed = true;
+   if (     !(lib = RARCH_AUTORELEASE_R([_device newLibraryWithSource:src
+                  options:nil error:&err]))
+         || !(fn  = RARCH_AUTORELEASE_R([lib newFunctionWithName:
+                  @"planar_yuv420"]))
+         || !(k   = RARCH_AUTORELEASE_R([_device
+                  newComputePipelineStateWithFunction:fn error:&err])))
+   {
+      RARCH_WARN("[Metal] Planar conversion unavailable, frames are"
+            " converted on the CPU: %s.\n",
+            err ? err.localizedDescription.UTF8String : "");
+      return nil;
+   }
+   RARCH_ASSIGN(_planarKernel, k);
+   _planarFailed = false;
+   return _planarKernel;
+}
+
+- (Texture *)newPlanarTexture:(const struct texture_image *)image filter:(enum texture_filter_type)filter
+{
+   MTLTextureDescriptor *td;
+   id<MTLTexture>        t;
+   Texture              *tex;
+   if (!image->width || !image->height || ![self planarKernel])
+      return nil;
+   td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+         MTLPixelFormatRGBA8Unorm width:image->width height:image->height
+         mipmapped:NO];
+   td.usage       = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+   td.storageMode = MTLStorageModePrivate;
+   if (!(t = [_device newTextureWithDescriptor:td]))
+      return nil;
+   tex          = [Texture new];
+   tex.texture  = RARCH_AUTORELEASE_R(t);
+   tex.sampler  = _samplers[(filter == TEXTURE_FILTER_NEAREST
+         || filter == TEXTURE_FILTER_MIPMAP_NEAREST)
+      ? TEXTURE_FILTER_NEAREST : TEXTURE_FILTER_LINEAR];
+   tex->_planar = true;
+   return tex;
+}
+
 - (id<MTLTexture>)newTexture:(struct texture_image)image mipmapped:(bool)mipmapped
 {
    /* A 10-bit (XRGB2101010) source uses BGR10A2Unorm, whose packed layout
     * (R in the high 10 bits, B in the low) matches the ABI with no swizzle,
     * exactly as in the Metal source-frame path; otherwise BGRA8. Both are 4
     * bytes/pixel so the row stride is unchanged. */
-   MTLPixelFormat        pf = image.pix10
+   /* RGBA half floats (fp16) are RGBA16Float, 8 bytes a pixel in the
+    * same R,G,B,A order. */
+   MTLPixelFormat        pf = image.fp16
+         ? MTLPixelFormatRGBA16Float
+         : image.pix10
          ? MTLPixelFormatBGR10A2Unorm
          : MTLPixelFormatBGRA8Unorm;
    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
@@ -2098,7 +2327,7 @@ static void buffer_chain_discard(buffer_chain_t *chain);
    [t replaceRegion:MTLRegionMake2D(0, 0, image.width, image.height)
         mipmapLevel:0
         withBytes:image.pixels
-        bytesPerRow:4 * image.width];
+        bytesPerRow:(image.fp16 ? 8 : 4) * image.width];
 
    if (mipmapped)
    {
@@ -2728,7 +2957,8 @@ static float metal_hdr_pq_to_nits(float pq)
    v[3].color = color;
 
    id<MTLRenderCommandEncoder> rce = self.rce;
-   [rce setRenderPipelineState:_clearState];
+   [rce setRenderPipelineState:(_hdrEnabled && _clearStateF16)
+      ? _clearStateF16 : _clearState];
    [rce setVertexBytes:&v length:sizeof(v) atIndex:BufferIndexPositions];
    [rce setVertexBytes:&_uniforms length:sizeof(_uniforms) atIndex:BufferIndexUniforms];
    [rce drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -2830,7 +3060,17 @@ static float metal_hdr_pq_to_nits(float pq)
 - (retro_time_t)lastPresentTime
 {
 #ifdef RETRO_ATOMIC_HAS_64
-   return (retro_time_t)retro_atomic_load_acquire_64(&metal_presented_at);
+   retro_time_t at = (retro_time_t)retro_atomic_load_acquire_64(&metal_presented_at);
+   if (at > 0)
+      return at;
+#endif
+#if TARGET_OS_OSX
+   /* No drawable has said when it was shown: the display's last vblank,
+    * from the view's display link, where there is one. */
+   {
+      retro_time_t cocoa_last_vblank_time(void);
+      return cocoa_last_vblank_time();
+   }
 #else
    return 0;
 #endif
@@ -3136,12 +3376,15 @@ static bool buffer_chain_alloc_range(buffer_chain_t *chain,
    bool _clearNextRender;
    /* gfx_display meshes: the pipeline, and each mesh's buffers by id */
    id<MTLRenderPipelineState> _meshState;
+   id<MTLRenderPipelineState> _meshStateF16; /* the HDR UI overlay's */
    BOOL _meshStateFailed;
    id<MTLBuffer> _meshVbo[4];
    id<MTLBuffer> _meshIbo[4];
    uint32_t _meshId[4];
    uint64_t _meshLast[4];
    uint64_t _meshDraws;
+   /* Sampled by a quad drawn with no texture: solid colour */
+   Texture *_white;
 }
 
 - (instancetype)initWithContext:(Context *)context
@@ -3166,10 +3409,27 @@ static bool buffer_chain_alloc_range(buffer_chain_t *chain,
       [_meshIbo[i] release];
    }
    [_meshState release];
+   [_meshStateF16 release];
+   [_white release];
    [_context release];
    [super dealloc];
 }
 #endif
+
+- (Texture *)_whiteTexture
+{
+   if (!_white)
+   {
+      static const uint32_t white = 0xffffffffu;
+      struct texture_image image;
+      memset(&image, 0, sizeof(image));
+      image.pixels = (uint32_t *)&white;
+      image.width  = 1;
+      image.height = 1;
+      _white = [_context newTexture:image filter:TEXTURE_FILTER_NEAREST];
+   }
+   return _white;
+}
 
 + (const float *)defaultVertices
 {
@@ -3334,6 +3594,7 @@ static bool buffer_chain_alloc_range(buffer_chain_t *chain,
    if (!psd.vertexFunction || !psd.fragmentFunction)
       return NO;
    _meshState = [device newRenderPipelineStateWithDescriptor:psd error:&err];
+   _meshStateF16 = [_context twinF16:psd];
    if (!_meshState)
    {
       RARCH_WARN("[Metal] Mesh pipeline unavailable, meshes are streamed: %s.\n",
@@ -3412,7 +3673,8 @@ static bool buffer_chain_alloc_range(buffer_chain_t *chain,
    unsigned c;
    int slot;
    MTLPrimitiveType prim;
-   Texture *tex                    = (__bridge Texture *)(void *)texture;
+   Texture *tex                    = texture
+      ? (__bridge Texture *)(void *)texture : [self _whiteTexture];
    id<MTLRenderCommandEncoder> rce = _context.rce;
 
    if (!mesh || tex == nil || !rce)
@@ -3465,7 +3727,8 @@ static bool buffer_chain_alloc_range(buffer_chain_t *chain,
 
    prim = (mesh->topology == GFX_MESH_TRIANGLE_STRIP)
       ? MTLPrimitiveTypeTriangleStrip : MTLPrimitiveTypeTriangle;
-   [rce setRenderPipelineState:_meshState];
+   [rce setRenderPipelineState:(_context.hdrEnabled && _meshStateF16)
+      ? _meshStateF16 : _meshState];
    [rce setVertexBytes:&u length:sizeof(u) atIndex:BufferIndexUniforms];
    [rce setVertexBuffer:_meshVbo[slot] offset:0 atIndex:BufferIndexPositions];
    [rce setFragmentTexture:tex.texture atIndex:TextureIndexColor];
@@ -3525,8 +3788,8 @@ static bool buffer_chain_alloc_range(buffer_chain_t *chain,
 
    MTLViewport vp = {
       .originX = VIDEO_POS_X(draw->pos),
-      .originY = VIDEO_SCALE_H(_context.viewport->full_dims) - VIDEO_POS_Y(draw->pos)
-               - VIDEO_SCALE_H(draw->dims),
+      .originY = VIDEO_POS_FLIP_Y(VIDEO_SCALE_H(_context.viewport->full_dims),
+            draw->pos, draw->dims),
       .width   = VIDEO_SCALE_W(draw->dims),
       .height  = VIDEO_SCALE_H(draw->dims),
       .znear   = 0,
@@ -3558,11 +3821,24 @@ static bool buffer_chain_alloc_range(buffer_chain_t *chain,
          break;
    }
 
-   Texture *tex = (__bridge Texture *)(void *)draw->texture;
+   Texture *tex = draw->texture
+      ? (__bridge Texture *)(void *)draw->texture : [self _whiteTexture];
    if (tex == nil)
       return;
 
-   [rce setRenderPipelineState:[_context getStockShader:VIDEO_SHADER_STOCK_BLEND blend:_blend]];
+   /* A half-float texture is linear scRGB: into the HDR overlay through
+    * the inverse of the menu composite's encode */
+   if (     tex.texture.pixelFormat == MTLPixelFormatRGBA16Float
+         && [_context linearShader] != nil)
+   {
+      simd_float4 linParams = simd_make_float4(
+            [_context hdrMenuNits], (float)[_context hdrExpandGamut],
+            0.0f, 0.0f);
+      [rce setRenderPipelineState:[_context linearShader]];
+      [rce setFragmentBytes:&linParams length:sizeof(linParams) atIndex:0];
+   }
+   else
+      [rce setRenderPipelineState:[_context getStockShader:VIDEO_SHADER_STOCK_BLEND blend:_blend]];
 
    Uniforms uniforms = {
       .projectionMatrix = draw->matrix_data ? make_matrix_float4x4((const float *)draw->matrix_data)
@@ -3868,6 +4144,7 @@ static void gfx_display_metal_scissor_end(void *data, unsigned video_dims)
    id<MTLTexture> _texture;
 
    id<MTLRenderPipelineState> _state;
+   id<MTLRenderPipelineState> _stateF16; /* the HDR UI overlay's */
    id<MTLSamplerState> _sampler;
 
    Context *_context;
@@ -3908,6 +4185,7 @@ static void gfx_display_metal_scissor_end(void *data, unsigned video_dims)
    [(id)_buffer release];
    [(id)_texture release];
    [(id)_state release];
+   [(id)_stateF16 release];
    [(id)_sampler release];
    RARCH_SUPER_DEALLOC();
 #endif
@@ -3938,8 +4216,7 @@ static void gfx_display_metal_scissor_end(void *data, unsigned video_dims)
       _atlas  = _font_driver->get_atlas(_font_data);
       /* The atlas may grow, up to a texture every Metal GPU makes; the
        * buffer and texture follow it (_followAtlas) */
-      _atlas->max_width  = 8192;
-      _atlas->max_height = 8192;
+      _atlas->max_dims = VIDEO_SCALE_PACK(8192, 8192);
       [self _makeAtlasTexture];
 
       if (![self _initializeState])
@@ -4064,6 +4341,7 @@ static void gfx_display_metal_scissor_end(void *data, unsigned video_dims)
          return NO;
 
       _state                         = [_context.device newRenderPipelineStateWithDescriptor:psd error:&err];
+      _stateF16                      = [_context twinF16:psd];
       if (err != nil)
          return NO;
    }
@@ -4077,35 +4355,34 @@ static void gfx_display_metal_scissor_end(void *data, unsigned video_dims)
    return YES;
 }
 
-- (void)updateGlyph:(const struct font_glyph *)glyph
+/* Copies the atlas's dirty region into the buffer the texture is made
+ * on. Whole cells go across, so no texel of a cell's earlier glyph is
+ * left beside a smaller one for filtering to pick up. */
+- (void)updateDirty
 {
    if (_atlas->dirty)
    {
       unsigned row;
-      for (row = glyph->atlas_offset_y; row < (glyph->atlas_offset_y + glyph->height); row++)
-      {
-         uint8_t *src = _atlas->buffer
-               + ((size_t)row * _atlas->width + glyph->atlas_offset_x) * _esz;
-         uint8_t *dst = (uint8_t *)_buffer.contents
-               + (size_t)row * _stride
-               + (size_t)glyph->atlas_offset_x * _esz;
-         memcpy(dst, src, (size_t)glyph->width * _esz);
-      }
+      unsigned x0 = VIDEO_SCALE_W(_atlas->dirty_xy0);
+      unsigned y0 = VIDEO_SCALE_H(_atlas->dirty_xy0);
+      unsigned x1 = VIDEO_SCALE_W(_atlas->dirty_xy1);
+      unsigned y1 = VIDEO_SCALE_H(_atlas->dirty_xy1);
+      _atlas->dirty = false;
+      if (     x1 <= x0 || y1 <= y0
+            || x1 > _atlas->width || y1 > _atlas->height)
+         return;
+      for (row = y0; row < y1; row++)
+         memcpy((uint8_t *)_buffer.contents
+                  + (size_t)row * _stride + (size_t)x0 * _esz,
+               _atlas->buffer
+                  + ((size_t)row * _atlas->width + x0) * _esz,
+               (size_t)(x1 - x0) * _esz);
 
 #if !defined(HAVE_COCOATOUCH)
-      /* didModifyRange takes a BYTE range, not a row index.
-       * Every other call site in this file (lines 958, 1664, 1681,
-       * 3082, 3550) passes bytes. Previously offset was the row
-       * index, which meant the invalidated range almost never
-       * overlapped the actually-modified rows on managed-storage
-       * devices, producing stale/garbled glyphs until the entire
-       * atlas was invalidated by some other path. */
-      NSUInteger offset = (NSUInteger)glyph->atlas_offset_y * _stride;
-      NSUInteger len    = (NSUInteger)glyph->height         * _stride;
-      [_buffer didModifyRange:NSMakeRange(offset, len)];
+      /* didModifyRange takes a byte range */
+      [_buffer didModifyRange:NSMakeRange((NSUInteger)y0 * _stride,
+            (NSUInteger)(y1 - y0) * _stride)];
 #endif
-
-      _atlas->dirty = false;
    }
 }
 
@@ -4130,8 +4407,9 @@ static void gfx_display_metal_scissor_end(void *data, unsigned video_dims)
     * its cell, so no cell is stranded when an unrelated glyph clears
     * the dirty flag. */
    if (glyph_q)
-      [self updateGlyph:glyph_q];
-#define FONT_MEASURE_DIRTY(glyph) [self updateGlyph:(glyph)]
+      [self updateDirty];
+#define FONT_MEASURE_DIRTY(glyph) \
+   do { (void)(glyph); [self updateDirty]; } while (0)
 #define FONT_MEASURE_SUM width
 #include "../font_measure.h"
    return (int)(width * scale);
@@ -4144,7 +4422,7 @@ static void gfx_display_metal_scissor_end(void *data, unsigned video_dims)
       return NULL;
    glyph = _font_driver->get_glyph(_font_data, code);
    if (glyph)
-      [self updateGlyph:glyph];
+      [self updateDirty];
    return glyph;
 }
 
@@ -4194,7 +4472,8 @@ static INLINE void write_quad6(SpriteVertex *pv,
    [rce pushDebugGroup:@"render fonts"];
 
    [_context resetRenderViewport:kFullscreenViewport];
-   [rce setRenderPipelineState:_state];
+   [rce setRenderPipelineState:(_context.hdrEnabled && _stateF16)
+      ? _stateF16 : _state];
    [rce setVertexBytes:&_uniforms length:sizeof(Uniforms) atIndex:BufferIndexUniforms];
    [rce setVertexBuffer:_range.buffer offset:_range.offset atIndex:BufferIndexPositions];
    [rce setFragmentTexture:_texture atIndex:TextureIndexColor];
@@ -4261,13 +4540,14 @@ static INLINE void write_quad6(SpriteVertex *pv,
 
    glyph_q          = get_glyph(font_data, '?');
    if (glyph_q)
-      [self updateGlyph:glyph_q];
+      [self updateDirty];
 
    v                = (SpriteVertex *)_range.data + _vertices;
 
 #define FONT_LAYOUT_ALIGNED (aligned == TEXT_ALIGN_RIGHT \
       || aligned == TEXT_ALIGN_CENTER)
-#define FONT_LAYOUT_DIRTY(glyph) [self updateGlyph:(glyph)]
+#define FONT_LAYOUT_DIRTY(glyph) \
+   do { (void)(glyph); [self updateDirty]; } while (0)
 #define FONT_LAYOUT_LINE(line, line_width, count, bytes) \
    do \
    { \
@@ -4285,10 +4565,10 @@ static INLINE void write_quad6(SpriteVertex *pv,
    { \
       int off_x  = (glyph)->draw_offset_x; \
       int off_y  = (glyph)->draw_offset_y; \
-      int tex_x  = (glyph)->atlas_offset_x; \
-      int tex_y  = (glyph)->atlas_offset_y; \
-      int g_w    = (glyph)->width; \
-      int g_h    = (glyph)->height; \
+      int tex_x  = VIDEO_SCALE_W((glyph)->atlas_pos); \
+      int tex_y  = VIDEO_SCALE_H((glyph)->atlas_pos); \
+      int g_w    = VIDEO_SCALE_W((glyph)->dims); \
+      int g_h    = VIDEO_SCALE_H((glyph)->dims); \
       write_quad6(v, \
             (x + (off_x + (pen_x)) * scale) * inv_win_width, \
             (y + (off_y + (pen_y)) * scale) * inv_win_height, \
@@ -4525,6 +4805,9 @@ static void metal_pull_cached_frame_cb(void *userdata,
    /* Render target layer state */
    id<MTLRenderPipelineState> _t_pipelineState;
    id<MTLRenderPipelineState> _t_pipelineStateNoAlpha;
+   /* The HDR UI overlay's */
+   id<MTLRenderPipelineState> _t_pipelineStateF16;
+   id<MTLRenderPipelineState> _t_pipelineStateNoAlphaF16;
 
    id<MTLSamplerState> _samplerStateLinear;
    id<MTLSamplerState> _samplerStateNearest;
@@ -4563,8 +4846,6 @@ static void metal_pull_cached_frame_cb(void *userdata,
 }
 
 - (instancetype)initWithVideo:(const video_info_t *)video
-                        input:(input_driver_t **)input
-                    inputData:(void **)inputData
 {
    if (self = [super init])
    {
@@ -4725,8 +5006,6 @@ static void metal_pull_cached_frame_cb(void *userdata,
       [self applyVideoMode:_video.dims
                 fullscreen:_video.fullscreen];
 
-      *input         = NULL;
-      *inputData     = NULL;
       /* graphics display driver */
       _display       = [[MenuDisplay alloc] initWithContext:_context];
       /* menu view */
@@ -4852,6 +5131,8 @@ static void metal_pull_cached_frame_cb(void *userdata,
    [_context release];
    [(id)_t_pipelineState release];
    [(id)_t_pipelineStateNoAlpha release];
+   [(id)_t_pipelineStateF16 release];
+   [(id)_t_pipelineStateNoAlphaF16 release];
    [(id)_samplerStateLinear release];
    [(id)_samplerStateNearest release];
    [(id)_layer release];
@@ -4931,6 +5212,7 @@ static void metal_pull_cached_frame_cb(void *userdata,
       }
 
       _t_pipelineState = [_device newRenderPipelineStateWithDescriptor:psd error:&err];
+      _t_pipelineStateF16 = [_context twinF16:psd];
       if (err != nil)
       {
          RARCH_ERR("[Metal] Error creating pipeline state %s.\n", err.localizedDescription.UTF8String);
@@ -4940,6 +5222,7 @@ static void metal_pull_cached_frame_cb(void *userdata,
       psd.label               = @"Pipeline+No Alpha";
       ca.blendingEnabled      = NO;
       _t_pipelineStateNoAlpha = [_device newRenderPipelineStateWithDescriptor:psd error:&err];
+      _t_pipelineStateNoAlphaF16 = [_context twinF16:psd];
       if (err != nil)
       {
          RARCH_ERR("[Metal] Error creating pipeline state (no alpha) %s.\n", err.localizedDescription.UTF8String);
@@ -5075,7 +5358,9 @@ static void metal_pull_cached_frame_cb(void *userdata,
        * overlay. */
       if (!hdrOn && (_frameView.drawState & ViewDrawStateEncoder) != 0)
       {
-         [rce setRenderPipelineState:_t_pipelineStateNoAlpha];
+         [rce setRenderPipelineState:(_context.hdrEnabled
+               && _t_pipelineStateNoAlphaF16)
+            ? _t_pipelineStateNoAlphaF16 : _t_pipelineStateNoAlpha];
          if (_frameView.filter == RTextureFilterNearest)
             [rce setFragmentSamplerState:_samplerStateNearest atIndex:SamplerIndexDraw];
          else
@@ -5090,7 +5375,9 @@ static void metal_pull_cached_frame_cb(void *userdata,
          if (_menu.hasFrame)
          {
             [_menu.view drawWithContext:_context];
-            [rce setRenderPipelineState:_t_pipelineState];
+            [rce setRenderPipelineState:(_context.hdrEnabled
+                  && _t_pipelineStateF16)
+               ? _t_pipelineStateF16 : _t_pipelineState];
             if (_menu.view.filter == RTextureFilterNearest)
                [rce setFragmentSamplerState:_samplerStateNearest atIndex:SamplerIndexDraw];
             else
@@ -5140,6 +5427,7 @@ static void metal_pull_cached_frame_cb(void *userdata,
        * yet).  Composite touches the drawable unconditionally to avoid
        * presenting uninitialised swapchain memory — when src is nil, a
        * clear-only pass runs in place of the core encode. */
+#if METAL_HDR_AVAILABLE
       if (hdrOn)
       {
          const HDRUniforms *u  = _context.currentHDRUniforms;
@@ -5153,6 +5441,7 @@ static void metal_pull_cached_frame_cb(void *userdata,
             src = _frameView.frameTexture;
          [_context hdrComposite:u fromSource:src rotation:rot];
       }
+#endif
 
       [self _endFrame];
    }
@@ -5588,6 +5877,21 @@ typedef struct MTLALIGN(16)
 }
 
 - (CGSize)size { return _size; }
+
+- (void)setSourceFormat:(RPixelFormat)format
+{
+   CGSize size = _size;
+   if (format == _format)
+      return;
+   _format   = format;
+   _bpp      = RPixelFormatToBPP(_format);
+   _srcDirty = NO;
+   RARCH_RELEASE_NIL(_src);
+   /* setSize: makes the staging texture a 16-bit format needs; a
+    * view that has had no frame yet gets it with its first */
+   _size     = CGSizeMake(0, 0);
+   [self setSize:size];
+}
 
 - (void)setFrame:(CGRect)frame
 {
@@ -6925,8 +7229,6 @@ static bool metal_set_shader(void *data,
 typedef struct
 {
    const video_info_t *video;
-   input_driver_t **input;
-   void **input_data;
    void *result;
 } metal_init_args_t;
 
@@ -6951,9 +7253,7 @@ static void metal_init_mainthread(void *userdata)
 
    [apple_platform setViewType:APPLE_VIEW_TYPE_METAL];
 
-   md = [[MetalDriver alloc] initWithVideo:args->video
-                                     input:args->input
-                                 inputData:args->input_data];
+   md = [[MetalDriver alloc] initWithVideo:args->video];
    if (md == nil)
    {
       args->result = NULL;
@@ -6967,15 +7267,11 @@ static void metal_init_mainthread(void *userdata)
 }
 
 static void *metal_init(
-      const video_info_t *video,
-      input_driver_t **input,
-      void **input_data)
+      const video_info_t *video)
 {
    metal_init_args_t args;
 
    args.video      = video;
-   args.input      = input;
-   args.input_data = input_data;
    args.result     = NULL;
 
    cocoa_main_thread_sync(metal_init_mainthread, &args);
@@ -7212,6 +7508,9 @@ typedef struct
  * are explicitly documented as single-thread-only.  Concurrent
  * access from the main thread (mid-load) and the video thread
  * (mid-frame-end commit) is undefined behaviour. */
+static enum video_texture_update metal_planar_update(MetalDriver *md,
+      Texture *t, const struct texture_image *ti);
+
 static uintptr_t metal_load_texture_internal(void *video_data, void *data,
       enum texture_filter_type filter_type)
 {
@@ -7223,7 +7522,16 @@ static uintptr_t metal_load_texture_internal(void *video_data, void *data,
    @autoreleasepool
    {
       struct texture_image image = *img;
-      Texture *t = [md.context newTexture:image filter:filter_type];
+      Texture *t;
+      if (img->planar)
+      {
+         if (!(t = RARCH_AUTORELEASE_R([md.context newPlanarTexture:img
+                     filter:filter_type]))
+               || metal_planar_update(md, t, img) != VIDEO_TEXTURE_UPDATE_DONE)
+            return 0;
+         return (uintptr_t)RARCH_BRIDGE_RETAINED(t);
+      }
+      t = [md.context newTexture:image filter:filter_type];
       return (uintptr_t)RARCH_BRIDGE_RETAINED(RARCH_AUTORELEASE_R(t));
    }
 }
@@ -7259,9 +7567,11 @@ static uintptr_t metal_load_texture(void *video_data, void *data,
     * inline.  Menu icon and thumbnail loads are all non-mipmapped;
     * routing each of them through a video-thread round-trip was a
     * per-icon latency tax on menu population. */
+   /* A planar frame is converted on the blit command buffer: there too */
    if (      threaded
          && (   filter_type == TEXTURE_FILTER_MIPMAP_LINEAR
-             || filter_type == TEXTURE_FILTER_MIPMAP_NEAREST))
+             || filter_type == TEXTURE_FILTER_MIPMAP_NEAREST
+             || (data && ((struct texture_image *)data)->planar)))
    {
       metal_texture_cmd_t cmd;
       cmd.video_data  = video_data;
@@ -7316,12 +7626,157 @@ static void metal_unload_texture(void *data,
  * Must run on the thread that owns Context.blitCommandBuffer (see
  * metal_load_texture_internal): metal_update_texture routes it to
  * the video thread when threaded video is up. */
-static bool metal_update_texture_internal(void *video_data,
-      uintptr_t handle, const struct texture_image *ti)
+/* The texture's staging buffer, METAL_STAGING_SLOTS slots of @len
+ * bytes, made on first use and kept: a texture streams at one size,
+ * and lent slots point into it. */
+static bool metal_texture_staging(Texture *t, NSUInteger len)
+{
+   id<MTLBuffer> buf;
+   if (t.staging.length >= len * METAL_STAGING_SLOTS)
+      return true;
+   /* Grown under a lent slot would leave the producer the old one */
+   if (t->_stagingLent)
+      return false;
+   if (!(buf = [t.texture.device newBufferWithLength:len * METAL_STAGING_SLOTS
+               options:PLATFORM_METAL_RESOURCE_STORAGE_MODE]))
+      return false;
+   t.staging = RARCH_AUTORELEASE_R(buf);
+   return true;
+}
+
+/* A planar frame into planar texture @t: its planes copied once into a
+ * staging slot no conversion is still reading, then converted there by
+ * the planar kernel straight into the texture, on the blit command
+ * buffer, in order with the draws around it. A slot still the GPU's
+ * drops the frame, as an RGBA update does. Must run on the thread that
+ * owns Context.blitCommandBuffer. */
+static enum video_texture_update metal_planar_update(MetalDriver *md,
+      Texture *t, const struct texture_image *ti)
+{
+   const struct texture_planar *tp = ti->planar;
+   id<MTLTexture> tex = t.texture;
+   id<MTLComputePipelineState> kernel;
+   id<MTLCommandBuffer> cb;
+   id<MTLComputeCommandEncoder> ce;
+   struct
+   {
+      uint32_t w, h, y_off, y_stride, cb_off, cr_off, c_stride, c_step;
+      float k[8];
+   } params;
+   NSUInteger w  = ti->width;
+   NSUInteger h  = ti->height;
+   NSUInteger cw = (w + 1) / 2;
+   NSUInteger ch = (h + 1) / 2;
+   NSUInteger len, off, y, x, tw;
+   unsigned slot, k;
+   uint8_t *dst;
+
+   if (     !tp || !t->_planar || !tex
+         || !tp->planes[0] || !tp->planes[1] || !tp->planes[2]
+         || (tp->chroma_step != 1 && tp->chroma_step != 2)
+         || tex.width != w || tex.height != h
+         || !(kernel = [md.context planarKernel]))
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+   /* Luma, then Cb and Cr planes, tightly packed; kept a multiple of
+    * four so each slot starts aligned */
+   len = (w * h + 2 * cw * ch + 3) & ~(NSUInteger)3;
+   if (!metal_texture_staging(t, len))
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+   for (k = 0; k < METAL_STAGING_SLOTS; k++)
+   {
+      slot = (t->_stagingNext + k) % METAL_STAGING_SLOTS;
+      if (!__atomic_load_n(&t->_stagingBusy[slot], __ATOMIC_ACQUIRE))
+         break;
+   }
+   if (k == METAL_STAGING_SLOTS)
+      return VIDEO_TEXTURE_UPDATE_DROPPED;
+   if (!(cb = md.context.blitCommandBuffer))
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+   t->_stagingNext = (slot + 1) % METAL_STAGING_SLOTS;
+   off = (NSUInteger)slot * len;
+   dst = (uint8_t *)t.staging.contents + off;
+   for (y = 0; y < h; y++)
+      memcpy(dst + y * w, tp->planes[0] + y * tp->strides[0], w);
+   for (y = 0; y < ch; y++)
+   {
+      const uint8_t *cbp = tp->planes[1] + y * tp->strides[1];
+      const uint8_t *crp = tp->planes[2] + y * tp->strides[2];
+      uint8_t *ob        = dst + w * h + y * cw;
+      uint8_t *oc        = dst + w * h + cw * ch + y * cw;
+      if (tp->chroma_step == 1)
+      {
+         memcpy(ob, cbp, cw);
+         memcpy(oc, crp, cw);
+      }
+      else
+         for (x = 0; x < cw; x++)
+         {
+            ob[x] = cbp[x * 2];
+            oc[x] = crp[x * 2];
+         }
+   }
+#if TARGET_OS_OSX
+   if (t.staging.storageMode == MTLStorageModeManaged)
+      [t.staging didModifyRange:NSMakeRange(off, len)];
+#endif
+   params.w        = (uint32_t)w;
+   params.h        = (uint32_t)h;
+   params.y_off    = 0;
+   params.y_stride = (uint32_t)w;
+   params.cb_off   = (uint32_t)(w * h);
+   params.cr_off   = (uint32_t)(w * h + cw * ch);
+   params.c_stride = (uint32_t)cw;
+   params.c_step   = 1;
+   image_yuv_coefficients(tp->yuv, params.k);
+   params.k[6]     = 0.0f;
+   params.k[7]     = 0.0f;
+
+   ce = [cb computeCommandEncoder];
+   ce.label = @"planar conversion";
+   [ce setComputePipelineState:kernel];
+   [ce setBuffer:t.staging offset:off atIndex:0];
+   [ce setBytes:&params length:sizeof(params) atIndex:1];
+   [ce setTexture:tex atIndex:0];
+   tw = kernel.threadExecutionWidth;
+   if (!tw)
+      tw = 8;
+   {
+      NSUInteger th = kernel.maxTotalThreadsPerThreadgroup / tw;
+      MTLSize size, count;
+      if (th > 8)
+         th = 8;
+      if (!th)
+         th = 1;
+      size  = MTLSizeMake(tw, th, 1);
+      count = MTLSizeMake((w + tw - 1) / tw, (h + th - 1) / th, 1);
+      [ce dispatchThreadgroups:count threadsPerThreadgroup:size];
+   }
+   [ce endEncoding];
+   __atomic_store_n(&t->_stagingBusy[slot], 1, __ATOMIC_RELEASE);
+   {
+      Texture *held = t;
+      [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+         (void)done;
+         __atomic_store_n(&held->_stagingBusy[slot], 0, __ATOMIC_RELEASE);
+      }];
+   }
+   return VIDEO_TEXTURE_UPDATE_DONE;
+}
+
+static enum video_texture_update metal_update_texture_internal(
+      void *video_data, uintptr_t handle, const struct texture_image *ti)
 {
    MetalDriver *md = (__bridge MetalDriver *)video_data;
+   if (md && handle && ti && ti->planar)
+   {
+      @autoreleasepool
+      {
+         return metal_planar_update(md,
+               (__bridge Texture *)(void *)handle, ti);
+      }
+   }
    if (!md || !handle || !ti || !ti->pixels)
-      return false;
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
 
    @autoreleasepool
    {
@@ -7331,32 +7786,57 @@ static bool metal_update_texture_internal(void *video_data,
             || tex.mipmapLevelCount > 1
             || tex.width  != ti->width
             || tex.height != ti->height)
-         return false;
+         return VIDEO_TEXTURE_UPDATE_REFUSED;
       {
-         NSUInteger len = (NSUInteger)ti->width * ti->height * 4;
-         unsigned slot  = t->_stagingNext;
-         NSUInteger off = (NSUInteger)slot * len;
+         /* The texture's own texel size: RGBA16Float half floats are 8 */
+         NSUInteger bpp = (tex.pixelFormat == MTLPixelFormatRGBA16Float)
+            ? 8 : 4;
+         NSUInteger len = (NSUInteger)ti->width * ti->height * bpp;
+         unsigned slot  = METAL_STAGING_SLOTS;
+         unsigned k;
+         NSUInteger off;
          id<MTLCommandBuffer> cb;
          id<MTLBlitCommandEncoder> bce;
 
-         /* The copy out of this slot from METAL_STAGING_SLOTS frames
-          * ago has not finished: the frame is dropped rather than
-          * written over the GPU's shoulder, which is the policy the
-          * other backends keep. */
-         if (__atomic_load_n(&t->_stagingBusy[slot], __ATOMIC_ACQUIRE))
-            return true;
-         if (t.staging.length < len * METAL_STAGING_SLOTS)
+         if (!metal_texture_staging(t, len))
+            return VIDEO_TEXTURE_UPDATE_REFUSED;
+         /* A lent slot holding the frame: the producer wrote it where
+          * the blit reads from, once the slot's last blit had run */
+         for (k = 0; k < METAL_STAGING_SLOTS; k++)
+            if (     (t->_stagingLent & (1u << k))
+                  && ti->pixels == (const void*)
+                     ((uint8_t *)t.staging.contents + (NSUInteger)k * len))
+               slot = k;
+         if (slot < METAL_STAGING_SLOTS)
          {
-            id<MTLBuffer> buf = [tex.device
-                  newBufferWithLength:len * METAL_STAGING_SLOTS
-                  options:PLATFORM_METAL_RESOURCE_STORAGE_MODE];
-            if (!buf)
-               return false;
-            t.staging = RARCH_AUTORELEASE_R(buf);
+            if (__atomic_load_n(&t->_stagingBusy[slot], __ATOMIC_ACQUIRE))
+               /* written early: keep the last frame */
+               return VIDEO_TEXTURE_UPDATE_DROPPED;
          }
+         else
+         {
+            /* Otherwise the next slot nobody writes but this path */
+            for (k = 0; k < METAL_STAGING_SLOTS; k++)
+            {
+               slot = (t->_stagingNext + k) % METAL_STAGING_SLOTS;
+               if (!(t->_stagingLent & (1u << slot)))
+                  break;
+            }
+            if (k == METAL_STAGING_SLOTS)
+               return VIDEO_TEXTURE_UPDATE_DROPPED;
+            /* The copy out of this slot from METAL_STAGING_SLOTS
+             * frames ago has not finished: the frame is dropped rather
+             * than written over the GPU's shoulder, which is the
+             * policy the other backends keep. */
+            if (__atomic_load_n(&t->_stagingBusy[slot], __ATOMIC_ACQUIRE))
+               return VIDEO_TEXTURE_UPDATE_DROPPED;
+            t->_stagingNext = (slot + 1) % METAL_STAGING_SLOTS;
+         }
+         off = (NSUInteger)slot * len;
          if (!(cb = md.context.blitCommandBuffer))
-            return false;
-         memcpy((uint8_t *)t.staging.contents + off, ti->pixels, len);
+            return VIDEO_TEXTURE_UPDATE_REFUSED;
+         if (!(t->_stagingLent & (1u << slot)))
+            memcpy((uint8_t *)t.staging.contents + off, ti->pixels, len);
 #if TARGET_OS_OSX
          if (t.staging.storageMode == MTLStorageModeManaged)
             [t.staging didModifyRange:NSMakeRange(off, len)];
@@ -7364,7 +7844,7 @@ static bool metal_update_texture_internal(void *video_data,
          bce = [cb blitCommandEncoder];
          [bce copyFromBuffer:t.staging
                 sourceOffset:off
-           sourceBytesPerRow:4 * ti->width
+           sourceBytesPerRow:bpp * ti->width
          sourceBytesPerImage:len
                   sourceSize:MTLSizeMake(ti->width, ti->height, 1)
                    toTexture:tex
@@ -7373,7 +7853,6 @@ static bool metal_update_texture_internal(void *video_data,
            destinationOrigin:MTLOriginMake(0, 0, 0)];
          [bce endEncoding];
          __atomic_store_n(&t->_stagingBusy[slot], 1, __ATOMIC_RELEASE);
-         t->_stagingNext = (slot + 1) % METAL_STAGING_SLOTS;
          {
             /* The slot is free again when this command buffer is done
              * with it. The handler holds the Texture so the flag it
@@ -7387,27 +7866,25 @@ static bool metal_update_texture_internal(void *video_data,
          }
       }
    }
-   return true;
+   return VIDEO_TEXTURE_UPDATE_DONE;
 }
 
 #ifdef HAVE_THREADS
-/* Runs on the video thread via CMD_CUSTOM_COMMAND; the result goes
- * back through cmd->handle (0 = refused), as metal_texture_load_wrap
- * does, since the int return channel is not wide enough for it. */
+/* Runs on the video thread via CMD_CUSTOM_COMMAND; the outcome comes
+ * back as the command's return value. */
 static uintptr_t metal_texture_update_wrap(void *data)
 {
    metal_texture_cmd_t *cmd = (metal_texture_cmd_t*)data;
-   cmd->handle = metal_update_texture_internal(cmd->video_data,
-         cmd->handle, cmd->image) ? cmd->handle : 0;
-   return 0;
+   return (uintptr_t)metal_update_texture_internal(cmd->video_data,
+         cmd->handle, cmd->image);
 }
 #endif
 
-static bool metal_update_texture(void *video_data, uintptr_t handle,
-      const struct texture_image *ti, bool threaded)
+static enum video_texture_update metal_update_texture(void *video_data,
+      uintptr_t handle, const struct texture_image *ti, bool threaded)
 {
    if (!handle || !ti)
-      return false;
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
 
 #ifdef HAVE_THREADS
    /* The update encodes a blit into Context.blitCommandBuffer, which
@@ -7421,12 +7898,50 @@ static bool metal_update_texture(void *video_data, uintptr_t handle,
       cmd.image       = (struct texture_image *)ti;
       cmd.filter_type = TEXTURE_FILTER_LINEAR;
       cmd.handle      = handle;
-      video_thread_texture_handle(&cmd, metal_texture_update_wrap);
-      return cmd.handle != 0;
+      return (enum video_texture_update)video_thread_texture_handle(
+            &cmd, metal_texture_update_wrap);
    }
 #endif
 
    return metal_update_texture_internal(video_data, handle, ti);
+}
+
+/* On the driver's own thread (see texture_lend in video_driver.h):
+ * the slot's staging memory, where the update's blit reads from */
+static void *metal_texture_lend(void *video_data, uintptr_t handle,
+      unsigned slot, size_t pitch)
+{
+   void *mem = NULL;
+   if (!video_data || !handle || slot >= 2)
+      return NULL;
+   @autoreleasepool
+   {
+      Texture *t         = (__bridge Texture *)(void *)handle;
+      id<MTLTexture> tex = t.texture;
+      NSUInteger bpp, len;
+      if (!tex || tex.mipmapLevelCount > 1)
+         return NULL;
+      bpp = (tex.pixelFormat == MTLPixelFormatRGBA16Float) ? 8 : 4;
+      len = (NSUInteger)tex.width * tex.height * bpp;
+      if (     (NSUInteger)pitch != (NSUInteger)tex.width * bpp
+            || !metal_texture_staging(t, len))
+         return NULL;
+      t->_stagingLent |= 1u << slot;
+      mem = (uint8_t *)t.staging.contents + (NSUInteger)slot * len;
+   }
+   return mem;
+}
+
+static bool metal_texture_lend_ready(void *video_data, uintptr_t handle,
+      unsigned slot)
+{
+   Texture *t;
+   if (!video_data || !handle || slot >= METAL_STAGING_SLOTS)
+      return true;
+   t = (__bridge Texture *)(void *)handle;
+   if (!(t->_stagingLent & (1u << slot)))
+      return true;
+   return !__atomic_load_n(&t->_stagingBusy[slot], __ATOMIC_ACQUIRE);
 }
 
 typedef struct
@@ -7638,6 +8153,24 @@ static bool metal_supports_texture_format(void *video_data,
     * words into it, on every Apple target. */
    if (fmt == TEXTURE_GPU_FORMAT_RGB10A2)
       return video_data != NULL;
+   /* RGBA16Float from half floats loads and updates on every Apple
+    * target */
+   if (fmt == TEXTURE_GPU_FORMAT_RGBA16F)
+      return video_data != NULL;
+   /* Converted by the planar kernel, which every Metal device runs */
+   if (fmt == TEXTURE_GPU_FORMAT_YUV420)
+   {
+      MetalDriver *md = (__bridge MetalDriver *)video_data;
+      return md && [md.context planarAvailable];
+   }
+   /* stock_fragment_linear shows such a texture as linear scRGB in the
+    * RGBA16Float HDR overlay; in SDR there is no linear light */
+   if (fmt == TEXTURE_GPU_FORMAT_SCRGB)
+   {
+      MetalDriver *mdl = (__bridge MetalDriver *)video_data;
+      return mdl && mdl.context.hdrEnabled
+         && [mdl.context linearShader] != nil;
+   }
 #if TARGET_OS_OSX
    MetalDriver  *md = (__bridge MetalDriver *)video_data;
    id<MTLDevice> dev;
@@ -7655,7 +8188,8 @@ static bool metal_supports_texture_format(void *video_data,
    }
    dev = md.context.device;
    if (apple_runtime_available(APPLE_RUNTIME_VER(11, 0, 0), 0, 0))
-      return dev.supportsBCTextureCompression ? true : false;
+      return apple_rt_get_bool(dev,
+            sel_registerName("supportsBCTextureCompression")) ? true : false;
    return true; /* BC always available on pre-11 (Intel) Macs */
 #else
    (void)video_data;
@@ -7688,6 +8222,24 @@ static uintptr_t metal_load_texture_compressed(void *video_data,
    (void)filter_type;
    return 0;
 #endif
+}
+
+/* The frame texture is 32-bit whatever the source; a 16-bit source is
+ * converted into it from a staging texture. A new format changes only
+ * that, and the frames' size is taken per frame already. */
+static bool metal_set_frame_format(void *data, bool rgb32,
+      unsigned input_scale)
+{
+   @autoreleasepool
+   {
+      MetalDriver *md = (__bridge MetalDriver *)data;
+      (void)input_scale;
+      if (!md || md.frameView.format == RPixelFormatBGR10A2Unorm)
+         return false;
+      [md.frameView setSourceFormat:rgb32
+            ? RPixelFormatBGRX8Unorm : RPixelFormatB5G6R5Unorm];
+      return true;
+   }
 }
 
 static const video_poke_interface_t metal_poke_interface = {
@@ -7731,7 +8283,15 @@ static const video_poke_interface_t metal_poke_interface = {
    NULL, /* hw_ring_context_new */
    NULL, /* hw_ring_context_free */
    NULL, /* hw_ring_framebuffer */
-   metal_update_texture
+   metal_update_texture,
+   NULL, /* get_swap_interval_cap */
+   metal_texture_lend,
+   metal_texture_lend_ready,
+   NULL, /* get_last_present_wait */
+   NULL, /* set_view_count */
+   NULL, /* hw_context_destroying */
+   NULL, /* get_headset_refresh */
+   metal_set_frame_format
 };
 
 static void metal_get_poke_interface(void *data,

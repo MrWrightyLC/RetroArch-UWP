@@ -51,6 +51,10 @@
 #include "../common/win32_common.h"
 #endif
 
+#ifdef HAVE_THREADS
+#include "../video_thread_wrapper.h"
+#endif
+
 /* AlphaBlend / GradientFill / TransparentBlt are msimg32 imports
  * that became available with Windows 98 / 2000.  Most of the menu
  * draw path requires real per-pixel alpha (Ozone shadows, XMB
@@ -92,6 +96,7 @@ typedef struct gdi_texture
    HBITMAP bmp;
    HBITMAP bmp_old;
    void *data;            /* Owned BGRA premultiplied pixel buffer. */
+   void *bits;            /* bmp's pixels, once realized. */
 
    unsigned dims;         /* Pixel size of `data`, packed. */
 
@@ -613,7 +618,7 @@ static void gdi_upload_core_frame_to_menu(gdi_t *gdi,
 }
 #endif
 
-#ifdef GDI_HAS_ALPHABLEND
+#if GDI_HAS_ALPHABLEND
 /* Composite RGUI's RGBA4444 menu_frame onto bmp_menu using
  * source-over alpha blending.
  *
@@ -725,8 +730,8 @@ static void gdi_blit_rgui_alpha(gdi_t *gdi,
  * The menu drivers (XMB, Ozone, MaterialUI) and gfx_widgets issue
  * draw calls in three flavours:
  *
- *   1. Solid-colour rectangle (texture is gfx_white_texture, a 1x1
- *      white pixel).  By far the most common: backgrounds, panels,
+ *   1. Solid-colour rectangle (no texture).  By far the most
+ *      common: backgrounds, panels,
  *      separator lines.  Per-vertex colour from coords->color.
  *      We render this with FillRect + cached SolidBrush.
  *
@@ -999,7 +1004,8 @@ static bool gdi_texture_realize(gdi_t *gdi, gdi_texture_t *texture)
    memcpy(pixels, texture->data,
          VIDEO_SCALE_AREA(texture->dims) * sizeof(uint32_t));
 
-   texture->bmp = bmp;
+   texture->bmp  = bmp;
+   texture->bits = pixels;
    return true;
 }
 
@@ -1131,7 +1137,7 @@ static void gfx_display_gdi_draw(gfx_display_ctx_draw_t *draw,
        * coordinate system (the video_height value we were
        * passed), so flip. */
       dst_x = (int)VIDEO_POS_X(draw->pos);
-      dst_y = (int)video_height - (int)VIDEO_SCALE_H(draw->dims) - (int)VIDEO_POS_Y(draw->pos);
+      dst_y = VIDEO_POS_FLIP_Y(video_height, draw->pos, draw->dims);
       dst_w = VIDEO_SCALE_W(draw->dims);
       dst_h = VIDEO_SCALE_H(draw->dims);
 
@@ -1232,10 +1238,8 @@ static void gfx_display_gdi_draw(gfx_display_ctx_draw_t *draw,
          return;
    }
 
-   /* gfx_white_texture is a 1x1 white pixel; the menu code uses
-    * "draw a textured quad with the white texture" as its idiom
-    * for solid-colour rectangles.  Detect that case so we can
-    * skip the (much more expensive) blit path entirely. */
+   /* A quad with no texture is a solid-colour rectangle; so is one
+    * with a 1x1 texture. Neither takes the blit path. */
    is_white_texture = (!texture
          || (   VIDEO_SCALE_W(texture->dims) <= 1
              && VIDEO_SCALE_H(texture->dims) <= 1));
@@ -1687,36 +1691,43 @@ static bool gdi_font_upload_atlas(gdi_raster_t *font)
    /* Expand A8 -> BGRA premultiplied: A=atlas[i], R=G=B=A.  This
     * gives us a "white glyph with embedded alpha" source that
     * AlphaBlend can composite directly with AC_SRC_ALPHA.  Only the
-    * dirty rectangle tracked by the font renderers is expanded; a
+    * dirty rectangles tracked by the font renderers are expanded; a
     * freshly (re)created DIB has no previous contents and is
     * converted in full. */
    {
-      unsigned x0 = font->atlas->dirty_x0;
-      unsigned y0 = font->atlas->dirty_y0;
-      unsigned x1 = font->atlas->dirty_x1;
-      unsigned y1 = font->atlas->dirty_y1;
-
-      if (     recreated
-            || x1 <= x0 || y1 <= y0
-            || x1 > (unsigned)font->atlas->width
-            || y1 > (unsigned)font->atlas->height)
+      unsigned r;
+      unsigned rects = recreated ? 1 : font_atlas_dirty_rects(font->atlas);
+      for (r = 0; r < rects; r++)
       {
-         x0 = 0;
-         y0 = 0;
-         x1 = font->atlas->width;
-         y1 = font->atlas->height;
-      }
+         unsigned xy0, xy1, x0, y0, x1, y1;
+         font_atlas_dirty_rect(font->atlas, r, &xy0, &xy1);
+         x0 = VIDEO_SCALE_W(xy0);
+         y0 = VIDEO_SCALE_H(xy0);
+         x1 = VIDEO_SCALE_W(xy1);
+         y1 = VIDEO_SCALE_H(xy1);
 
-      for (j = y0; j < y1; j++)
-      {
-         uint32_t      *dst = font->atlas_pixels
-            + (size_t)j * VIDEO_SCALE_W(font->atlas_dims) + x0;
-         const uint8_t *src = font->atlas->buffer
-            + (size_t)j * font->atlas->width + x0;
-         for (i = 0; i < x1 - x0; i++)
+         if (     recreated
+               || x1 <= x0 || y1 <= y0
+               || x1 > (unsigned)font->atlas->width
+               || y1 > (unsigned)font->atlas->height)
          {
-            uint32_t a = src[i];
-            dst[i] = (a << 24) | (a << 16) | (a << 8) | a;
+            x0 = 0;
+            y0 = 0;
+            x1 = font->atlas->width;
+            y1 = font->atlas->height;
+         }
+
+         for (j = y0; j < y1; j++)
+         {
+            uint32_t      *dst = font->atlas_pixels
+               + (size_t)j * VIDEO_SCALE_W(font->atlas_dims) + x0;
+            const uint8_t *src = font->atlas->buffer
+               + (size_t)j * font->atlas->width + x0;
+            for (i = 0; i < x1 - x0; i++)
+            {
+               uint32_t a = src[i];
+               dst[i] = (a << 24) | (a << 16) | (a << 8) | a;
+            }
          }
       }
    }
@@ -1808,8 +1819,7 @@ static void *gdi_font_init(void *data,
    font->atlas = font->font_driver->get_atlas(font->font_data);
    /* The atlas may grow; the DIB mirroring it is made again whenever
     * its size changes */
-   font->atlas->max_width  = 2048;
-   font->atlas->max_height = 2048;
+   font->atlas->max_dims = VIDEO_SCALE_PACK(2048, 2048);
 
    /* The atlas DIB is created lazily on first render_msg, since
     * gdi->memDC may not exist yet at font init time (font_driver
@@ -1996,16 +2006,16 @@ static void gdi_font_render_line(
       if (plain_white) \
       { \
          int gx, gy, gw, gh; \
-         gw = (int)((float)(gl)->width  * scale); \
-         gh = (int)((float)(gl)->height * scale); \
+         gw = (int)((float)VIDEO_SCALE_W((gl)->dims) * scale); \
+         gh = (int)((float)VIDEO_SCALE_H((gl)->dims) * scale); \
          if (gw > 0 && gh > 0) \
          { \
             gx = line_x + x_offset + (int)((float)(gl)->draw_offset_x * scale); \
             gy = line_y           + (int)((float)(gl)->draw_offset_y * scale); \
             AlphaBlend(dst_dc, gx, gy, gw, gh, \
                   atlas_dc, \
-                  (gl)->atlas_offset_x, (gl)->atlas_offset_y, \
-                  (gl)->width, (gl)->height, \
+                  VIDEO_SCALE_W((gl)->atlas_pos), VIDEO_SCALE_H((gl)->atlas_pos), \
+                  VIDEO_SCALE_W((gl)->dims), VIDEO_SCALE_H((gl)->dims), \
                   blend); \
          } \
       } \
@@ -2013,13 +2023,13 @@ static void gdi_font_render_line(
       { \
          int gx_dst, gy_dst, gw, gh; \
          int gx_src, gy_src; \
-         gw     = (int)((float)(gl)->width  * scale); \
-         gh     = (int)((float)(gl)->height * scale); \
+         gw     = (int)((float)VIDEO_SCALE_W((gl)->dims) * scale); \
+         gh     = (int)((float)VIDEO_SCALE_H((gl)->dims) * scale); \
          gx_dst = x_offset + (int)((float)(gl)->draw_offset_x * scale); \
          gy_dst = (metrics ? (int)(metrics->ascender * scale + 0.5f) : 0) \
                 + (int)((float)(gl)->draw_offset_y * scale); \
-         gx_src = (int)(gl)->atlas_offset_x; \
-         gy_src = (int)(gl)->atlas_offset_y; \
+         gx_src = (int)VIDEO_SCALE_W((gl)->atlas_pos); \
+         gy_src = (int)VIDEO_SCALE_H((gl)->atlas_pos); \
          if (gw > 0 && gh > 0) \
          { \
             int yy, xx; \
@@ -2031,8 +2041,8 @@ static void gdi_font_render_line(
                const uint8_t *src_row; \
                if (dst_y2 < 0 || dst_y2 >= (int)VIDEO_SCALE_H(font->scratch_dims)) \
                   continue; \
-               src_y2  = gy_src + (int)((float)yy * (float)(gl)->height \
-                     / (float)gh); \
+               src_y2  = gy_src + (int)((float)yy \
+                     * (float)VIDEO_SCALE_H((gl)->dims) / (float)gh); \
                if (src_y2 < 0 || src_y2 >= (int)VIDEO_SCALE_H(font->atlas_dims)) \
                   continue; \
                dst_row = font->scratch_pixels \
@@ -2047,8 +2057,8 @@ static void gdi_font_render_line(
                   uint32_t out_a, out_r, out_g, out_b; \
                   if (dst_x2 < 0 || dst_x2 >= (int)VIDEO_SCALE_W(font->scratch_dims)) \
                      continue; \
-                  src_x2 = gx_src + (int)((float)xx * (float)(gl)->width \
-                        / (float)gw); \
+                  src_x2 = gx_src + (int)((float)xx \
+                        * (float)VIDEO_SCALE_W((gl)->dims) / (float)gw); \
                   if (src_x2 < 0 || src_x2 >= (int)VIDEO_SCALE_W(font->atlas_dims)) \
                      continue; \
                   alpha = src_row[src_x2]; \
@@ -2388,8 +2398,7 @@ static void gdi_create(gdi_t *gdi)
    }
 }
 
-static void *gdi_init(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+static void *gdi_init(const video_info_t *video)
 {
    unsigned full_x, full_y;
    unsigned mode_dims = 0;
@@ -2401,8 +2410,6 @@ static void *gdi_init(const video_info_t *video,
    if (!gdi)
       return NULL;
 
-   *input                               = NULL;
-   *input_data                          = NULL;
 
    gdi->frame_dims = video->dims;
    gdi->rgb32                           = video->rgb32;
@@ -2466,7 +2473,7 @@ static void *gdi_init(const video_info_t *video,
 
    /* no input driver of this driver's own: the frontend starts the
     * one that goes with a Windows window */
-   input_driver_left_to_frontend(INPUT_WINDOW_WINDOWS, input, input_data);
+   input_driver_video_window(INPUT_WINDOW_WINDOWS, NULL);
 
 
    RARCH_LOG("[GDI] Init complete.\n");
@@ -2902,7 +2909,7 @@ static bool gdi_frame(void *data, const void *frame,
           *     transparency degrades to opaque, RGUI's chequer
           *     becomes solid, which is the same behaviour
           *     non-transparency-capable backends give. */
-#ifdef GDI_HAS_ALPHABLEND
+#if GDI_HAS_ALPHABLEND
          if (frame_to_copy == gdi->menu_frame && bits == 16)
          {
             gdi_blit_rgui_alpha(gdi, frame_to_copy, width, height,
@@ -3221,43 +3228,17 @@ static void gdi_set_video_mode(void *data, unsigned dims,
    gfx_ctx_gdi_set_video_mode(dims, fullscreen);
 }
 
-static uintptr_t gdi_load_texture(void *video_data, void *data,
-      bool threaded, enum texture_filter_type filter_type)
+/* Source pixels arrive in BGRA byte order (PNG -> ARGB32 little-
+ * endian when supports_rgba is false, which is the GDI default).
+ * AlphaBlend with AC_SRC_ALPHA needs *premultiplied* alpha source
+ * pixels: do that conversion once here so the per-frame draw path
+ * is a straight blit.  Also detect "no transparency anywhere" so
+ * the draw path can use a faster opaque blit when appropriate. */
+static bool gdi_texture_premultiply(uint32_t *dst, const uint32_t *src,
+      size_t total)
 {
-   gdi_texture_t *texture      = NULL;
-   struct texture_image *image = (struct texture_image*)data;
-   const uint32_t *src;
-   uint32_t       *dst;
-   size_t          i, total;
-   bool            has_alpha   = false;
-
-   if (!image || image->width > 2048 || image->height > 2048)
-      return 0;
-
-   texture                     = (gdi_texture_t*)calloc(1, sizeof(*texture));
-
-   if (!texture)
-      return 0;
-
-   texture->dims               = VIDEO_SCALE_PACK(image->width, image->height);
-   texture->type               = filter_type;
-   total                       = VIDEO_SCALE_AREA(texture->dims);
-   texture->data               = calloc(1, total * sizeof(uint32_t));
-
-   if (!texture->data)
-   {
-      free(texture);
-      return 0;
-   }
-
-   /* Source pixels arrive in BGRA byte order (PNG -> ARGB32 little-
-    * endian when supports_rgba is false, which is the GDI default).
-    * AlphaBlend with AC_SRC_ALPHA needs *premultiplied* alpha source
-    * pixels: do that conversion once here so the per-frame draw path
-    * is a straight blit.  Also detect "no transparency anywhere" so
-    * the draw path can use a faster opaque blit when appropriate. */
-   src   = (const uint32_t*)image->pixels;
-   dst   = (uint32_t*)texture->data;
+   size_t i;
+   bool has_alpha = false;
 
    for (i = 0; i < total; i++)
    {
@@ -3291,10 +3272,94 @@ static uintptr_t gdi_load_texture(void *video_data, void *data,
              |  (uint32_t)pb;
    }
 
-   texture->has_alpha     = has_alpha;
+   return has_alpha;
+}
+
+static uintptr_t gdi_load_texture(void *video_data, void *data,
+      bool threaded, enum texture_filter_type filter_type)
+{
+   gdi_texture_t *texture      = NULL;
+   struct texture_image *image = (struct texture_image*)data;
+   size_t          total;
+
+   if (!image || image->width > 2048 || image->height > 2048)
+      return 0;
+
+   texture                     = (gdi_texture_t*)calloc(1, sizeof(*texture));
+
+   if (!texture)
+      return 0;
+
+   texture->dims               = VIDEO_SCALE_PACK(image->width, image->height);
+   texture->type               = filter_type;
+   total                       = VIDEO_SCALE_AREA(texture->dims);
+   texture->data               = calloc(1, total * sizeof(uint32_t));
+
+   if (!texture->data)
+   {
+      free(texture);
+      return 0;
+   }
+
+   texture->has_alpha     = gdi_texture_premultiply(
+         (uint32_t*)texture->data, (const uint32_t*)image->pixels, total);
    texture->premultiplied = true;
 
    return (uintptr_t)texture;
+}
+
+/* Runs where the draws run, so the DIB is never read while written;
+ * GdiFlush retires any batched blit still sourcing it. */
+static void gdi_update_texture_internal(gdi_texture_t *texture,
+      const struct texture_image *ti)
+{
+   size_t total       = VIDEO_SCALE_AREA(texture->dims);
+   texture->has_alpha = gdi_texture_premultiply(
+         (uint32_t*)texture->data, (const uint32_t*)ti->pixels, total);
+   if (texture->bits)
+   {
+      GdiFlush();
+      memcpy(texture->bits, texture->data, total * sizeof(uint32_t));
+   }
+}
+
+#ifdef HAVE_THREADS
+typedef struct
+{
+   gdi_texture_t *texture;
+   const struct texture_image *ti;
+} gdi_update_cmd_t;
+
+static uintptr_t gdi_update_texture_wrap(void *data)
+{
+   gdi_update_cmd_t *cmd = (gdi_update_cmd_t*)data;
+   gdi_update_texture_internal(cmd->texture, cmd->ti);
+   return 1;
+}
+#endif
+
+static enum video_texture_update gdi_update_texture(void *video_data,
+      uintptr_t id, const struct texture_image *ti, bool threaded)
+{
+   gdi_texture_t *texture = (gdi_texture_t*)id;
+
+   if (     !texture || !ti || !ti->pixels || ti->pix10 || ti->fp16
+         || texture->dims != VIDEO_SCALE_PACK(ti->width, ti->height))
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+
+#ifdef HAVE_THREADS
+   if (threaded)
+   {
+      gdi_update_cmd_t cmd;
+      cmd.texture = texture;
+      cmd.ti      = ti;
+      video_thread_texture_handle(&cmd, gdi_update_texture_wrap);
+      return VIDEO_TEXTURE_UPDATE_DONE;
+   }
+#endif
+
+   gdi_update_texture_internal(texture, ti);
+   return VIDEO_TEXTURE_UPDATE_DONE;
 }
 
 static void gdi_unload_texture(void *data,
@@ -3372,7 +3437,22 @@ static const video_poke_interface_t gdi_poke_interface = {
    NULL, /* set_hdr_paper_white_nits */
    NULL, /* set_hdr_expand_gamut */
    NULL, /* set_hdr_scanlines */
-   NULL  /* set_hdr_subpixel_layout */
+   NULL, /* set_hdr_subpixel_layout */
+   NULL, /* supports_texture_format */
+   NULL, /* load_texture_compressed */
+   NULL, /* present_last */
+   NULL, /* get_last_present_time */
+   NULL, /* hw_ring_install */
+   NULL, /* hw_ring_fence_new */
+   NULL, /* hw_ring_fence_free */
+   NULL, /* hw_ring_fence_signal */
+   NULL, /* hw_ring_fence_wait */
+   NULL, /* hw_ring_capture */
+   NULL, /* hw_ring_present_slot */
+   NULL, /* hw_ring_context_new */
+   NULL, /* hw_ring_context_free */
+   NULL, /* hw_ring_framebuffer */
+   gdi_update_texture
 };
 
 static void gdi_get_poke_interface(void *data,
@@ -3458,14 +3538,36 @@ static void gdi_overlay_free(gdi_t *gdi)
    unsigned i;
    if (!gdi || !gdi->overlays)
       return;
-   for (i = 0; i < gdi->overlays_size; i++)
-   {
-      if (gdi->overlays[i].bmp)
-         DeleteObject(gdi->overlays[i].bmp);
-   }
+   if (!gdi->overlays_borrowed)
+      for (i = 0; i < gdi->overlays_size; i++)
+      {
+         if (gdi->overlays[i].bmp)
+            DeleteObject(gdi->overlays[i].bmp);
+      }
    free(gdi->overlays);
-   gdi->overlays      = NULL;
-   gdi->overlays_size = 0;
+   gdi->overlays          = NULL;
+   gdi->overlays_size     = 0;
+   gdi->overlays_borrowed = false;
+}
+
+static void gdi_overlay_defaults(struct gdi_overlay *o, HBITMAP bmp,
+      unsigned dims)
+{
+   o->bmp            = bmp;
+   o->tex_dims       = dims;
+   o->alpha_mod      = 1.0f;
+   o->fullscreen     = false;
+   /* Stretch to the full target rect by default.  The overlay
+    * descriptor drives subsequent vertex_geom calls before
+    * anything is actually drawn. */
+   o->tex_coords[0]  = 0.0f;
+   o->tex_coords[1]  = 0.0f;
+   o->tex_coords[2]  = 1.0f;
+   o->tex_coords[3]  = 1.0f;
+   o->vert_coords[0] = 0.0f;
+   o->vert_coords[1] = 0.0f;
+   o->vert_coords[2] = 1.0f;
+   o->vert_coords[3] = 1.0f;
 }
 
 static bool gdi_overlay_load(void *data,
@@ -3497,9 +3599,6 @@ static bool gdi_overlay_load(void *data,
       BITMAPINFO bmi;
       void              *bits = NULL;
       HBITMAP            bmp;
-      const uint32_t    *src;
-      uint32_t          *dst;
-      size_t             j, total;
       struct gdi_overlay *o = &gdi->overlays[i];
       unsigned           w  = imgs[i].width;
       unsigned           h  = imgs[i].height;
@@ -3524,52 +3623,45 @@ static bool gdi_overlay_load(void *data,
          continue;
       }
 
-      /* Premultiply alpha at load: AlphaBlend with AC_SRC_ALPHA
-       * needs premultiplied RGB or transparent pixels bleed
-       * background colour through their fringes.  Source pixels
-       * are 0xAARRGGBB (BGRA in memory order, the GDI default
-       * when supports_rgba is false). */
-      src   = imgs[i].pixels;
-      dst   = (uint32_t*)bits;
-      total = (size_t)w * (size_t)h;
-      for (j = 0; j < total; j++)
-      {
-         uint32_t s  = src[j];
-         uint8_t  sa = (uint8_t)((s >> 24) & 0xFF);
-         uint8_t  sr = (uint8_t)((s >> 16) & 0xFF);
-         uint8_t  sg = (uint8_t)((s >>  8) & 0xFF);
-         uint8_t  sb = (uint8_t)( s        & 0xFF);
-         uint8_t  pr, pg, pb;
+      /* AlphaBlend with AC_SRC_ALPHA needs premultiplied RGB or
+       * transparent pixels bleed background colour through their
+       * fringes. */
+      gdi_texture_premultiply((uint32_t*)bits, imgs[i].pixels,
+            (size_t)w * (size_t)h);
+      gdi_overlay_defaults(o, bmp, VIDEO_SCALE_PACK(w, h));
+   }
 
-         if (sa == 255)      { pr = sr; pg = sg; pb = sb; }
-         else if (sa == 0)   { pr = pg = pb = 0; }
-         else
-         {
-            pr = (uint8_t)GDI_DIV255((unsigned)sr * sa);
-            pg = (uint8_t)GDI_DIV255((unsigned)sg * sa);
-            pb = (uint8_t)GDI_DIV255((unsigned)sb * sa);
-         }
-         dst[j] = ((uint32_t)sa << 24)
-                | ((uint32_t)pr << 16)
-                | ((uint32_t)pg <<  8)
-                |  (uint32_t)pb;
-      }
+   return true;
+}
 
-      o->bmp           = bmp;
-      o->tex_dims      = VIDEO_SCALE_PACK(w, h);
-      o->alpha_mod     = 1.0f;
-      o->fullscreen    = false;
-      /* Stretch to the full target rect by default.  The overlay
-       * descriptor drives subsequent vertex_geom calls before
-       * anything is actually drawn. */
-      o->tex_coords[0]  = 0.0f;
-      o->tex_coords[1]  = 0.0f;
-      o->tex_coords[2]  = 1.0f;
-      o->tex_coords[3]  = 1.0f;
-      o->vert_coords[0] = 0.0f;
-      o->vert_coords[1] = 0.0f;
-      o->vert_coords[2] = 1.0f;
-      o->vert_coords[3] = 1.0f;
+/* A page of the pack's textures: each one's DIB, realized here once
+ * for every page it is on */
+static bool gdi_overlay_load_textures(void *data,
+      const uintptr_t *textures, unsigned num_textures)
+{
+   unsigned i;
+   gdi_t *gdi = (gdi_t*)data;
+
+   if (!gdi)
+      return false;
+
+   gdi_overlay_free(gdi);
+
+   if (num_textures == 0 || !textures)
+      return true;
+
+   if (!(gdi->overlays = (struct gdi_overlay*)calloc(num_textures,
+         sizeof(*gdi->overlays))))
+      return false;
+   gdi->overlays_size     = num_textures;
+   gdi->overlays_borrowed = true;
+
+   for (i = 0; i < num_textures; i++)
+   {
+      gdi_texture_t *texture = (gdi_texture_t*)textures[i];
+      if (texture && gdi_texture_realize(gdi, texture))
+         gdi_overlay_defaults(&gdi->overlays[i], texture->bmp,
+               texture->dims);
    }
 
    return true;
@@ -3748,7 +3840,7 @@ static void gdi_overlays_render(gdi_t *gdi,
 static const video_overlay_interface_t gdi_overlay_interface = {
    gdi_overlay_enable,
    gdi_overlay_load,
-   NULL, /* load_textures */
+   gdi_overlay_load_textures,
    gdi_overlay_tex_geom,
    gdi_overlay_vertex_geom,
    gdi_overlay_full_screen,

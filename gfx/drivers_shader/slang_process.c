@@ -19,6 +19,9 @@
 #include <stdint.h>
 
 #include "glslang_util.h"
+/* Names the reflection table below needs in every build, with or
+ * without the compiler. */
+#include "slang_rect.h"
 #if defined(HAVE_GLSLANG)
 #include "slang_cache.h"
 #endif
@@ -89,7 +92,10 @@ static const char *semantic_uniform_names[] = {
    "Gyroscope",
    "Accelerometer",
    "AccelerometerRest",
-   "SwapCount"
+   "SwapCount",
+   SLANG_RECT_NAME_RECT,
+   SLANG_RECT_NAME_CLAMP,
+   SLANG_RECT_NAME_TEXELS
 };
 
 static bool slang_reflect(
@@ -1440,6 +1446,7 @@ bool slang_process(
    spvc_compiler_options   vs_options  = NULL;
    spvc_compiler_options   ps_options  = NULL;
    spvc_backend            backend     = SPVC_BACKEND_GLSL;
+   const char             *backend_name = "GLSL";
    const char             *vs_code     = NULL;
    const char             *ps_code     = NULL;
    const spvc_reflected_resource *list = NULL;
@@ -1458,6 +1465,35 @@ bool slang_process(
 
    if (!*pass->alias && output.meta.name[0])
       strlcpy(pass->alias, output.meta.name, sizeof(pass->alias) - 1);
+
+   /* Every pass samples the frame as the first does. Its filter must be
+    * the preset's own: an unspecified one follows the smooth setting,
+    * which the driver can change without building the preset again. */
+   out->frame_in_place = false;
+   if (     semantics_map->uniforms[SLANG_SEMANTIC_ORIGINAL_RECT]
+         && shader_info->pass[0].filter != RARCH_FILTER_UNSPEC)
+   {
+      enum slang_rect_wrap wrap = SLANG_RECT_WRAP_BORDER;
+      switch (shader_info->pass[0].wrap)
+      {
+         case RARCH_WRAP_EDGE:
+            wrap = SLANG_RECT_WRAP_EDGE;
+            break;
+         case RARCH_WRAP_REPEAT:
+            wrap = SLANG_RECT_WRAP_REPEAT;
+            break;
+         case RARCH_WRAP_MIRRORED_REPEAT:
+            wrap = SLANG_RECT_WRAP_MIRROR;
+            break;
+         default:
+            break;
+      }
+      out->frame_in_place = slang_rect_remap_pass(
+            &output.vertex, &output.vertex_len,
+            &output.fragment, &output.fragment_len,
+            pass_number == 0,
+            shader_info->pass[0].filter == RARCH_FILTER_LINEAR, wrap);
+   }
 
    out->format          = output.meta.rt_format;
    out->explicit_format = (output.meta.rt_format != SLANG_FORMAT_UNKNOWN);
@@ -1481,15 +1517,12 @@ bool slang_process(
    {
       case RARCH_SHADER_HLSL:
       case RARCH_SHADER_CG:
-#ifdef HAVE_HLSL
-         backend = SPVC_BACKEND_HLSL;
+         backend      = SPVC_BACKEND_HLSL;
+         backend_name = "HLSL";
          break;
-#else
-         RARCH_ERR("[Slang] HLSL backend not compiled in.\n");
-         goto error;
-#endif
       case RARCH_SHADER_METAL:
-         backend = SPVC_BACKEND_MSL;
+         backend      = SPVC_BACKEND_MSL;
+         backend_name = "MSL";
          break;
       default:
          backend = SPVC_BACKEND_GLSL;
@@ -1654,7 +1687,7 @@ bool slang_process(
    return true;
 
 spvc_error:
-   RARCH_ERR("[Slang] SPIRV-Cross: %s.\n",
+   RARCH_ERR("[Slang] SPIRV-Cross, %s: %s\n", backend_name,
          spvc_context_get_last_error_string(ctx));
 
 error:
@@ -1860,6 +1893,12 @@ static bool validate_type_for_semantic(spvc_type type, enum slang_semantic sem)
       case SLANG_SEMANTIC_ACCELEROMETER_REST:
          return spvc_type_get_basetype(type) == SPVC_BASETYPE_FP32
             &&  spvc_type_get_vector_size(type)  == 3
+            &&  spvc_type_get_columns(type)  == 1;
+      case SLANG_SEMANTIC_ORIGINAL_RECT:
+      case SLANG_SEMANTIC_ORIGINAL_CLAMP:
+      case SLANG_SEMANTIC_ORIGINAL_TEXELS:
+         return spvc_type_get_basetype(type) == SPVC_BASETYPE_FP32
+            &&  spvc_type_get_vector_size(type)  == 4
             &&  spvc_type_get_columns(type)  == 1;
          /* float */
       case SLANG_SEMANTIC_FLOAT_PARAMETER:
