@@ -111,7 +111,7 @@ HAVE_ANGLE=no              # ANGLE support (OpenGL wrapper)
 HAVE_VULKAN=auto           # Vulkan support
 C89_VULKAN=no
 HAVE_VULKAN_DISPLAY=yes    # Vulkan KHR display backend support
-HAVE_OPENXR=no             # OpenXR headset output (Vulkan; the vendored Khronos loader is built in-tree)
+HAVE_OPENXR=no             # OpenXR headset output (Vulkan, or desktop GL on Linux; the vendored Khronos loader is built in-tree)
 C89_OPENXR=no
 HAVE_METAL=no              # Metal support (macOS-only)
 C89_METAL=no
@@ -259,6 +259,7 @@ HAVE_FLAC=no               # Link against libFLAC (unused by default; FLAC decod
 HAVE_RMODTRACKER=yes       # rmodtracker MOD/S3M/XM support
 HAVE_RWEBM=yes             # RWEBM (WebM/Matroska demuxer) support
 HAVE_RMP4=yes              # RMP4 (MP4/ISO-BMFF demuxer) support
+HAVE_RAV1=yes              # AV1 hardware decoding support
 HAVE_RVP9=yes              # RVP9 (VP9 video decoder) support
 HAVE_RMPEG1=yes            # RMPEG1 (MPEG-1 program stream / video) support
 

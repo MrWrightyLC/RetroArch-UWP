@@ -32,7 +32,8 @@ jobs:
           # (shader_vulkan.c, slang_process.c, glslang_util.c, slang_cache.c)
           # and the Vulkan contexts into this lane; without it configure
           # drops them and none of those C files ever meet -std=c89.
-          pkgs="build-essential libxkbcommon-dev libx11-xcb-dev libvulkan-dev zlib1g-dev libfreetype6-dev libegl1-mesa-dev libgles2-mesa-dev libgbm-dev nvidia-cg-toolkit nvidia-cg-dev libavcodec-dev libsdl2-dev libsdl-image1.2-dev libxml2-dev yasm"
+          # libpipewire-0.3-dev does the same for the PipeWire drivers.
+          pkgs="build-essential libxkbcommon-dev libx11-xcb-dev libvulkan-dev libpipewire-0.3-dev zlib1g-dev libfreetype6-dev libegl1-mesa-dev libgles2-mesa-dev libgbm-dev nvidia-cg-toolkit nvidia-cg-dev libavcodec-dev libsdl2-dev libsdl-image1.2-dev libxml2-dev yasm"
           if dpkg -s $pkgs >/dev/null 2>&1; then
             echo "All packages already present on runner image; skipping apt."
             exit 0
@@ -86,6 +87,9 @@ jobs:
             $pkgs
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
       - name: Configure
         run: ./configure
       - name: Build
@@ -93,4 +97,4 @@ jobs:
       - name: Build Debug
         run: |
           make clean # making sure we don't have leftovers from previous build
-          make DEBUG=1 GL_DEBUG=1 C89_BUILD=1 info all
+          CFLAGS="-O0 -g1" CXXFLAGS="-O0 -g1" make DEBUG=1 GL_DEBUG=1 C89_BUILD=1 info all

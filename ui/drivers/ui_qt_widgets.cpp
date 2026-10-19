@@ -30,6 +30,7 @@
 
 #include "ui_qt_widgets.h"
 #include "ui_qt.h"
+#include "ui_qt_float_sync.h"
 
 /* RetroArch-internal headers are included here, OUTSIDE the extern "C"
  * block below.  They self-guard their C declarations with
@@ -521,7 +522,7 @@ StringComboBox::StringComboBox(rarch_setting_t *setting, QWidget *parent) :
    ,m_setting(setting)
    ,m_value(setting->value.target.string)
 {
-   addItems(QString(setting->values).split('|'));
+   addItems(QString(setting->aux.values).split('|'));
 
    connect(this, SIGNAL(currentTextChanged(const QString&)), this,
 		 SLOT(onCurrentTextChanged(const QString&)));
@@ -892,6 +893,7 @@ FloatSpinBox::FloatSpinBox(rarch_setting_t *setting, QWidget *parent) :
          999.00f);
 
    setValue(*m_value);
+   m_synced = *m_value;
    setSingleStep(setting->step);
 
    connect(this, SIGNAL(valueChanged(double)), this, SLOT(onValueChanged(double)));
@@ -901,18 +903,22 @@ FloatSpinBox::FloatSpinBox(rarch_setting_t *setting, QWidget *parent) :
 void FloatSpinBox::onValueChanged(double value)
 {
    *m_value = (float)value;
+   m_synced = *m_value;
 
    setting_generic_handle_change(m_setting);
 }
 
 void FloatSpinBox::paintEvent(QPaintEvent *event)
 {
-   if ((float)value() != *m_value)
+   if (ui_qt_float_resync(&m_synced, *m_value))
    {
       blockSignals(true);
 
       if (*m_value < minimum() || *m_value > maximum())
+      {
          *m_value = m_setting->default_value.fraction;
+         m_synced = *m_value;
+      }
 
       setValue(*m_value);
 
@@ -964,7 +970,7 @@ void FileButton::onClicked(bool)
       this,
       "Choose File",
       currentPath(),
-      QString(m_setting->short_description) + " (*." + QString(m_setting->values) + ")");
+      QString(m_setting->short_description) + " (*." + QString(m_setting->aux.values) + ")");
 
    if (!file.isNull())
    {
@@ -1020,6 +1026,7 @@ FloatSlider::FloatSlider(rarch_setting_t *setting, QWidget *parent) :
    setSingleStep(setting->step * m_precision);
 
    setValue(*m_value * m_precision);
+   m_synced = *m_value;
 
    connect(this, SIGNAL(valueChanged(int)), this, SLOT(onValueChanged(int)));
 
@@ -1029,14 +1036,14 @@ FloatSlider::FloatSlider(rarch_setting_t *setting, QWidget *parent) :
 void FloatSlider::onValueChanged(int value)
 {
    *m_value = (float)value / m_precision;
+   m_synced = *m_value;
 
    setting_generic_handle_change(m_setting);
 }
 
 void FloatSlider::paintEvent(QPaintEvent *event)
 {
-   /* The same float division onValueChanged stores */
-   if ((float)value() / m_precision != *m_value)
+   if (ui_qt_float_resync(&m_synced, *m_value))
    {
       blockSignals(true);
 
@@ -3595,7 +3602,7 @@ static void shader_reresolve_keeping_values(struct video_shader *shader)
 
    for (i = 0; i < shader->num_parameters; i++)
       values.insert(QString(shader->parameters[i].id),
-            shader->parameters[i].current);
+            video_shader_param_get(&shader->parameters[i]));
 
    video_shader_resolve_parameters(shader);
 
@@ -3604,7 +3611,7 @@ static void shader_reresolve_keeping_values(struct video_shader *shader)
       QHash<QString, float>::const_iterator it =
             values.constFind(QString(shader->parameters[i].id));
       if (it != values.constEnd())
-         shader->parameters[i].current = it.value();
+         video_shader_param_set(&shader->parameters[i], it.value());
    }
 }
 
@@ -3809,7 +3816,7 @@ void ShaderParamsDialog::onShaderResetPass(int pass)
          if (pass >= 0 && param->pass != pass)
             continue;
 
-         param->current = param->initial;
+         video_shader_param_set(param, param->initial);
       }
    }
 
@@ -3824,7 +3831,7 @@ void ShaderParamsDialog::onShaderResetPass(int pass)
          if (pass >= 0 && param->pass != pass)
             continue;
 
-         param->current = param->initial;
+         video_shader_param_set(param, param->initial);
       }
 
       video_shader->flags |= SHDR_FLAG_MODIFIED;
@@ -3854,7 +3861,7 @@ void ShaderParamsDialog::onShaderResetParameter(QString parameter)
       }
 
       if (param)
-         param->current = param->initial;
+         video_shader_param_set(param, param->initial);
    }
 
    if (video_shader)
@@ -3871,7 +3878,7 @@ void ShaderParamsDialog::onShaderResetParameter(QString parameter)
       }
 
       if (param)
-         param->current = param->initial;
+         video_shader_param_set(param, param->initial);
 
       video_shader->flags |= SHDR_FLAG_MODIFIED;
    }
@@ -4601,7 +4608,7 @@ void ShaderParamsDialog::addShaderParam(struct video_shader_parameter *param, QF
    {
       /* option is basically a bool, so use a checkbox */
       QCheckBox *checkBox = new QCheckBox(this);
-      checkBox->setChecked(param->current == param->maximum ? true : false);
+      checkBox->setChecked(video_shader_param_get(param) == param->maximum ? true : false);
       checkBox->setProperty("param", parameter);
 
       connect(checkBox, SIGNAL(clicked()), this, SLOT(onShaderParamCheckBoxClicked()));
@@ -4615,7 +4622,7 @@ void ShaderParamsDialog::addShaderParam(struct video_shader_parameter *param, QF
       QHBoxLayout *box              = new QHBoxLayout();
       QSlider *slider               = new QSlider(Qt::Horizontal, this);
       double value                  = lerp(
-            param->minimum, param->maximum, 0, 100, param->current);
+            param->minimum, param->maximum, 0, 100, video_shader_param_get(param));
       double intpart                = 0;
       bool stepIsFractional         = modf(param->step, &intpart);
 
@@ -4634,7 +4641,7 @@ void ShaderParamsDialog::addShaderParam(struct video_shader_parameter *param, QF
          doubleSpinBox = new QDoubleSpinBox(this);
          doubleSpinBox->setRange(param->minimum, param->maximum);
          doubleSpinBox->setSingleStep(param->step);
-         doubleSpinBox->setValue(param->current);
+         doubleSpinBox->setValue(video_shader_param_get(param));
          doubleSpinBox->setProperty("slider", QVariant::fromValue(slider));
          slider->setProperty("doubleSpinBox", QVariant::fromValue(doubleSpinBox));
 
@@ -4647,7 +4654,7 @@ void ShaderParamsDialog::addShaderParam(struct video_shader_parameter *param, QF
          spinBox = new QSpinBox(this);
          spinBox->setRange(param->minimum, param->maximum);
          spinBox->setSingleStep(param->step);
-         spinBox->setValue(param->current);
+         spinBox->setValue(video_shader_param_get(param));
          spinBox->setProperty("slider", QVariant::fromValue(slider));
          slider->setProperty("spinBox", QVariant::fromValue(spinBox));
 
@@ -4695,7 +4702,7 @@ void ShaderParamsDialog::onShaderParamCheckBoxClicked()
          }
 
          if (param)
-            param->current = (checkBox->isChecked() ? param->maximum : param->minimum);
+            video_shader_param_set(param, (checkBox->isChecked() ? param->maximum : param->minimum));
       }
 
       if (video_shader)
@@ -4712,7 +4719,7 @@ void ShaderParamsDialog::onShaderParamCheckBoxClicked()
          }
 
          if (param)
-            param->current = (checkBox->isChecked() ? param->maximum : param->minimum);
+            video_shader_param_set(param, (checkBox->isChecked() ? param->maximum : param->minimum));
 
          video_shader->flags   |= SHDR_FLAG_MODIFIED;
       }
@@ -4757,7 +4764,7 @@ void ShaderParamsDialog::onShaderParamSliderValueChanged(int)
          {
             newValue = lerp(0, 100, param->minimum, param->maximum, slider->value());
             newValue = round(newValue / param->step) * param->step;
-            param->current = newValue;
+            video_shader_param_set(param, newValue);
          }
       }
 
@@ -4778,7 +4785,7 @@ void ShaderParamsDialog::onShaderParamSliderValueChanged(int)
          {
             newValue = lerp(0, 100, param->minimum, param->maximum, slider->value());
             newValue = round(newValue / param->step) * param->step;
-            param->current = newValue;
+            video_shader_param_set(param, newValue);
          }
 
          video_shader->flags   |= SHDR_FLAG_MODIFIED;
@@ -4857,9 +4864,9 @@ void ShaderParamsDialog::onShaderParamSpinBoxValueChanged(int value)
 
          if (param)
          {
-            param->current = value;
+            video_shader_param_set(param, value);
             newValue       = lerp(
-                  param->minimum, param->maximum, 0, 100, param->current);
+                  param->minimum, param->maximum, 0, 100, video_shader_param_get(param));
             slider->blockSignals(true);
             slider->setValue(newValue);
             slider->blockSignals(false);
@@ -4881,9 +4888,9 @@ void ShaderParamsDialog::onShaderParamSpinBoxValueChanged(int value)
 
          if (param)
          {
-            param->current = value;
+            video_shader_param_set(param, value);
             newValue       = lerp(
-                  param->minimum, param->maximum, 0, 100, param->current);
+                  param->minimum, param->maximum, 0, 100, video_shader_param_get(param));
             slider->blockSignals(true);
             slider->setValue(newValue);
             slider->blockSignals(false);
@@ -4940,9 +4947,9 @@ void ShaderParamsDialog::onShaderParamDoubleSpinBoxValueChanged(double value)
 
          if (param)
          {
-            param->current = value;
+            video_shader_param_set(param, value);
             newValue       = lerp(
-                  param->minimum, param->maximum, 0, 100, param->current);
+                  param->minimum, param->maximum, 0, 100, video_shader_param_get(param));
             slider->blockSignals(true);
             slider->setValue(newValue);
             slider->blockSignals(false);
@@ -4964,9 +4971,9 @@ void ShaderParamsDialog::onShaderParamDoubleSpinBoxValueChanged(double value)
 
          if (param)
          {
-            param->current = value;
+            video_shader_param_set(param, value);
             newValue       = lerp(
-                  param->minimum, param->maximum, 0, 100, param->current);
+                  param->minimum, param->maximum, 0, 100, video_shader_param_get(param));
             slider->blockSignals(true);
             slider->setValue(newValue);
             slider->blockSignals(false);
@@ -5453,14 +5460,26 @@ QWidget *AudioPage::widget()
    outputGroup->add(MENU_ENUM_LABEL_AUDIO_DRIVER);
    outputGroup->add(MENU_ENUM_LABEL_AUDIO_DEVICE);
    outputGroup->add(MENU_ENUM_LABEL_AUDIO_LATENCY);
+   outputGroup->add(MENU_ENUM_LABEL_AUDIO_LATENCY_FLOOR);
+   outputGroup->add(MENU_ENUM_LABEL_AUDIO_OUTPUT_LAYOUT);
+   outputGroup->add(MENU_ENUM_LABEL_AUDIO_HEADPHONE_VIRTUAL_SURROUND);
 
    resamplerGroup->add(MENU_ENUM_LABEL_AUDIO_RESAMPLER_DRIVER);
    resamplerGroup->add(MENU_ENUM_LABEL_AUDIO_RESAMPLER_QUALITY);
    resamplerGroup->add(MENU_ENUM_LABEL_AUDIO_OUTPUT_RATE);
+   resamplerGroup->add(MENU_ENUM_LABEL_AUDIO_RESAMPLER_HQ_OVERSAMPLING);
+   resamplerGroup->add(MENU_ENUM_LABEL_AUDIO_FASTPATH_S16);
+   resamplerGroup->add(MENU_ENUM_LABEL_AUDIO_FORMAT_NEGOTIATION);
 
    syncGroup->add(MENU_ENUM_LABEL_AUDIO_SYNC);
    syncGroup->add(MENU_ENUM_LABEL_AUDIO_MAX_TIMING_SKEW);
    syncGroup->add(MENU_ENUM_LABEL_AUDIO_RATE_CONTROL_DELTA);
+   syncGroup->add(MENU_ENUM_LABEL_AUDIO_THREADED_PIPELINE);
+   syncGroup->add(MENU_ENUM_LABEL_AUDIO_PIPELINE_FILL_CAP);
+   syncGroup->add(MENU_ENUM_LABEL_AUDIO_SINK_RATE_ESTIMATION);
+   syncGroup->add(MENU_ENUM_LABEL_AUDIO_THREAD_PRIORITY);
+   syncGroup->add(MENU_ENUM_LABEL_AUDIO_TIME_STRETCH);
+   syncGroup->add(MENU_ENUM_LABEL_AUDIO_TIME_STRETCH_LOWPASS);
 
    dspGroup->add(MENU_ENUM_LABEL_AUDIO_DSP_PLUGIN);
 
@@ -5682,6 +5701,7 @@ QWidget *LatencyPage::widget()
    layout->add(menu_setting_find_enum(MENU_ENUM_LABEL_VIDEO_MAX_SWAPCHAIN_IMAGES));
    layout->add(menu_setting_find_enum(MENU_ENUM_LABEL_VIDEO_WAITABLE_SWAPCHAINS));
    layout->add(menu_setting_find_enum(MENU_ENUM_LABEL_VIDEO_SCANLINE_SYNC));
+   layout->add(menu_setting_find_enum(MENU_ENUM_LABEL_VIDEO_SCANLINE_SYNC_OFFSET));
    layout->add(menu_setting_find_enum(MENU_ENUM_LABEL_VIDEO_MAX_FRAME_LATENCY));
    layout->add(menu_setting_find_enum(MENU_ENUM_LABEL_VIDEO_FRAME_DELAY));
    layout->add(menu_setting_find_enum(MENU_ENUM_LABEL_VIDEO_FRAME_DELAY_AUTO));
@@ -6157,6 +6177,7 @@ QWidget *SavingPage::widget()
 
    systemFilesDirGroup->add(MENU_ENUM_LABEL_SYSTEMFILES_IN_CONTENT_DIR_ENABLE);
 
+   screenshotsDirGroup->add(MENU_ENUM_LABEL_VIDEO_GPU_SCREENSHOT);
    screenshotsDirGroup->add(MENU_ENUM_LABEL_SORT_SCREENSHOTS_BY_CONTENT_ENABLE);
    screenshotsDirGroup->add(MENU_ENUM_LABEL_SCREENSHOTS_IN_CONTENT_DIR_ENABLE);
 
@@ -6598,6 +6619,7 @@ QWidget *VideoPage::widget()
    QHBoxLayout *syncMiscLayout         = new QHBoxLayout;
 
    SettingsGroup *miscGroup            = new SettingsGroup("Miscellaneous");
+   SettingsGroup *stereo3dGroup        = new SettingsGroup("Stereo 3D and Screens");
    SettingsGroup *filterGroup          = new SettingsGroup("Video Filter");
 
    unsigned i, size                    = 0;
@@ -6624,6 +6646,9 @@ QWidget *VideoPage::widget()
 
    outputGroup->add(MENU_ENUM_LABEL_VIDEO_DRIVER);
    outputGroup->add(MENU_ENUM_LABEL_VIDEO_THREADED);
+   outputGroup->add(MENU_ENUM_LABEL_VIDEO_THREADED_PRESENT_REPEAT);
+   outputGroup->add(MENU_ENUM_LABEL_VIDEO_THREADED_DISPLAY_PACING);
+   outputGroup->add(MENU_ENUM_LABEL_VIDEO_DXGI_PRESENT);
    outputGroup->add(MENU_ENUM_LABEL_VIDEO_MONITOR_INDEX);
    outputGroup->add(MENU_ENUM_LABEL_VIDEO_ROTATION);
    outputGroup->add(MENU_ENUM_LABEL_SCREEN_ORIENTATION);
@@ -6633,6 +6658,7 @@ QWidget *VideoPage::widget()
 
    fullscreenGroup->add(MENU_ENUM_LABEL_VIDEO_FULLSCREEN);
    fullscreenGroup->add(MENU_ENUM_LABEL_VIDEO_WINDOWED_FULLSCREEN);
+   fullscreenGroup->add(MENU_ENUM_LABEL_VIDEO_FSE_NEGOTIATION);
 
    leftFullscreenSizeForm->addRow("Width:", new UIntSpinBox(MENU_ENUM_LABEL_VIDEO_FULLSCREEN_X));
    rightFullscreenSizeForm->addRow("Height:", new UIntSpinBox(MENU_ENUM_LABEL_VIDEO_FULLSCREEN_Y));
@@ -6693,18 +6719,12 @@ QWidget *VideoPage::widget()
 
    syncGroup->add(MENU_ENUM_LABEL_VIDEO_MAX_SWAPCHAIN_IMAGES);
    syncGroup->add(MENU_ENUM_LABEL_VIDEO_WAITABLE_SWAPCHAINS);
-   syncGroup->add(MENU_ENUM_LABEL_VIDEO_MAX_FRAME_LATENCY);
    syncGroup->add(MENU_ENUM_LABEL_VIDEO_SCANLINE_SYNC);
    syncGroup->add(MENU_ENUM_LABEL_VRR_RUNLOOP_ENABLE);
 
    miscGroup->add(MENU_ENUM_LABEL_SUSPEND_SCREENSAVER_ENABLE);
-#ifdef HAVE_VIDEO_FILTER
-   miscGroup->add(MENU_ENUM_LABEL_VIDEO_FILTER_ENABLE);
-#endif
-   miscGroup->add(MENU_ENUM_LABEL_VIDEO_THREADED);
    miscGroup->add(MENU_ENUM_LABEL_VIDEO_GPU_SCREENSHOT);
    miscGroup->add(MENU_ENUM_LABEL_VIDEO_SMOOTH);
-   miscGroup->add(MENU_ENUM_LABEL_VIDEO_CTX_SCALING);
    miscGroup->add(MENU_ENUM_LABEL_VIDEO_SHADER_DELAY);
 
    if (video_driver_get_disp_flags() & VIDEO_FLAG_HDR_SUPPORT)
@@ -6720,7 +6740,15 @@ QWidget *VideoPage::widget()
    syncMiscLayout->addWidget(syncGroup);
    syncMiscLayout->addWidget(miscGroup);
 
+   stereo3dGroup->add(MENU_ENUM_LABEL_VIDEO_STEREO_SWAP_EYES);
+   stereo3dGroup->add(MENU_ENUM_LABEL_VIDEO_STEREO_MODE);
+   stereo3dGroup->add(MENU_ENUM_LABEL_VIDEO_SCREEN_LAYOUT);
+
+#ifdef HAVE_VIDEO_FILTER
+   filterGroup->add(MENU_ENUM_LABEL_VIDEO_FILTER_ENABLE);
+   filterGroup->add(MENU_ENUM_LABEL_VIDEO_FILTER_THREADS);
    filterGroup->add(MENU_ENUM_LABEL_VIDEO_FILTER);
+#endif
 
    modeLayout->addWidget(fullscreenGroup);
    modeLayout->addWidget(windowedGroup);
@@ -6732,6 +6760,7 @@ QWidget *VideoPage::widget()
    layout->addLayout(modeLayout);
    layout->addLayout(hdrLayout);
    layout->addLayout(syncMiscLayout);
+   layout->addWidget(stereo3dGroup);
    layout->addWidget(filterGroup);
 
    layout->addStretch();

@@ -26,7 +26,7 @@ typedef struct ra_dxgi_bridge {
    void *resources[2], *ready_handle, *done_handle, *event, *latency;
    void *d3d_dll, *dxgi_dll;
    UINT64 sequence, last_use[2];
-   unsigned width, height, format, chain_flags, current_index;
+   unsigned width, height, format, chain_flags, current_index, present_count;
    int failed, occluded, resized;
 } ra_dxgi_bridge_t;
 static UINT64 completed, expected;
@@ -60,7 +60,6 @@ static unsigned WaitForSingleObject(void *event, unsigned timeout)
    drained = 1; ++waits; return 0;
 }
 static int CloseHandle(void *handle) { assert(handle); return 1; }
-static int FreeLibrary(void *module) { assert(module); return 1; }
 #define DROP(p) do { if (p) { (p)->lpVtbl->Release(p); (p) = NULL; } } while (0)
 #include "destroy.inc"
 static HRESULT resize_buffers(object *p, unsigned count, unsigned width,

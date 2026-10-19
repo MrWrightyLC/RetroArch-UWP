@@ -101,6 +101,7 @@ enum
    SRECT_OP_FSUB                 = 131,
    SRECT_OP_FMUL                 = 133,
    SRECT_OP_FDIV                 = 136,
+   SRECT_OP_VECTOR_TIMES_SCALAR  = 142,
    SRECT_OP_ALL                  = 155,
    SRECT_OP_LOGICAL_AND          = 167,
    SRECT_OP_SELECT               = 169,
@@ -227,7 +228,7 @@ typedef struct
    uint32_t member_idx[3];
 
    /* Constants made, on first use. */
-   uint32_t c_int0, c_v2i0, c_v2i1, c_v2f_half, c_v2f_one, c_v4f0;
+   uint32_t c_int0, c_v2i0, c_v2i1, c_v2f0, c_v2f_half, c_v2f_one, c_v4f0;
 
    srect_rbuf_t   types;   /* new types, constants, a block's variable */
    srect_rbuf_t   names;   /* new OpName / OpMemberName */
@@ -532,6 +533,7 @@ static void srect_consts_init(srect_rect_t *r)
    r->c_int0     = srect_const_int(r, 0);
    r->c_v2i0     = srect_const_vec(r, r->t_v2i, r->c_int0, 2);
    r->c_v2i1     = srect_const_vec(r, r->t_v2i, srect_const_int(r, 1), 2);
+   r->c_v2f0     = srect_const_vec(r, r->t_v2f, srect_const_float(r, 0.0f), 2);
    r->c_v2f_half = srect_const_vec(r, r->t_v2f, srect_const_float(r, 0.5f), 2);
    r->c_v2f_one  = srect_const_vec(r, r->t_v2f, srect_const_float(r, 1.0f), 2);
    r->c_v4f0     = srect_const_vec(r, r->t_v4f, srect_const_float(r, 0.0f), 4);
@@ -1080,10 +1082,12 @@ static void srect_write_sample(srect_rect_t *r, const uint32_t *w, unsigned len)
       uint32_t ops[12];
       uint32_t args[3];
       uint32_t rect, lim, scale;
+      uint32_t inner = 0;
       unsigned k = 0;
-      /* Linear filtering mixes across the rectangle's edge for every
-       * wrap but clamp to edge. */
-      if (r->wrap != SLANG_RECT_WRAP_EDGE)
+      /* Linear filtering mixes across the rectangle's edge with repeat
+       * and mirror, which the clamp below cannot keep. */
+      if (     r->wrap != SLANG_RECT_WRAP_EDGE
+            && r->wrap != SLANG_RECT_WRAP_BORDER)
       {
          r->fail = true;
          return;
@@ -1091,13 +1095,35 @@ static void srect_write_sample(srect_rect_t *r, const uint32_t *w, unsigned len)
       rect  = srect_block_load(r, 0);
       lim   = srect_block_load(r, 1);
       scale = srect_half_of(r, rect, 0);
-      if (o.offset)
-      {
+      if (o.offset || r->wrap == SLANG_RECT_WRAP_BORDER)
          srect_rect_texels(r, &size_f, NULL, NULL);
+      if (o.offset)
          coord = srect_emit2(r, SRECT_OP_FADD, r->t_v2f, coord,
                srect_emit2(r, SRECT_OP_FDIV, r->t_v2f,
                   srect_emit1(r, SRECT_OP_CONVERT_S_TO_F, r->t_v2f, srect_m_id(r, o.offset)),
                   size_f));
+      /* Border: the edge texels sampled as clamp to edge would, times
+       * the share of the filter's footprint inside the rectangle - the
+       * border's transparent black is the rest. t is the coordinate in
+       * texels less half: a texel's weight leaving the first runs from
+       * t = 0 to -1, the last's from t = n - 1 to n. Inside, the share
+       * is exactly 1 and the sample comes out as it was. */
+      if (r->wrap == SLANG_RECT_WRAP_BORDER)
+      {
+         uint32_t t, lo, hi, in2;
+         t       = srect_emit2(r, SRECT_OP_FSUB, r->t_v2f,
+               srect_emit2(r, SRECT_OP_FMUL, r->t_v2f, coord, size_f),
+               r->c_v2f_half);
+         args[0] = srect_emit2(r, SRECT_OP_FADD, r->t_v2f, t, r->c_v2f_one);
+         args[1] = r->c_v2f0;
+         args[2] = r->c_v2f_one;
+         lo      = srect_ext(r, r->t_v2f, SRECT_GLSL_FCLAMP, args, 3);
+         args[0] = srect_emit2(r, SRECT_OP_FSUB, r->t_v2f, size_f, t);
+         hi      = srect_ext(r, r->t_v2f, SRECT_GLSL_FCLAMP, args, 3);
+         in2     = srect_emit2(r, SRECT_OP_FMUL, r->t_v2f, lo, hi);
+         inner   = srect_emit2(r, SRECT_OP_FMUL, r->t_float,
+               srect_emit2(r, SRECT_OP_COMPOSITE_EXTRACT, r->t_float, in2, 0),
+               srect_emit2(r, SRECT_OP_COMPOSITE_EXTRACT, r->t_float, in2, 1));
       }
       coord   = srect_emit2(r, SRECT_OP_FADD, r->t_v2f,
             srect_emit2(r, SRECT_OP_FMUL, r->t_v2f, coord, scale),
@@ -1121,7 +1147,7 @@ static void srect_write_sample(srect_rect_t *r, const uint32_t *w, unsigned len)
       }
 
       ops[k++] = rtype;
-      ops[k++] = result;
+      ops[k++] = inner ? srect_new_id(r) : result;
       ops[k++] = srect_m_id(r, w[3]);
       ops[k++] = coord;
       o.mask  &= ~(uint32_t)(SRECT_IMG_CONST_OFFSET | SRECT_IMG_OFFSET);
@@ -1138,6 +1164,13 @@ static void srect_write_sample(srect_rect_t *r, const uint32_t *w, unsigned len)
          if (o.mask & SRECT_IMG_MIN_LOD) ops[k++] = srect_m_id(r, o.min_lod);
       }
       srect_rb_inst(r, &r->funcs, SRECT_INST_OP(w[0]), ops, k);
+      if (inner)
+      {
+         args[0] = ops[1];
+         args[1] = inner;
+         srect_emit_r(r, SRECT_OP_VECTOR_TIMES_SCALAR, r->t_v4f, result,
+               args, 2);
+      }
       return;
    }
 
@@ -1877,7 +1910,7 @@ end:
    return res;
 }
 
-bool slang_rect_remap_pass(uint32_t **vs, size_t *vs_words,
+enum slang_rect_result slang_rect_remap_pass(uint32_t **vs, size_t *vs_words,
       uint32_t **fs, size_t *fs_words,
       bool source, bool linear, enum slang_rect_wrap wrap)
 {
@@ -1896,7 +1929,7 @@ bool slang_rect_remap_pass(uint32_t **vs, size_t *vs_words,
    vend = slang_rect_block_end(*vs, *vs_words, &place);
    fend = slang_rect_block_end(*fs, *fs_words, &place);
    if (vend == ~0u || fend == ~0u)
-      return false;
+      return SLANG_RECT_UNSUPPORTED;
    place.offset = vend > fend ? vend : fend;
 
    /* Push constants are scarce: the uniform block takes what does not
@@ -1907,13 +1940,13 @@ bool slang_rect_remap_pass(uint32_t **vs, size_t *vs_words,
                   &place.set, &place.binding)
             && !slang_rect_uniform_block(*fs, *fs_words,
                   &place.set, &place.binding))
-         return false;
+         return SLANG_RECT_UNSUPPORTED;
       place.where  = SLANG_RECT_UBO;
       place.offset = 0;
       vend = slang_rect_block_end(*vs, *vs_words, &place);
       fend = slang_rect_block_end(*fs, *fs_words, &place);
       if (vend == ~0u || fend == ~0u)
-         return false;
+         return SLANG_RECT_UNSUPPORTED;
       place.offset = vend > fend ? vend : fend;
    }
 
@@ -1925,7 +1958,7 @@ bool slang_rect_remap_pass(uint32_t **vs, size_t *vs_words,
    {
       free(vout);
       free(fout);
-      return false;
+      return SLANG_RECT_UNSUPPORTED;
    }
    if (vres == SLANG_RECT_REWRITTEN)
    {
@@ -1939,7 +1972,8 @@ bool slang_rect_remap_pass(uint32_t **vs, size_t *vs_words,
       *fs       = fout;
       *fs_words = fout_len;
    }
-   return true;
+   return (vres == SLANG_RECT_REWRITTEN || fres == SLANG_RECT_REWRITTEN)
+      ? SLANG_RECT_REWRITTEN : SLANG_RECT_UNCHANGED;
 }
 
 void slang_rect_values(float v[12], unsigned dims, unsigned origin,

@@ -4,16 +4,33 @@
 Runs the video_views test core in headless gamescope for each case,
 takes a GPU screenshot over the network command port (gamescope's own
 with the menu open), checks the colour where each view should land,
-and checks the views status the core logged. One case also bounds the
-GPU memory RetroArch holds, and the pointer cases move the pointer of
+and checks the views status the core logged; a case is shot once that
+status is final, not after a fixed wait. One case also bounds the GPU
+memory RetroArch holds, and the pointer cases move the pointer of
 gamescope's own X server and look for the menu's cursor under it. The
-gl driver doesn't present views, so it runs one case that expects the
-packed frame and no PRESENTS. The exact cases check every pixel of
+exact cases check every pixel of
 views filled with noise, drawn straight from the frame by the stock
-chain and copied out of it for a preset, on glcore once for each way it
-copies them; and, on glcore, a frame drawn whole out of a core's larger
-framebuffer.
-Not run in CI: it needs a GPU, gamescope and a RetroArch build.
+chain and for a preset copied out of it, on glcore once for each way it
+copies them, or a software frame's written straight in; and, on glcore,
+a frame drawn whole out of a core's larger framebuffer.
+In full it needs a GPU, gamescope and a RetroArch build.
+
+With RA_E2E_XVFB=1 each case runs on an Xvfb server of its own instead
+of gamescope, with Mesa's software renderers where there is no GPU:
+the screen is read with ImageMagick's import and the pointer moved on
+that server, several cases at once (RA_E2E_JOBS, 4 by default). The
+GPU memory cases are left out there. Xvfb has no XVideo adaptor: for
+the xvideo driver RA_E2E_XV_STANDIN names samples/gfx/xv_standin's
+library, preloaded to be one. RA_E2E_ONLY, a
+regular expression, runs only the cases whose names it finds; CI runs a
+set of them that way (Linux-vulkan-validation.yml).
+
+With RA_E2E_WINE=1 the binary is a retroarch.exe run under Wine, on
+Xvfb as above, each worker in a copy of WINEPREFIX of its own, with
+the core built by make DLL=1 and paths given as
+Wine's Z: drive has them; a D3DCompiler_47.dll next to the binary is
+taken over Wine's own (Windows-wine-views.yml). The cases that need a
+preset run only on drivers whose views take one.
 
 Usage: run.py <retroarch binary> <output dir> <driver> [driver ...]
 """
@@ -29,13 +46,21 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CORE = os.path.normpath(os.path.join(HERE, '..', 'video_views_libretro.so'))
+WINE = os.environ.get('RA_E2E_WINE') == '1'
+CORE = os.path.normpath(os.path.join(
+    HERE, '..', 'video_views_libretro.' + ('dll' if WINE else 'so')))
 W, H = 1600, 960
 TOLERANCE = 8
+# How long a case runs on once its views status is final: the frames
+# that take up the layout, with threaded video's one behind. Wine's
+# software D3D draws a frame in far longer.
+SETTLE = 2.0 if WINE else 0.5
 
 RED, BLUE, GREEN = (255, 0, 0), (0, 0, 255), (0, 255, 0)
 YELLOW, WHITE = (255, 255, 0), (255, 255, 255)
@@ -111,16 +136,26 @@ CASES = [
      [(800, 100, GREEN), (800, 900, YELLOW), (1500, 480, GREEN)]),
 ]
 
-# The same cases drawn in hardware: through a GL core context, with each
-# origin, on glcore, and into the core's own images on vulkan.
+# The same cases drawn in hardware: through a GL compatibility context on
+# gl, a core context with each origin on glcore, and into the core's own
+# images on vulkan.
 # {driver: [(case, video_views_test_hw)]}
 HW_CASES = {
+    'gl': [(name, 'gl_compat')
+           for name in ('3ds-2d', '3ds-sbs-full', '3ds-anaglyph',
+                        '3ds-interlaced')],
     'glcore': [(name, hw) for hw in ('gl', 'gl_topleft')
                for name in ('3ds-2d', '3ds-sbs-full', '3ds-anaglyph',
                             '3ds-interlaced')],
     'vulkan': [(name, 'vulkan')
                for name in ('3ds-2d', '3ds-sbs-full', '3ds-anaglyph',
                             '3ds-interlaced', '3ds-sbs-full-threaded')],
+    'd3d11': [(name, 'd3d11')
+              for name in ('3ds-2d', '3ds-sbs-full', '3ds-anaglyph',
+                           '3ds-interlaced', '3ds-sbs-full-threaded')],
+    'd3d12': [(name, 'd3d12')
+              for name in ('3ds-2d', '3ds-sbs-full', '3ds-anaglyph',
+                           '3ds-interlaced', '3ds-sbs-full-threaded')],
 }
 
 # A frame past the declared maximum in the core's own Vulkan image.
@@ -189,14 +224,6 @@ POINTER_PARK = (40, 900)
 POINTER_TOLERANCE = 6
 POINTER_REACH = 48
 
-# The gl driver doesn't present views: the map is accepted, STEREO is off,
-# and the core's 2D packing shows whole.
-GL_CASES = [
-    ('3ds-sbs-full-gl', '3ds', {'video_stereo_mode': '2'},
-     [(400, 240, GREEN), (1200, 240, GREY), (800, 720, YELLOW),
-      (100, 720, GREY)]),
-]
-
 # The core declares Azahar's 8000x4800 maximum, draws its usual frame in
 # hardware as Azahar does, and runs a preset keeping eight frames of
 # history. Sized for that maximum, the history is 1.75 GiB a chain: the
@@ -233,14 +260,66 @@ EXACT_CASES = [
     # Rows counted from the frame's bottom, and from its top.
     ('exact-3ds', '3ds', NOISE, 'gl'),
     ('exact-3ds', '3ds', NOISE, 'gl_topleft'),
+    ('exact-3ds', '3ds', NOISE, 'gl_compat'),
     ('exact-3ds', '3ds', NOISE, 'vulkan'),
+    ('exact-3ds', '3ds', NOISE, 'd3d11'),
+    ('exact-3ds', '3ds', NOISE, 'd3d12'),
     # No map: the frame drawn whole. A core's GL framebuffer as large as
     # its maximum holds the frame in a corner, so the stock chain would
     # copy it out; glcore draws it straight from there instead.
     ('whole-3ds', 'none', NOISE_LARGE, 'gl'),
     ('whole-3ds', 'none', NOISE_LARGE, 'gl_topleft'),
 ]
-EXACT_HW = {'glcore': ('off', 'gl', 'gl_topleft'), 'vulkan': ('off', 'vulkan')}
+EXACT_HW = {'gl': ('off', 'gl_compat'),
+            'glcore': ('off', 'gl', 'gl_topleft'), 'vulkan': ('off', 'vulkan'),
+            'gl1': ('off',), 'd3d10': ('off',), 'd3d11': ('off', 'd3d11'),
+            'd3d12': ('off', 'd3d12'), 'd3d9_hlsl': ('off',),
+            'sdl2': ('off',), 'sdl3': ('off',), 'd3d8': ('off',),
+            'gdi': ('off',), 'sdl': ('off',), 'x11': ('off',)}
+# Drivers whose views take a preset: on the others a preset draws the
+# frame whole, so the cases that need one are left out there.
+PRESET_DRIVERS = ('glcore', 'vulkan', 'd3d10', 'd3d11', 'd3d12')
+# gl takes GLSL presets: views through two passes, the first into a
+# framebuffer at the view's size or its placement's, and through one,
+# each with earlier frames and feedback of its own.
+GL_PRESETS = [('-preset', os.path.join(HERE, 'pass.glslp')),
+              ('-preset-viewport', os.path.join(HERE, 'pass_viewport.glslp')),
+              ('-preset-one', os.path.join(HERE, 'pass_one.glslp')),
+              # Each view's own earlier frames and feedback
+              ('-preset-prev', os.path.join(HERE, 'prev.glslp')),
+              ('-preset-prev-one', os.path.join(HERE, 'prev_one.glslp')),
+              ('-preset-feedback', os.path.join(HERE, 'feedback.glslp'))]
+# d3d9_hlsl takes Cg presets the same, but for feedback, which it has not.
+D3D9_PRESETS = [('-preset', os.path.join(HERE, 'pass.cgp')),
+                ('-preset-viewport', os.path.join(HERE, 'pass_viewport.cgp')),
+                ('-preset-one', os.path.join(HERE, 'pass_one.cgp')),
+                ('-preset-prev', os.path.join(HERE, 'prev.cgp')),
+                ('-preset-prev-one', os.path.join(HERE, 'prev_one.cgp'))]
+# {driver: its presets of its own shader language}
+DRIVER_PRESETS = {'gl': GL_PRESETS, 'd3d9_hlsl': D3D9_PRESETS}
+GL_PRESET_CASES = ('3ds-sbs-full', '3ds-top-bottom', '3ds-anaglyph',
+                   '3ds-interlaced', 'ds-horizontal')
+# Drivers whose views' presets have each view of a software frame written
+# straight out of it into a texture of its own, not read in place. Not
+# vulkan's, which does from a staging buffer but copies from a linear
+# image, as for lavapipe's XRGB8888 frames.
+WRITE_SW_VIEWS = ('gl', 'glcore', 'd3d9_hlsl', 'd3d10', 'd3d11', 'd3d12')
+# Drivers whose views' presets read a software frame's views where they
+# lie when they can.
+SW_IN_PLACE_DRIVERS = ('glcore', 'vulkan')
+WRITE_SW_RE = re.compile(
+    r'\] Views\' presets have each view of a software frame written '
+    r'straight in\.')
+# Drivers on shader model 4, where the rect presets' gathers of more than
+# the red component do not compile.
+SM4_DRIVERS = ('d3d10',)
+# Drivers that draw anaglyph's frames whole: no blend of theirs makes its
+# colours, which mix the channels.
+WHOLE_ANAGLYPH_DRIVERS = ('d3d8', 'sdl2', 'sdl3')
+# Drivers left out of the pointer cases: on Xvfb SDL 1.2's fullscreen
+# window (SDL2's sdl12-compat) reports no pointer motion, even with a
+# window manager.
+NO_POINTER_DRIVERS = ('sdl',)
 # Filtered, a view drawn straight from the frame must stop at its edge
 # as its copy does: the ds screens touch in the frame, so a bottom row
 # blended with the other screen's top shows. Compared, not checked
@@ -249,14 +328,19 @@ SMOOTH_CASES = [
     ('smooth-ds', 'ds', NOISE, 'off'),
     ('smooth-3ds', '3ds', NOISE, 'gl'),
     ('smooth-3ds', '3ds', NOISE, 'vulkan'),
+    ('smooth-3ds', '3ds', NOISE, 'd3d11'),
+    ('smooth-3ds', '3ds', NOISE, 'd3d12'),
     ('smooth-whole-3ds', 'none', NOISE_LARGE, 'gl'),
 ]
 SMOOTH_SETTINGS = dict(EXACT_SETTINGS, video_smooth='true')
 LINEAR_PRESET = os.path.join(HERE, 'history_linear.slangp')
 # Drivers that draw the stock chain's views straight from the frame,
 # and that draw a frame whole straight from a larger texture.
-DIRECT_DRIVERS = ('glcore', 'vulkan')
+DIRECT_DRIVERS = ('gl1', 'gl', 'glcore', 'vulkan', 'd3d9_hlsl', 'd3d10',
+                  'd3d11', 'd3d12', 'sdl2', 'sdl3', 'd3d8', 'gdi', 'sdl',
+                  'x11', 'xvideo')
 DIRECT_RE = re.compile(r'\] Views drawn straight from the frame\.')
+PRESET_RE = re.compile(r'\] Views drawn through the preset')
 WHOLE_DRIVERS = ('glcore',)
 WHOLE_RE = re.compile(r'\] Frames drawn straight from the core\'s texture\.')
 # The core's 2D maps, as (x, y, width, height) in the packed frame.
@@ -269,30 +353,35 @@ NOISE_COLOURS = [BLACK, RED, GREEN, BLUE, (0, 255, 255), (255, 0, 255),
 # A preset reads a frame inside a larger texture where it lies. Each
 # preset runs on the core's frame drawn in hardware into a framebuffer
 # as large as its maximum, and again on its software frame, which comes
-# on its own: the screenshots must match. Linear filtering with border
-# wrap mixes in what lies past the frame, so that preset has the frame
-# copied out. [(preset, read in place)]
-RECT_PRESETS = [('rect_nearest.slangp', True),
-                ('rect_nearest_edge.slangp', True),
-                ('rect_nearest_repeat.slangp', True),
-                ('rect_nearest_mirror.slangp', True),
-                ('rect_linear.slangp', True),
-                ('rect_linear_border.slangp', False),
-                ('rect_full.slangp', True),
-                ('rect_two.slangp', True)]
+# on its own: the screenshots must match, but for linear filtering with
+# border wrap, whose blend of the edge texels with the border is the
+# shader's and may round a step from the sampler's.
+# [(preset, read in place, tolerance)]
+RECT_PRESETS = [('rect_nearest.slangp', True, 0),
+                ('rect_nearest_edge.slangp', True, 0),
+                ('rect_nearest_repeat.slangp', True, 0),
+                ('rect_nearest_mirror.slangp', True, 0),
+                ('rect_linear.slangp', True, 0),
+                ('rect_linear_border.slangp', True, 1),
+                ('rect_full.slangp', True, 0),
+                ('rect_two.slangp', True, 0)]
 RECT_HW = {'glcore': ('gl', 'gl_topleft')}
 IN_PLACE_RE = re.compile(
     r'\[GLCore\] Preset reads frames where the core leaves them\.')
 # A view's preset reads the view where it lies in the frame. Each runs
 # a rect preset, read in place, and its rect_hist twin, which reads a
 # frame of history too and so has the views copied out: the screenshots
-# must match. [(name, map option, core options, hw)]
+# must match, linear with border to within a step as above.
+# [(name, map option, core options, hw)]
 VIEW_RECT_CASES = [('view-rect-ds', 'ds', NOISE, 'off'),
                    ('view-rect-ds-rgb565', 'ds', NOISE_565, 'off'),
                    ('view-rect-3ds', '3ds', NOISE, 'gl'),
                    ('view-rect-3ds', '3ds', NOISE, 'gl_topleft'),
-                   ('view-rect-3ds', '3ds', NOISE, 'vulkan')]
-VIEW_RECT_PRESETS = ('nearest', 'nearest_repeat', 'linear')
+                   ('view-rect-3ds', '3ds', NOISE, 'vulkan'),
+                   ('view-rect-3ds', '3ds', NOISE, 'd3d11'),
+                   ('view-rect-3ds', '3ds', NOISE, 'd3d12')]
+VIEW_RECT_PRESETS = (('nearest', 0), ('nearest_repeat', 0), ('linear', 0),
+                     ('linear_border', 1))
 VIEW_IN_PLACE_RE = re.compile(
     r'\] Views\' presets read the frame where it lies\.')
 
@@ -360,12 +449,22 @@ def send(cmd, port):
     s.close()
 
 
+# Ports and displays handed to cases running side by side.
+TAKEN_LOCK = threading.Lock()
+TAKEN_PORTS = set()
+TAKEN_DISPLAYS = set()
+
+
 def free_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(('127.0.0.1', 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    with TAKEN_LOCK:
+        while True:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.bind(('127.0.0.1', 0))
+            port = s.getsockname()[1]
+            s.close()
+            if port not in TAKEN_PORTS:
+                TAKEN_PORTS.add(port)
+                return port
 
 
 def write_cfg(path, d, driver, settings, port):
@@ -439,21 +538,42 @@ def write_cfg(path, d, driver, settings, port):
         'core_assets_directory': d,
         'dynamic_wallpapers_directory': d,
     }
+    if WINE:
+        cfg = {k: winpath(v) for k, v in cfg.items()}
+        cfg.update(video_context_driver='', input_driver='dinput')
     cfg.update(settings)
     with open(path, 'w') as f:
         for k in sorted(cfg):
             f.write('%s = "%s"\n' % (k, cfg[k]))
 
 
+def winpath(v):
+    """An absolute path as Wine's Z: drive has it; anything else as is."""
+    return 'Z:' + v if WINE and v.startswith('/') else v
+
+
 def expected_status(driver, settings):
     """(presents, stereo) the frontend should report for these settings."""
-    if driver == 'gl':
-        return (0, 0)
     return (1, 0 if settings.get('video_stereo_mode', '0') == '0' else 1)
 
 
-def status_errors(d, driver, settings):
-    """Check the last views status the core logged."""
+def wait_for_views(p, d, timeout=60):
+    """Wait for a Wine launch to reach the core before timing the case."""
+    deadline = time.monotonic() + timeout
+    while p.poll() is None:
+        for name in ('run.log', 'retroarch.log'):
+            path = os.path.join(d, name)
+            if os.path.exists(path):
+                with open(path, errors='replace') as f:
+                    if STATUS_RE.search(f.read()):
+                        return
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.1)
+
+
+def last_status(d):
+    """The last views status the core logged, or None."""
     found = None
     for name in ('run.log', 'retroarch.log'):
         path = os.path.join(d, name)
@@ -461,6 +581,42 @@ def status_errors(d, driver, settings):
             with open(path, errors='replace') as f:
                 for m in STATUS_RE.finditer(f.read()):
                     found = tuple(int(g) for g in m.groups())
+    return found
+
+
+def wait_settled(p, d, want, timeout=20):
+    """Until the core reports the views status want, and the frames
+    that take up its layout are drawn; at most timeout seconds, after
+    which the case's checks report what went wrong."""
+    deadline = time.monotonic() + timeout
+    while p.poll() is None and time.monotonic() < deadline:
+        found = last_status(d)
+        if found and found[:2] == want:
+            time.sleep(SETTLE)
+            return
+        time.sleep(0.05)
+
+
+def png_done(path):
+    """Whether the PNG at path is written to its end."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(-12, os.SEEK_END)
+            return f.read(12)[4:8] == b'IEND'
+    except OSError:
+        return False
+
+
+# What RetroArch logs when the driver asked for is not in the build: it
+# goes on with another, whose results would pass for the one asked for.
+MISSING_DRIVER_RE = re.compile(r"Couldn't find any video driver named")
+
+
+def status_errors(d, driver, settings):
+    """Check the last views status the core logged."""
+    found = last_status(d)
+    if direct_drawn(d, MISSING_DRIVER_RE):
+        return ['video driver "%s" is not in this build' % driver]
     if found is None:
         return ['no "[video_views] presents=" line in the logs']
     want = expected_status(driver, settings)
@@ -468,8 +624,6 @@ def status_errors(d, driver, settings):
     if found[:2] != want:
         errors.append('status presents=%d stereo=%d, want presents=%d '
                       'stereo=%d' % (found[0], found[1], want[0], want[1]))
-    if driver == 'gl' and found[2] != 1:
-        errors.append('map not accepted on gl')
     return errors
 
 
@@ -487,9 +641,115 @@ def isolated_env():
     return env
 
 
+XVFB = WINE or os.environ.get('RA_E2E_XVFB') == '1'
+# samples/gfx/xv_standin's library, for the xvideo driver on Xvfb
+XV_STANDIN = os.environ.get('RA_E2E_XV_STANDIN')
+# Cases run side by side, each on an Xvfb of its own, four at a time:
+# most of a case is waiting, so more than the cores still gains. One at
+# a time in gamescope, whose screenshot names one display. Under Wine
+# each worker has a prefix of its own: cases sharing a wineserver move
+# each other's pointer. RA_E2E_JOBS sets how many.
+JOBS = int(os.environ.get('RA_E2E_JOBS') or 0) or (4 if XVFB else 1)
+WINE_PREFIXES = []
+WINE_COPIES = []
+WINE_WORKER = threading.local()
+ONLY = os.environ.get('RA_E2E_ONLY')
+
+
+def wanted(name):
+    """Whether RA_E2E_ONLY lets case @name run."""
+    return not ONLY or re.search(ONLY, name) is not None
+
+
+def wine_prefixes():
+    """Gives each worker a copy of the prepared prefix, or the prefix
+    itself when there is one worker. The copies go in WINE_COPIES."""
+    base = os.environ.get('WINEPREFIX') or os.path.expanduser('~/.wine')
+    if JOBS == 1:
+        WINE_PREFIXES.append(base)
+        return
+    prepared = os.path.isdir(base)
+    if prepared:
+        subprocess.run(['wineserver', '-w'],
+                       env=dict(os.environ, WINEPREFIX=base))
+    for _ in range(JOBS):
+        p = os.path.join(tempfile.mkdtemp(prefix='ra-e2e-wine-'), 'prefix')
+        WINE_COPIES.append(p)
+        # With no prefix prepared, Wine makes each worker its own.
+        if prepared:
+            shutil.copytree(base, p, symlinks=True)
+        WINE_PREFIXES.append(p)
+
+
+def wine_prefix():
+    """This worker's prefix."""
+    if not hasattr(WINE_WORKER, 'prefix'):
+        with TAKEN_LOCK:
+            WINE_WORKER.prefix = WINE_PREFIXES.pop()
+    return WINE_WORKER.prefix
+
+
+def free_display():
+    """An X display number nothing serves, kept for the caller until
+    release_display()."""
+    with TAKEN_LOCK:
+        for n in range(90, 190):
+            if n not in TAKEN_DISPLAYS and \
+                    not os.path.exists('/tmp/.X11-unix/X%d' % n) and \
+                    not os.path.exists('/tmp/.X%d-lock' % n):
+                TAKEN_DISPLAYS.add(n)
+                return n
+    raise RuntimeError('no free X display')
+
+
+# Drivers whose fullscreen window a window manager sizes: SDL 1.2's
+# (SDL2's sdl12-compat) stays 1x1 without one.
+WM_DRIVERS = ('sdl',)
+
+
+def wm_start(env):
+    """openbox on env's display."""
+    p = subprocess.Popen(['openbox'], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, env=env,
+                         start_new_session=True)
+    time.sleep(0.5)
+    return p
+
+
+def release_display(display):
+    with TAKEN_LOCK:
+        TAKEN_DISPLAYS.discard(int(display.lstrip(':')))
+
+
+def xvfb_start(env):
+    """An Xvfb of the window's size: its process and DISPLAY."""
+    n = free_display()
+    # A client disconnect must not reset the server during startup.
+    p = subprocess.Popen(['Xvfb', ':%d' % n, '-screen', '0',
+                          '%dx%dx24' % (W, H), '-nolisten', 'tcp', '-noreset'],
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, env=env,
+                         start_new_session=True)
+    deadline = time.time() + 10
+    while (time.time() < deadline
+           and not os.path.exists('/tmp/.X11-unix/X%d' % n)):
+        time.sleep(0.1)
+    time.sleep(0.5)
+    return p, ':%d' % n
+
+
 def gamescope_shot(d, env, name='menu.png'):
     """What gamescope shows, menu included, in d/name."""
     out = os.path.join(d, name)
+    if XVFB:
+        try:
+            # PNG24: read_png takes 8-bit RGB, not a palette.
+            subprocess.run(['import', '-display', env['DISPLAY'], '-window',
+                            'root', 'PNG24:' + out], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=20)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return out if os.path.exists(out) else None
     try:
         subprocess.run(['gamescopectl', 'screenshot', out],
                        env=dict(env, GAMESCOPE_WAYLAND_DISPLAY='gamescope-0'),
@@ -635,15 +895,38 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
            retroarch, '--config', cfg, '-L', CORE, '--verbose'] + list(args)
     env = isolated_env()
     env.update(env_extra or {})
+    # Xvfb has no XVideo adaptor: the stand-in's, preloaded
+    if driver == 'xvideo' and XV_STANDIN:
+        env['LD_PRELOAD'] = XV_STANDIN
+    xvfb = wm = None
+    if XVFB:
+        xvfb, env['DISPLAY'] = xvfb_start(env)
+        if driver in WM_DRIVERS:
+            wm = wm_start(env)
+        cmd = cmd[cmd.index('--') + 1:]
+    if WINE:
+        env['WINEPREFIX'] = wine_prefix()
+        env['WINEDEBUG'] = '-all'
+        # A D3DCompiler_47.dll next to the binary (vkd3d-utils, say)
+        # over Wine's own.
+        env['WINEDLLOVERRIDES'] = 'd3dcompiler_47=n,b'
+        cmd = cmd[:cmd.index(retroarch)] + [
+            'wine', retroarch, '--config', winpath(cfg), '-L',
+            winpath(CORE), '--verbose'] + [
+                a.replace('=/', '=Z:/') for a in args]
     log = open(os.path.join(d, 'run.log'), 'w')
     p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
                          env=env, start_new_session=True)
     shot = None
     try:
+        if WINE:
+            wait_for_views(p, d)
+        if gpu is None:
+            wait_settled(p, d, expected_status(driver, settings))
         settle = time.time() + 5
-        while time.time() < settle:
+        while gpu is not None and time.time() < settle:
             time.sleep(0.5)
-            pid = retroarch_pid(p.pid, cfg) if gpu is not None else None
+            pid = retroarch_pid(p.pid, cfg)
             mib = gpu_mib(pid) if pid else None
             if mib is not None:
                 gpu.append(mib)
@@ -666,11 +949,10 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
             send('SCREENSHOT', port)
         deadline = time.time() + 10
         while time.time() < deadline and not shot:
-            time.sleep(0.5)
+            time.sleep(0.05)
             pngs = [x for x in os.listdir(os.path.join(d, 'shots'))
                     if x.endswith('.png')]
-            if pngs:
-                time.sleep(1)
+            if pngs and png_done(os.path.join(d, 'shots', pngs[0])):
                 shot = os.path.join(d, 'shots', pngs[0])
         send('QUIT', port)
         try:
@@ -687,6 +969,19 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
             except subprocess.TimeoutExpired:
                 os.killpg(p.pid, signal.SIGKILL)
         log.close()
+        if wm:
+            wm.terminate()
+            try:
+                wm.wait(5)
+            except subprocess.TimeoutExpired:
+                wm.kill()
+        if xvfb:
+            xvfb.terminate()
+            try:
+                xvfb.wait(5)
+            except subprocess.TimeoutExpired:
+                xvfb.kill()
+            release_display(env['DISPLAY'])
         runtime_dir = env['XDG_RUNTIME_DIR']
         if os.path.basename(runtime_dir).startswith('ra-e2e-'):
             shutil.rmtree(runtime_dir, ignore_errors=True)
@@ -818,11 +1113,13 @@ def direct_drawn(d, regex):
 
 
 def run_exact_case(retroarch, root, driver, case, suffix='',
-                   env_extra=None, path=None, preset=None, exact=True):
+                   env_extra=None, path=None, preset=None, exact=True,
+                   in_place=False):
     """The errors, and the screenshot's rows for comparing runs. path is
     how glcore must say it copies views. preset, a preset's path, has the
     views copied; without one a driver in DIRECT_DRIVERS must draw them
-    straight from the frame. exact checks each view pixel for pixel."""
+    straight from the frame. exact checks each view pixel for pixel.
+    in_place: the preset can read views where they lie."""
     name, mapopt, opts, hw = case
     name += suffix
     settings = EXACT_SETTINGS if exact else SMOOTH_SETTINGS
@@ -844,6 +1141,12 @@ def run_exact_case(retroarch, root, driver, case, suffix='',
     if direct != (driver in drivers and not preset):
         errors.append('%s %s straight from the frame' %
                       (what, 'drawn' if direct else 'not drawn'))
+    written = bool(preset) and mapopt != 'none' and hw == 'off' \
+        and driver in WRITE_SW_VIEWS \
+        and not (in_place and driver in SW_IN_PLACE_DRIVERS)
+    if driver in WRITE_SW_VIEWS and direct_drawn(d, WRITE_SW_RE) != written:
+        errors.append('views %s straight in'
+                      % ('not written' if written else 'written'))
     shots = sorted(x for x in os.listdir(os.path.join(d, 'shots'))
                    if x.endswith('.png'))
     if not shots:
@@ -1049,10 +1352,19 @@ def pointer_helper(d):
     x11.XWarpPointer.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
                                  ctypes.c_ulong] + [ctypes.c_int] * 6
     x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    deadline = time.monotonic() + 5
     dpy = x11.XOpenDisplay(None)
+    while not dpy and time.monotonic() < deadline:
+        time.sleep(0.05)
+        dpy = x11.XOpenDisplay(None)
     if not dpy:
+        print('[e2e] pointer helper cannot open DISPLAY=%s'
+              % os.environ['DISPLAY'], flush=True)
         return 1
-    root = gamescope_root(x11, dpy)
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    root = (x11.XDefaultRootWindow(dpy) if XVFB
+            else gamescope_root(x11, dpy))
     if root is None:
         print('[e2e] refusing %s: not this gamescope\'s X server.'
               % os.environ['DISPLAY'], flush=True)
@@ -1078,165 +1390,220 @@ def pointer_helper(d):
     return 0
 
 
+def report(name, errors):
+    """A case's result lines."""
+    return ['%s %s' % ('FAIL' if errors else 'pass', name)] + \
+        ['    ' + e for e in errors]
+
+
+def driver_jobs(retroarch, root, driver):
+    """The driver's cases as jobs that can run side by side, each
+    returning its result lines and how many of them failed."""
+    jobs = []
+
+    def plain(case, hw):
+        errors = run_case(retroarch, root, driver, case, hw)
+        return report('%s/%s%s' % (driver, case[0], '' if hw == 'off'
+                                   else ' (hw ' + hw + ')'), errors), \
+            bool(errors)
+
+    def own_preset(case, suffix, preset):
+        name, mapopt, settings, points = case
+        c = (name + suffix, mapopt,
+             dict(settings, video_shader_enable='true'), points)
+        errors = run_case(retroarch, root, driver, c,
+                          args=('--set-shader=' + preset,))
+        if not direct_drawn(case_dir(root, driver, c[0]), PRESET_RE):
+            errors.append('views not drawn through the preset')
+        if not direct_drawn(case_dir(root, driver, c[0]), WRITE_SW_RE):
+            errors.append('views not written straight in')
+        return report('%s/%s' % (driver, c[0]), errors), bool(errors)
+
+    def exact(case):
+        hw = '' if case[3] == 'off' else ' (hw ' + case[3] + ')'
+        copy = 'glCopyImageSubData' if driver == 'glcore' else None
+        runs = [('', None, copy, None)]
+        if driver in PRESET_DRIVERS:
+            runs.append(('-preset', None, copy, HISTORY_PRESET))
+        if driver == 'glcore':
+            runs.append(('-preset-blit', NO_COPY_IMAGE,
+                         'framebuffer blits', HISTORY_PRESET))
+        runs += [(suffix, None, None, preset)
+                 for suffix, preset in DRIVER_PRESETS.get(driver, [])]
+        first, lines, failed = None, [], 0
+        for suffix, env_extra, path, preset in runs:
+            errors, rows = run_exact_case(
+                retroarch, root, driver, case, suffix, env_extra, path,
+                preset)
+            if first is None:
+                first = rows
+            elif rows and first and rows != first:
+                errors.append('screenshot differs from %s/%s\'s'
+                              % (driver, case[0]))
+            lines += report('%s/%s%s%s' % (driver, case[0], suffix, hw),
+                            errors)
+            failed += bool(errors)
+        return lines, failed
+
+    def rect(preset, in_place, tolerance):
+        name = 'rect-' + preset[:-len('.slangp')]
+        path = os.path.join(HERE, preset)
+        errors, first = run_exact_case(
+            retroarch, root, driver, (name, 'none', NOISE_LARGE, 'off'),
+            preset=path, exact=False)
+        lines = report('%s/%s' % (driver, name), errors)
+        failed = bool(errors)
+        for hw in RECT_HW[driver]:
+            case = (name, 'none', NOISE_LARGE, hw)
+            errors, rows = run_exact_case(retroarch, root, driver, case,
+                                          preset=path, exact=False)
+            d = case_dir(root, driver, name, hw)
+            if direct_drawn(d, IN_PLACE_RE) != in_place:
+                errors.append('frame %s where it lies' %
+                              ('not read' if in_place else 'read'))
+            # A copied frame upside down filters to within a step of the
+            # software frame's: weights round the other way.
+            bad = rows_differ(rows, first, tolerance if in_place else 1) \
+                if rows and first else None
+            if bad is None:
+                errors.append('no screenshot to compare')
+            elif bad:
+                errors.append('%d pixels differ from the software '
+                              'frame\'s' % bad)
+            lines += report('%s/%s (hw %s)' % (driver, name, hw), errors)
+            failed += bool(errors)
+        return lines, failed
+
+    def view_rect(case, mode, tolerance):
+        name, mapopt, opts, hw = case
+        rows = {}
+        errors = []
+        for kind, in_place in (('rect', True), ('rect_hist', False)):
+            preset = os.path.join(HERE, '%s_%s.slangp' % (kind, mode))
+            c = ('%s-%s-%s' % (name, kind, mode), mapopt, opts, hw)
+            e, rows[kind] = run_exact_case(retroarch, root, driver, c,
+                                           preset=preset, exact=False,
+                                           in_place=in_place)
+            errors += e
+            d = case_dir(root, driver, c[0], hw)
+            sw_out = hw == 'off' and driver not in SW_IN_PLACE_DRIVERS
+            if direct_drawn(d, VIEW_IN_PLACE_RE) != (in_place and not sw_out):
+                errors.append('%s: views %s where they lie' % (
+                    kind, 'not read' if in_place else 'read'))
+        if not rows['rect'] or not rows['rect_hist']:
+            errors.append('no screenshot to compare')
+        elif rows_differ(rows['rect'], rows['rect_hist'], tolerance):
+            errors.append('%d pixels differ from the copied views\''
+                          % rows_differ(rows['rect'],
+                                        rows['rect_hist'], tolerance))
+        return report('%s/%s-%s%s' % (driver, name, mode, '' if hw == 'off'
+                                      else ' (hw ' + hw + ')'), errors), \
+            bool(errors)
+
+    def smooth(case):
+        hw = '' if case[3] == 'off' else ' (hw ' + case[3] + ')'
+        errors, rows = run_exact_case(retroarch, root, driver, case,
+                                      exact=False)
+        copy_errors, copy_rows = run_exact_case(
+            retroarch, root, driver, case, '-preset',
+            preset=LINEAR_PRESET, exact=False)
+        errors += copy_errors
+        if not rows or not copy_rows:
+            errors.append('no screenshot to compare')
+        else:
+            bad = rows_differ(rows, copy_rows, TOLERANCE)
+            if bad:
+                errors.append('%d pixels differ from the preset\'s copies'
+                              % bad)
+        return report('%s/%s%s' % (driver, case[0], hw), errors), \
+            bool(errors)
+
+    def memory(case):
+        errors, peak = run_memory_case(retroarch, root, driver, case)
+        return report('%s/%s (hw %s, GPU %s MiB)'
+                      % (driver, case[0], MEMORY_HW[driver],
+                         '?' if peak is None else '%d' % peak), errors), \
+            bool(errors)
+
+    def menu_case(case):
+        errors = run_menu_case(retroarch, root, driver, case)
+        return report('%s/%s' % (driver, case[0]), errors), bool(errors)
+
+    def pointer(menu, case):
+        errors = run_pointer_case(retroarch, root, driver, menu, case)
+        return report('%s/%s-%s' % (driver, case[0], menu), errors), \
+            bool(errors)
+
+    runs = [(case, 'off') for case in CASES
+            if not (driver in WHOLE_ANAGLYPH_DRIVERS and 'anaglyph' in case[0])]
+    runs += [(case, hw) for name, hw in HW_CASES.get(driver, [])
+             for case in CASES if case[0] == name]
+    if driver == 'vulkan':
+        runs += [(case, 'vulkan') for case in VULKAN_CROP_CASES]
+    jobs += [lambda c=c, hw=hw: plain(c, hw)
+             for c, hw in runs if wanted(c[0])]
+    jobs += [lambda c=c, x=x, p=p: own_preset(c, x, p)
+             for c in (CASES if driver in DRIVER_PRESETS else [])
+             if c[0] in GL_PRESET_CASES and wanted(c[0])
+             for x, p in DRIVER_PRESETS[driver]]
+    jobs += [lambda c=c: exact(c) for c in EXACT_CASES
+             if c[3] in EXACT_HW.get(driver, ()) and wanted(c[0])]
+    jobs += [lambda p=p, i=i, t=t: rect(p, i, t)
+             for p, i, t in (RECT_PRESETS if driver in RECT_HW else [])
+             if wanted('rect-' + p[:-len('.slangp')])]
+    jobs += [lambda c=c, m=m, t=t: view_rect(c, m, t)
+             for c in VIEW_RECT_CASES
+             if c[3] in EXACT_HW.get(driver, ())
+             and driver in PRESET_DRIVERS and driver not in SM4_DRIVERS
+             and wanted(c[0])
+             for m, t in VIEW_RECT_PRESETS]
+    jobs += [lambda c=c: smooth(c) for c in SMOOTH_CASES
+             if c[3] in EXACT_HW.get(driver, ())
+             and driver in PRESET_DRIVERS and wanted(c[0])]
+    jobs += [lambda c=c: memory(c)
+             for c in (MEMORY_CASES if driver in MEMORY_HW and not XVFB
+                       else []) if wanted(c[0])]
+    jobs += [lambda c=c: menu_case(c) for c in MENU_CASES if wanted(c[0])]
+    jobs += [lambda m=m, c=c: pointer(m, c) for m in sorted(POINTER_MENUS)
+             for c in POINTER_CASES
+             if wanted(c[0]) and driver not in NO_POINTER_DRIVERS]
+    return jobs
+
+
 def main():
     if sys.argv[1:2] == ['--pointer']:
         return pointer_helper(sys.argv[2])
     if len(sys.argv) < 4:
         print(__doc__)
         return 2
+    if XVFB and not shutil.which('import'):
+        # The menu and pointer cases read the screen through
+        # ImageMagick's import.
+        print('import (ImageMagick) is needed under Xvfb')
+        return 1
     retroarch = os.path.abspath(sys.argv[1])
     root = os.path.realpath(sys.argv[2])
     os.makedirs(root, exist_ok=True)
+    jobs = [j for driver in sys.argv[3:]
+            for j in driver_jobs(retroarch, root, driver)]
     failed = 0
-    for driver in sys.argv[3:]:
-        if driver == 'gl':
-            runs = [(case, 'off') for case in GL_CASES]
-        else:
-            runs = [(case, 'off') for case in CASES]
-        runs += [(case, hw) for name, hw in HW_CASES.get(driver, [])
-                 for case in CASES if case[0] == name]
-        if driver == 'vulkan':
-            runs += [(case, 'vulkan') for case in VULKAN_CROP_CASES]
-        for case, hw in runs:
-            errors = run_case(retroarch, root, driver, case, hw)
-            print('%s %s/%s%s' % ('FAIL' if errors else 'pass', driver,
-                                  case[0], '' if hw == 'off' else ' (hw ' + hw + ')'))
-            for e in errors:
-                print('    ' + e)
-            failed += bool(errors)
-        for case in [c for c in EXACT_CASES
-                     if c[3] in EXACT_HW.get(driver, ())]:
-            hw = '' if case[3] == 'off' else ' (hw ' + case[3] + ')'
-            copy = 'glCopyImageSubData' if driver == 'glcore' else None
-            runs = [('', None, copy, None),
-                    ('-preset', None, copy, HISTORY_PRESET)]
-            if driver == 'glcore':
-                runs.append(('-preset-blit', NO_COPY_IMAGE,
-                             'framebuffer blits', HISTORY_PRESET))
-            first = None
-            for suffix, env_extra, path, preset in runs:
-                errors, rows = run_exact_case(
-                    retroarch, root, driver, case, suffix, env_extra, path,
-                    preset)
-                if first is None:
-                    first = rows
-                elif rows and first and rows != first:
-                    errors.append('screenshot differs from %s/%s\'s'
-                                  % (driver, case[0]))
-                print('%s %s/%s%s%s' % ('FAIL' if errors else 'pass', driver,
-                                        case[0], suffix, hw))
-                for e in errors:
-                    print('    ' + e)
-                failed += bool(errors)
-        for preset, in_place in (RECT_PRESETS if driver in RECT_HW
-                                 else []):
-            name = 'rect-' + preset[:-len('.slangp')]
-            path = os.path.join(HERE, preset)
-            errors, first = run_exact_case(
-                retroarch, root, driver, (name, 'none', NOISE_LARGE, 'off'),
-                preset=path, exact=False)
-            print('%s %s/%s' % ('FAIL' if errors else 'pass', driver, name))
-            for e in errors:
-                print('    ' + e)
-            failed += bool(errors)
-            for hw in RECT_HW[driver]:
-                case = (name, 'none', NOISE_LARGE, hw)
-                errors, rows = run_exact_case(retroarch, root, driver, case,
-                                              preset=path, exact=False)
-                d = case_dir(root, driver, name, hw)
-                if direct_drawn(d, IN_PLACE_RE) != in_place:
-                    errors.append('frame %s where it lies' %
-                                  ('not read' if in_place else 'read'))
-                # A copied frame upside down filters to within a step
-                # of the software frame's: weights round the other way.
-                bad = rows_differ(rows, first, 0 if in_place else 1) \
-                    if rows and first else None
-                if bad is None:
-                    errors.append('no screenshot to compare')
-                elif bad:
-                    errors.append('%d pixels differ from the software '
-                                  'frame\'s' % bad)
-                print('%s %s/%s (hw %s)' % ('FAIL' if errors else 'pass',
-                                            driver, name, hw))
-                for e in errors:
-                    print('    ' + e)
-                failed += bool(errors)
-        for case in [c for c in VIEW_RECT_CASES
-                     if c[3] in EXACT_HW.get(driver, ())]:
-            name, mapopt, opts, hw = case
-            for mode in VIEW_RECT_PRESETS:
-                rows = {}
-                errors = []
-                for kind, in_place in (('rect', True), ('rect_hist', False)):
-                    preset = os.path.join(HERE, '%s_%s.slangp' % (kind, mode))
-                    c = ('%s-%s-%s' % (name, kind, mode), mapopt, opts, hw)
-                    e, rows[kind] = run_exact_case(retroarch, root, driver, c,
-                                                   preset=preset, exact=False)
-                    errors += e
-                    d = case_dir(root, driver, c[0], hw)
-                    if direct_drawn(d, VIEW_IN_PLACE_RE) != in_place:
-                        errors.append('%s: views %s where they lie' % (
-                            kind, 'not read' if in_place else 'read'))
-                if not rows['rect'] or not rows['rect_hist']:
-                    errors.append('no screenshot to compare')
-                elif rows['rect'] != rows['rect_hist']:
-                    errors.append('%d pixels differ from the copied views\''
-                                  % rows_differ(rows['rect'],
-                                                rows['rect_hist'], 0))
-                print('%s %s/%s-%s%s' % ('FAIL' if errors else 'pass', driver,
-                                         name, mode, '' if hw == 'off'
-                                         else ' (hw ' + hw + ')'))
-                for e in errors:
-                    print('    ' + e)
-                failed += bool(errors)
-        for case in [c for c in SMOOTH_CASES
-                     if c[3] in EXACT_HW.get(driver, ())]:
-            hw = '' if case[3] == 'off' else ' (hw ' + case[3] + ')'
-            errors, rows = run_exact_case(retroarch, root, driver, case,
-                                          exact=False)
-            copy_errors, copy_rows = run_exact_case(
-                retroarch, root, driver, case, '-preset',
-                preset=LINEAR_PRESET, exact=False)
-            errors += copy_errors
-            if not rows or not copy_rows:
-                errors.append('no screenshot to compare')
-            else:
-                bad = rows_differ(rows, copy_rows, TOLERANCE)
-                if bad:
-                    errors.append('%d pixels differ from the preset\'s copies'
-                                  % bad)
-            print('%s %s/%s%s' % ('FAIL' if errors else 'pass', driver,
-                                  case[0], hw))
-            for e in errors:
-                print('    ' + e)
-            failed += bool(errors)
-        for case in (MEMORY_CASES if driver in MEMORY_HW else []):
-            errors, peak = run_memory_case(retroarch, root, driver, case)
-            print('%s %s/%s (hw %s, GPU %s MiB)'
-                  % ('FAIL' if errors else 'pass', driver, case[0],
-                     MEMORY_HW[driver], '?' if peak is None else '%d' % peak))
-            for e in errors:
-                print('    ' + e)
-            failed += bool(errors)
-        for case in (MENU_CASES if driver != 'gl' else []):
-            errors = run_menu_case(retroarch, root, driver, case)
-            print('%s %s/%s' % ('FAIL' if errors else 'pass', driver,
-                                case[0]))
-            for e in errors:
-                print('    ' + e)
-            failed += bool(errors)
-        for menu, case in ([(m, c) for m in sorted(POINTER_MENUS)
-                            for c in POINTER_CASES]
-                           if driver != 'gl' else []):
-            errors = run_pointer_case(retroarch, root, driver, menu, case)
-            print('%s %s/%s-%s' % ('FAIL' if errors else 'pass', driver,
-                                   case[0], menu))
-            for e in errors:
-                print('    ' + e)
-            failed += bool(errors)
+    try:
+        if WINE:
+            wine_prefixes()
+        with ThreadPoolExecutor(max_workers=JOBS) as pool:
+            for future in [pool.submit(j) for j in jobs]:
+                lines, n = future.result()
+                for line in lines:
+                    print(line, flush=True)
+                failed += n
+    finally:
+        for p in WINE_COPIES:
+            subprocess.run(['wineserver', '-k'],
+                           env=dict(os.environ, WINEPREFIX=p),
+                           stderr=subprocess.DEVNULL)
+            shutil.rmtree(os.path.dirname(p), ignore_errors=True)
     print('%d failed' % failed)
     return 1 if failed else 0
-
 
 if __name__ == '__main__':
     sys.exit(main())

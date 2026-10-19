@@ -47,6 +47,11 @@ RETRO_BEGIN_DECLS
  * - linear filtering, clamp to edge: the coordinate is moved into the
  *   rectangle and clamped to just past its first and last texel
  *   centres, where the filter gives the texel beyond no weight;
+ * - linear filtering, clamp to border: as clamp to edge, times the
+ *   share of the filter's footprint inside the rectangle, the border's
+ *   transparent black being the rest. That blend's weight is the
+ *   shader's own, where a sampler's is quantised: the outermost texels'
+ *   blend with the border may differ by a step of 8 bits;
  * - nearest filtering, any wrap: the texel the sampler would pick is
  *   fetched, repeat and mirror wrapping the coordinate before it is
  *   scaled as samplers do;
@@ -56,7 +61,7 @@ RETRO_BEGIN_DECLS
  * The texel picked where a coordinate falls exactly on a texel's edge is
  * the one the shader's float arithmetic gives; a sampler rounding the
  * other way there would differ (seen only for mirrored gathers).
- * Anything else - linear filtering with another wrap, depth compares,
+ * Anything else - linear filtering with repeat or mirror, depth compares,
  * projective sampling, a frame texture used in a way this does not
  * know - is reported unsupported, and the chain keeps its copy. */
 
@@ -133,9 +138,10 @@ enum slang_rect_result slang_rect_remap(const uint32_t *in, size_t in_len,
  * three vec4s placed as struct slang_rect_place describes: in the push
  * constants past both stages' own, or in the uniform block when those
  * would come out past SLANG_RECT_PUSH_LIMIT. @vs and @fs are malloc'd
- * and replaced by the rewritten stages. False, the stages left as they
- * are, when a stage reads the frame in a way that cannot be kept. */
-bool slang_rect_remap_pass(uint32_t **vs, size_t *vs_words,
+ * and replaced by the rewritten stages: REWRITTEN when either was,
+ * UNCHANGED when neither reads the frame, UNSUPPORTED - the stages left
+ * as they are - when a stage reads it in a way that cannot be kept. */
+enum slang_rect_result slang_rect_remap_pass(uint32_t **vs, size_t *vs_words,
       uint32_t **fs, size_t *fs_words,
       bool source, bool linear, enum slang_rect_wrap wrap);
 

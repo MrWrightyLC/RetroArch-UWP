@@ -85,8 +85,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.ccache
           key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
@@ -100,7 +103,7 @@ jobs:
           export CCACHE_DIR="$HOME/.ccache"
           echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
-          ccache -M 500M
+          ccache -M 250M
           ccache -z
 
       - name: Build and run samples
@@ -231,3 +234,17 @@ jobs:
           if [[ $fails -gt 0 ]]; then
             exit 1
           fi
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}

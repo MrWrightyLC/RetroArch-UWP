@@ -24,6 +24,7 @@
 
 #include "gfx/video_views.h"
 #include "gfx/video_defines.h"
+#include "gfx/video_views_cpu.h"
 
 static int failures = 0;
 
@@ -673,16 +674,635 @@ static void test_ui_point(void)
    CHECK(ui_point_is(&l, 400, 240, 400, 240));
 }
 
+static void test_eye_pair(void)
+{
+   video_views_map_t map;
+   struct retro_video_view v[4];
+   int eyes[2];
+
+   map_3ds(&map);
+   CHECK(video_views_eye_pair(&map, eyes) && eyes[0] == 0 && eyes[1] == 1);
+   map_vb(&map);
+   CHECK(video_views_eye_pair(&map, eyes) && eyes[0] == 0 && eyes[1] == 1);
+   map_ds(&map);
+   CHECK(!video_views_eye_pair(&map, eyes) && eyes[0] == -1 && eyes[1] == -1);
+
+   /* Two pairs are not one. */
+   v[0] = mkview(  0,   0, 400, 240, 0, RETRO_VIDEO_VIEW_EYE_LEFT);
+   v[1] = mkview(400,   0, 400, 240, 0, RETRO_VIDEO_VIEW_EYE_RIGHT);
+   v[2] = mkview(  0, 240, 400, 240, 1, RETRO_VIDEO_VIEW_EYE_LEFT);
+   v[3] = mkview(400, 240, 400, 240, 1, RETRO_VIDEO_VIEW_EYE_RIGHT);
+   CHECK(video_views_validate(v, 4, &map));
+   CHECK(!video_views_eye_pair(&map, eyes) && eyes[0] == -1 && eyes[1] == -1);
+
+   /* The right eye first. */
+   v[0] = mkview(400, 0, 400, 240, 0, RETRO_VIDEO_VIEW_EYE_RIGHT);
+   v[1] = mkview(  0, 0, 400, 240, 0, RETRO_VIDEO_VIEW_EYE_LEFT);
+   CHECK(video_views_validate(v, 2, &map));
+   CHECK(video_views_eye_pair(&map, eyes) && eyes[0] == 1 && eyes[1] == 0);
+}
+
+/* A screen's views as a map of their own: the 3DS driver's top and
+ * bottom screens. */
+static void test_select_screens(void)
+{
+   video_views_map_t map, sub;
+   struct retro_video_view v[4];
+   unsigned index[RETRO_VIDEO_VIEWS_MAX];
+
+   map_3ds(&map);
+   CHECK(video_views_select_screens(&map, 0, 1, &sub, index));
+   CHECK(sub.num_views == 2 && sub.num_screens == 1);
+   CHECK(index[0] == 0 && index[1] == 1);
+   CHECK(sub.views[1].eye == RETRO_VIDEO_VIEW_EYE_RIGHT);
+   CHECK(video_views_find(&sub, 0, RETRO_VIDEO_VIEW_EYE_RIGHT) == 1);
+
+   CHECK(video_views_select_screens(&map, 1, 1, &sub, index));
+   CHECK(sub.num_views == 1 && sub.num_screens == 1);
+   CHECK(index[0] == 2 && sub.views[0].screen == 0);
+   CHECK(sub.views[0].x == 240 && sub.views[0].y == 240);
+
+   /* The count is cut to the screens there are. */
+   CHECK(video_views_select_screens(&map, 1, 5, &sub, index));
+   CHECK(sub.num_screens == 1 && sub.num_views == 1);
+   CHECK(!video_views_select_screens(&map, 2, 1, &sub, index));
+   CHECK(sub.num_views == 0 && sub.num_screens == 0);
+   CHECK(!video_views_select_screens(&map, 0, 0, &sub, index));
+
+   /* Screens 1 and 2 of three, in the map's order, which needn't be the
+    * screens'. */
+   v[0] = mkview(0,   0, 100, 50, 2, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(0,  50, 100, 50, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[2] = mkview(0, 100, 100, 50, 1, RETRO_VIDEO_VIEW_EYE_LEFT);
+   v[3] = mkview(100, 100, 100, 50, 1, RETRO_VIDEO_VIEW_EYE_RIGHT);
+   CHECK(video_views_validate(v, 4, &map));
+   CHECK(video_views_select_screens(&map, 1, 2, &sub, index));
+   CHECK(sub.num_views == 3 && sub.num_screens == 2);
+   CHECK(index[0] == 0 && sub.views[0].screen == 1);
+   CHECK(index[1] == 2 && sub.views[1].screen == 0);
+   CHECK(index[2] == 3 && sub.views[2].screen == 0);
+   /* A layout of the selection places its screens like a map of two. */
+   {
+      video_views_layout_params_t p;
+      video_views_layout_t l;
+      memset(&p, 0, sizeof(p));
+      p.map         = &sub;
+      p.dims        = VIDEO_SCALE_PACK(320, 240);
+      p.stereo_mode = VIDEO_STEREO_MODE_2D;
+      video_views_layout(&p, &l);
+      CHECK(l.num_placements == 2);
+      CHECK(l.placements[0].view == 1 && l.placements[1].view == 0);
+   }
+}
+
+/* A console's touchscreen through the views it shows: the 3DS's bottom
+ * screen showing the DS map's second screen. */
+static void test_touch(void)
+{
+   video_views_map_t map, sub;
+   video_views_layout_params_t p;
+   video_views_layout_t l;
+   video_views_touch_t t;
+   unsigned index[RETRO_VIDEO_VIEWS_MAX];
+   int16_t x = 123, y = 456;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   memset(&t, 0, sizeof(t));
+   CHECK(!video_views_touch_point(&t, 0, 0, &x, &y));
+   CHECK(x == 123 && y == 456);
+
+   map_ds(&map);
+   CHECK(video_views_select_screens(&map, 1, 1, &sub, index));
+   memset(&p, 0, sizeof(p));
+   p.map         = &sub;
+   p.dims        = VIDEO_SCALE_PACK(320, 240);
+   p.stereo_mode = VIDEO_STEREO_MODE_2D;
+   video_views_layout(&p, &l);
+   /* 256x192 into 320x240: the whole screen, aspect kept. */
+   CHECK(l.num_placements == 1
+         && l.placements[0].dst.dims == VIDEO_SCALE_PACK(320, 240));
+   video_views_touch_publish(&t, &map, &l, index, p.dims, frame);
+   CHECK(!(retro_atomic_load_acquire_int(&t.seq) & 1));
+
+   /* The display's middle is the second screen's: (128, 288) packed. */
+   CHECK(video_views_touch_point(&t, 0, 0, &x, &y));
+   CHECK(x >= -2 && x <= 2);
+   CHECK(y >= 16383 - 200 && y <= 16383 + 200);
+   /* The top left corner is the second screen's: (0, 192). */
+   CHECK(video_views_touch_point(&t, -0x7fff, -0x7fff, &x, &y));
+   CHECK(x == -0x7fff && y >= -2 && y <= 2);
+
+   /* Pillarboxed: off the view is off the frame. */
+   p.dims = VIDEO_SCALE_PACK(400, 240);
+   video_views_layout(&p, &l);
+   video_views_touch_publish(&t, &map, &l, index, p.dims, frame);
+   CHECK(video_views_touch_point(&t, -0x7fff, 0, &x, &y));
+   CHECK(x == -0x8000 && y == -0x8000);
+
+   /* Taken back: none. */
+   video_views_touch_publish(&t, NULL, NULL, NULL, 0, 0);
+   x = 7;
+   CHECK(!video_views_touch_point(&t, 0, 0, &x, &y) && x == 7);
+}
+
+/* The CPU drivers' composer: a layout made for a screen twice the DS
+ * map's size is composed at half that, each view copied as it is, for
+ * display hardware to enlarge; and side by side at full size. */
+/* What a blitter scales into each placement's visible part */
+static void test_cut_source(void)
+{
+   struct retro_video_view v = { 0 };
+   video_views_rect_t dst, cut, out;
+
+   v.x = 10; v.y = 20; v.width = 100; v.height = 50;
+   /* Drawn whole, at twice its size: all of it */
+   dst.pos  = VIDEO_POS_PACK(4, 6);
+   dst.dims = VIDEO_SCALE_PACK(200, 100);
+   video_views_cut_source(&v, &dst, &dst, &out);
+   CHECK(VIDEO_POS_X(out.pos) == 10 && VIDEO_POS_Y(out.pos) == 20);
+   CHECK(VIDEO_SCALE_W(out.dims) == 100 && VIDEO_SCALE_H(out.dims) == 50);
+   /* Its right half and bottom half cut away */
+   cut.pos  = dst.pos;
+   cut.dims = VIDEO_SCALE_PACK(100, 50);
+   video_views_cut_source(&v, &dst, &cut, &out);
+   CHECK(VIDEO_POS_X(out.pos) == 10 && VIDEO_POS_Y(out.pos) == 20);
+   CHECK(VIDEO_SCALE_W(out.dims) == 50 && VIDEO_SCALE_H(out.dims) == 25);
+   /* Off the left and top of the screen: the view's far quarter */
+   dst.pos  = VIDEO_POS_PACK(-150, -75);
+   cut.pos  = VIDEO_POS_PACK(0, 0);
+   cut.dims = VIDEO_SCALE_PACK(50, 25);
+   video_views_cut_source(&v, &dst, &cut, &out);
+   CHECK(VIDEO_POS_X(out.pos) == 85 && VIDEO_POS_Y(out.pos) == 57);
+   CHECK(VIDEO_SCALE_W(out.dims) == 25 && VIDEO_SCALE_H(out.dims) == 13);
+   /* Shrunk to less than a pixel's worth: still a pixel */
+   dst.pos  = VIDEO_POS_PACK(0, 0);
+   dst.dims = VIDEO_SCALE_PACK(10, 5);
+   cut.pos  = VIDEO_POS_PACK(9, 4);
+   cut.dims = VIDEO_SCALE_PACK(1, 1);
+   video_views_cut_source(&v, &dst, &cut, &out);
+   CHECK(VIDEO_POS_X(out.pos) == 100 && VIDEO_POS_Y(out.pos) == 60);
+   CHECK(VIDEO_SCALE_W(out.dims) == 10 && VIDEO_SCALE_H(out.dims) == 10);
+   /* A one-pixel view stays one pixel */
+   v.width  = 1;
+   v.height = 1;
+   dst.dims = VIDEO_SCALE_PACK(40, 40);
+   cut.pos  = VIDEO_POS_PACK(39, 39);
+   video_views_cut_source(&v, &dst, &cut, &out);
+   CHECK(VIDEO_POS_X(out.pos) == 10 && VIDEO_POS_Y(out.pos) == 20);
+   CHECK(VIDEO_SCALE_W(out.dims) == 1 && VIDEO_SCALE_H(out.dims) == 1);
+}
+
+static void test_cpu_compose(void)
+{
+   unsigned i, x, y;
+   video_views_map_t map;
+   video_views_layout_params_t p;
+   video_views_layout_t l;
+   video_views_cpu_t cpu;
+   static uint32_t frame[256 * 384];
+   static uint32_t out[512 * 384];
+   unsigned dims;
+   float scale;
+   bool ok = true;
+
+   memset(&cpu, 0, sizeof(cpu));
+   for (y = 0; y < 384; y++)
+      for (x = 0; x < 256; x++)
+         frame[y * 256 + x] = (y << 12) | (x << 1) | (y >= 192);
+
+   map_ds(&map);
+   memset(&p, 0, sizeof(p));
+   p.map         = &map;
+   p.dims        = VIDEO_SCALE_PACK(512, 768);
+   p.stereo_mode = VIDEO_STEREO_MODE_2D;
+   video_views_layout(&p, &l);
+   scale = video_views_cpu_scale(&map, &l);
+   CHECK(scale == 0.5f);
+   dims  = video_views_cpu_dims(p.dims, scale);
+   CHECK(dims == VIDEO_SCALE_PACK(256, 384));
+   video_views_cpu_compose(&cpu, &map, &l, frame, 256 * 4,
+         SCALER_FMT_ARGB8888, SCALER_TYPE_POINT, scale, dims, out, 256,
+         NULL);
+   /* The screens stacked as they are packed: the frame itself */
+   for (i = 0; i < 256 * 384; i++)
+      if ((out[i] & 0xffffff) != (frame[i] & 0xffffff))
+         ok = false;
+   CHECK(ok);
+
+   /* Side by side, full: each eye's half its own. */
+   p.dims        = VIDEO_SCALE_PACK(512, 384);
+   p.stereo_mode = VIDEO_STEREO_MODE_SBS_FULL;
+   video_views_layout(&p, &l);
+   video_views_cpu_compose(&cpu, &map, &l, frame, 256 * 4,
+         SCALER_FMT_ARGB8888, SCALER_TYPE_POINT, 1.0f, p.dims, out, 512,
+         NULL);
+   /* Both halves show the top screen at their top left */
+   CHECK((out[0] & 0xffffff) == (frame[0] & 0xffffff));
+   CHECK((out[256] & 0xffffff) == (frame[0] & 0xffffff));
+
+   /* Interlaced is composed at the screen's own size. */
+   p.stereo_mode = VIDEO_STEREO_MODE_INTERLACED;
+   video_views_layout(&p, &l);
+   CHECK(video_views_cpu_scale(&map, &l) == 1.0f);
+   video_views_cpu_free(&cpu);
+}
+
+/* The CPU drivers' blend of a canvas's halves. */
+static void test_blend(void)
+{
+   /* Two 2x2 halves side by side, and an output wider than the eye. */
+   uint32_t canvas[2 * 4];
+   uint32_t out[2 * 3];
+   unsigned i;
+
+   for (i = 0; i < 2; i++)
+   {
+      canvas[i * 4 + 0] = 0xffffff;
+      canvas[i * 4 + 1] = 0x000000;
+      canvas[i * 4 + 2] = 0x000000;
+      canvas[i * 4 + 3] = 0xffffff;
+   }
+   for (i = 0; i < 6; i++)
+      out[i] = 0x123456;
+
+   video_views_blend_xrgb8888(canvas, 4, out, 3, VIDEO_SCALE_PACK(2, 2),
+         VIDEO_STEREO_MODE_ANAGLYPH);
+   /* White left only is red, white right only cyan. */
+   CHECK(out[0] == 0xff0000 && out[1] == 0x00ffff);
+   CHECK(out[3] == 0xff0000 && out[4] == 0x00ffff);
+   /* Past the eye's width is left alone. */
+   CHECK(out[2] == 0x123456 && out[5] == 0x123456);
+
+   canvas[4] = 0x0000ff;
+   canvas[6] = 0x00ff00;
+   video_views_blend_xrgb8888(canvas, 4, out, 3, VIDEO_SCALE_PACK(2, 2),
+         VIDEO_STEREO_MODE_INTERLACED);
+   /* Row 0 from the left half, row 1 from the right. */
+   CHECK(out[0] == 0xffffff && out[1] == 0x000000);
+   CHECK(out[3] == 0x00ff00 && out[4] == 0xffffff);
+}
+
+/* ---- the compositor, instantiated over fakes ---- */
+
+typedef struct fake_chain
+{
+   int id;
+} fake_chain_t;
+
+typedef struct fake_target
+{
+   int made;
+} fake_target_t;
+
+typedef struct fake_drv
+{
+   int stock_made, stock_fail, synced;
+   int made, retired, retire_refuses, make_fails;
+} fake_drv_t;
+
+typedef struct fake_ctx
+{
+   int tag;
+} fake_ctx_t;
+
+static const fake_ctx_t fake_ctx = { 42 };
+static int bad_ctx;
+
+#define MAX_DRAWS 16
+static struct
+{
+   int view;              /* -1: a pass */
+   fake_chain_t *chain;
+   video_views_rect_t dst, cut;
+   int again;
+} draws[MAX_DRAWS];
+static int num_draws;
+static fake_chain_t chain_objs[RETRO_VIDEO_VIEWS_MAX * 2];
+
+static void *fake_stock(fake_drv_t *d)
+{
+   if (d->stock_fail)
+      return NULL;
+   return &chain_objs[RETRO_VIDEO_VIEWS_MAX + d->stock_made++];
+}
+
+static void fake_sync(fake_drv_t *d, fake_chain_t *c)
+{
+   (void)c;
+   d->synced++;
+}
+
+static void fake_direct(fake_drv_t *d, const fake_ctx_t *x, unsigned view,
+      const video_views_rect_t *dst, const video_views_rect_t *cut)
+{
+   (void)d;
+   if (x != &fake_ctx)
+      bad_ctx++;
+   if (num_draws >= MAX_DRAWS)
+      return;
+   draws[num_draws].view  = (int)view;
+   draws[num_draws].chain = NULL;
+   draws[num_draws].dst   = *dst;
+   draws[num_draws].cut   = *cut;
+   draws[num_draws].again = 0;
+   num_draws++;
+}
+
+static void fake_pass(fake_drv_t *d, const fake_ctx_t *x, fake_chain_t *c,
+      const video_views_rect_t *dst, const video_views_rect_t *cut,
+      bool again)
+{
+   (void)d;
+   if (x != &fake_ctx)
+      bad_ctx++;
+   if (num_draws >= MAX_DRAWS)
+      return;
+   draws[num_draws].view  = -1;
+   draws[num_draws].chain = c;
+   draws[num_draws].dst   = *dst;
+   draws[num_draws].cut   = *cut;
+   draws[num_draws].again = again ? 1 : 0;
+   num_draws++;
+}
+
+static bool fake_make(fake_drv_t *d, fake_target_t *t, unsigned dims)
+{
+   (void)dims;
+   d->made++;
+   t->made = !d->make_fails;
+   return !d->make_fails;
+}
+
+static bool fake_retire(fake_drv_t *d, fake_target_t *t)
+{
+   if (d->retire_refuses)
+      return false;
+   d->retired++;
+   t->made = 0;
+   return true;
+}
+
+#define VV_FN(name)                     fake_vv_##name
+#define VV_DRV                          fake_drv_t
+#define VV_CHAIN                        fake_chain_t
+#define VV_CREATE_STOCK(drv)            fake_stock(drv)
+#define VV_SYNC_PARAMS(drv, c)          fake_sync(drv, c)
+#define VV_DRAW                         fake_ctx_t
+#define VV_DIRECT(drv, x, v, dst, cut)  fake_direct(drv, x, v, dst, cut)
+#define VV_PASS(drv, x, c, dst, cut, a) fake_pass(drv, x, c, dst, cut, a)
+#define VV_TARGET                       fake_target_t
+#define VV_TARGET_MAKE(drv, t, dims)    fake_make(drv, t, dims)
+#define VV_TARGET_RETIRE(drv, t)        fake_retire(drv, t)
+#define VV_ROWS_UP
+#include "gfx/video_views_draw.h"
+
+static void layout_3ds(video_views_map_t *map, video_views_layout_t *l,
+      unsigned w, unsigned h, unsigned mode)
+{
+   video_views_layout_params_t p;
+   map_3ds(map);
+   params_init(&p, map, w, h);
+   p.stereo_mode = mode;
+   video_views_layout(&p, l);
+}
+
+static void test_pick_chains(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   video_views_chains_t set;
+   fake_drv_t d;
+   fake_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   video_views_rect_t rects[RETRO_VIDEO_VIEWS_MAX];
+   unsigned full = VIDEO_SCALE_PACK(1600, 960);
+
+   layout_3ds(&map, &l, 1600, 960, VIDEO_STEREO_MODE_SBS_FULL);
+   memset(&set, 0, sizeof(set));
+   memset(&d, 0, sizeof(d));
+   set.count = 3;
+
+   /* Stock chains made on first use, once each, and nothing synced. */
+   CHECK(fake_vv_pick_chains(&d, &set, &map, &l, true, true, full, chains,
+            rects));
+   CHECK(d.stock_made == 3 && d.synced == 0);
+   CHECK(chains[0] && chains[1] && chains[2] && chains[0] != chains[1]);
+   CHECK(rect_is(&rects[1], 800, 0, 800, 480));
+   CHECK(fake_vv_pick_chains(&d, &set, &map, &l, true, true, full, chains,
+            rects));
+   CHECK(d.stock_made == 3);
+
+   /* The left area only: the right eye isn't drawn, so has no chain. */
+   CHECK(fake_vv_pick_chains(&d, &set, &map, &l, true, false, full, chains,
+            rects));
+   CHECK(chains[0] && !chains[1] && chains[2]);
+
+   /* Preset chains are the driver's: none made here, each synced. */
+   CHECK(!fake_vv_pick_chains(&d, &set, &map, &l, false, true, full, chains,
+            rects));
+   set.preset[0] = &chain_objs[0];
+   set.preset[1] = &chain_objs[1];
+   set.preset[2] = &chain_objs[2];
+   CHECK(fake_vv_pick_chains(&d, &set, &map, &l, false, true, full, chains,
+            rects));
+   CHECK(d.synced == 3 && chains[2] == &chain_objs[2] && d.stock_made == 3);
+
+   /* A frame queued before the count shrank. */
+   set.count = 2;
+   CHECK(!fake_vv_pick_chains(&d, &set, &map, &l, false, true, full, chains,
+            rects));
+
+   /* A stock chain that can't be made is not tried every frame. */
+   memset(&set, 0, sizeof(set));
+   set.count    = 3;
+   d.stock_fail = 1;
+   CHECK(!fake_vv_pick_chains(&d, &set, &map, &l, true, true, full, chains,
+            rects));
+   CHECK(set.stock_failed);
+   d.stock_fail = 0;
+   CHECK(!fake_vv_pick_chains(&d, &set, &map, &l, true, true, full, chains,
+            rects));
+   CHECK(d.stock_made == 3);
+}
+
+static void test_draw_placements(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   fake_drv_t d;
+   fake_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned full = VIDEO_SCALE_PACK(1600, 960);
+
+   layout_3ds(&map, &l, 1600, 960, VIDEO_STEREO_MODE_SBS_FULL);
+   memset(&d, 0, sizeof(d));
+   memset(chains, 0, sizeof(chains));
+   chains[0] = &chain_objs[0];
+   chains[1] = &chain_objs[1];
+   chains[2] = &chain_objs[2];
+
+   /* Each placement through its chain; the bottom screen, in both eyes,
+    * the second time again. */
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, false, false);
+   CHECK(num_draws == 4);
+   CHECK(draws[0].chain == chains[0] && !draws[0].again);
+   CHECK(draws[1].chain == chains[2] && !draws[1].again);
+   CHECK(draws[2].chain == chains[1] && !draws[2].again);
+   CHECK(draws[3].chain == chains[2] && draws[3].again);
+   CHECK(rect_is(&draws[3].dst, 880, 480, 640, 480));
+
+   /* The left area only, and a view without a chain left out. */
+   num_draws = 0;
+   chains[2] = NULL;
+   fake_vv_draw_placements(&d, &fake_ctx, &l,
+         chains, false, full, false, false);
+   CHECK(num_draws == 1 && draws[0].chain == chains[0]);
+   chains[2] = &chain_objs[2];
+
+   /* Straight from the frame: by view, never through a chain. */
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(num_draws == 4 && draws[0].view == 0 && draws[2].view == 1
+         && draws[3].view == 2);
+
+   /* A placement cut to its target. */
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l,
+         chains, true, VIDEO_SCALE_PACK(1200, 960),
+         false, false);
+   CHECK(num_draws == 4 && rect_is(&draws[3].cut, 880, 480, 320, 480)
+         && rect_is(&draws[3].dst, 880, 480, 640, 480));
+
+   /* Interlaced into a 3200x960 canvas whose rows count from the bottom:
+    * with an even height the eyes trade halves - the left eye's top
+    * screen at 400, the right's at 2000. */
+   layout_3ds(&map, &l, 1600, 960, VIDEO_STEREO_MODE_INTERLACED);
+   CHECK(l.offscreen);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l,
+         chains, true, l.canvas_dims, false, true);
+   CHECK(num_draws == 4);
+   CHECK(VIDEO_POS_X(draws[0].dst.pos) == 2000
+         && VIDEO_POS_X(draws[0].cut.pos) == 2000);
+   CHECK(VIDEO_POS_X(draws[2].dst.pos) == 400
+         && VIDEO_POS_X(draws[2].cut.pos) == 400);
+   /* From the top they stay. */
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l,
+         chains, true, l.canvas_dims, false, false);
+   CHECK(num_draws == 4 && VIDEO_POS_X(draws[0].dst.pos) == 400);
+   /* And with an odd height. */
+   layout_3ds(&map, &l, 1600, 961, VIDEO_STEREO_MODE_INTERLACED);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l,
+         chains, true, l.canvas_dims, false, true);
+   CHECK(num_draws == 4
+         && VIDEO_POS_X(draws[0].dst.pos)
+            == VIDEO_POS_X(l.placements[0].dst.pos));
+   CHECK(!bad_ctx);
+}
+
+static void test_targets(void)
+{
+   video_views_target_t t;
+   fake_target_t obj;
+   fake_drv_t d;
+   memset(&t, 0, sizeof(t));
+   memset(&obj, 0, sizeof(obj));
+   memset(&d, 0, sizeof(d));
+
+   CHECK(!fake_vv_target_ensure(&d, &t, &obj, 0) && d.made == 0);
+   CHECK(fake_vv_target_ensure(&d, &t, &obj, VIDEO_SCALE_PACK(64, 32))
+         && d.made == 1);
+   /* The same size is kept. */
+   CHECK(fake_vv_target_ensure(&d, &t, &obj, VIDEO_SCALE_PACK(64, 32))
+         && d.made == 1 && d.retired == 0);
+   /* Another is remade, the old one let go first. */
+   CHECK(fake_vv_target_ensure(&d, &t, &obj, VIDEO_SCALE_PACK(80, 32))
+         && d.made == 2 && d.retired == 1);
+   /* Not while it can't be let go. */
+   d.retire_refuses = 1;
+   CHECK(!fake_vv_target_ensure(&d, &t, &obj, VIDEO_SCALE_PACK(96, 32))
+         && d.made == 2);
+   fake_vv_target_drop(&d, &t, &obj);
+   CHECK(t.made && t.dims == VIDEO_SCALE_PACK(80, 32));
+   d.retire_refuses = 0;
+   /* A size that failed isn't tried again until the size changes. */
+   d.make_fails = 1;
+   CHECK(!fake_vv_target_ensure(&d, &t, &obj, VIDEO_SCALE_PACK(96, 32))
+         && d.made == 3);
+   CHECK(!fake_vv_target_ensure(&d, &t, &obj, VIDEO_SCALE_PACK(96, 32))
+         && d.made == 3 && d.retired == 2);
+   d.make_fails = 0;
+   CHECK(fake_vv_target_ensure(&d, &t, &obj, VIDEO_SCALE_PACK(64, 64))
+         && d.made == 4 && d.retired == 2);
+   fake_vv_target_drop(&d, &t, &obj);
+   CHECK(!t.made && !t.dims && d.retired == 3);
+   fake_vv_target_drop(&d, &t, &obj);
+   CHECK(d.retired == 3);
+}
+
+static int widget_polls;
+static bool poll_widgets(void)
+{
+   widget_polls++;
+   return true;
+}
+
+static void test_ui_helpers(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   video_views_ui_dims_t saved;
+   unsigned dims = 11, video_dims = 22;
+   const char *none = NULL;
+
+   layout_3ds(&map, &l, 1600, 960, VIDEO_STEREO_MODE_SBS_FULL);
+   CHECK(video_views_ui_per_eye(&map, &l, true));
+   CHECK(!video_views_ui_per_eye(&map, &l, false));
+   layout_3ds(&map, &l, 1600, 960, VIDEO_STEREO_MODE_2D);
+   CHECK(!video_views_ui_per_eye(&map, &l, true));
+
+   CHECK(!VIDEO_VIEWS_UI_WANTED(true, false, none, false, false));
+   CHECK(!VIDEO_VIEWS_UI_WANTED(true, false, "", false, false));
+   CHECK(VIDEO_VIEWS_UI_WANTED(true, false, "msg", false, false));
+   CHECK(VIDEO_VIEWS_UI_WANTED(true, true, none, false, false));
+   CHECK(VIDEO_VIEWS_UI_WANTED(true, false, none, true, false));
+   CHECK(VIDEO_VIEWS_UI_WANTED(true, false, none, false, true));
+   CHECK(!VIDEO_VIEWS_UI_WANTED(false, true, "msg", true, true));
+   /* The widgets aren't asked when something else already wants it. */
+   CHECK(VIDEO_VIEWS_UI_WANTED(true, true, none, false, poll_widgets())
+         && !widget_polls);
+   CHECK(!VIDEO_VIEWS_UI_WANTED(false, false, none, false, poll_widgets())
+         && !widget_polls);
+   CHECK(VIDEO_VIEWS_UI_WANTED(true, false, none, false, poll_widgets())
+         && widget_polls == 1);
+
+   video_views_ui_enter(&saved, &dims, &video_dims, 33);
+   CHECK(dims == 33 && video_dims == 33);
+   video_views_ui_leave(&saved, &dims, &video_dims);
+   CHECK(dims == 11 && video_dims == 22);
+}
+
 int main(void)
 {
    test_validate();
    test_frame_helpers();
+   test_eye_pair();
+   test_select_screens();
+   test_blend();
+   test_cpu_compose();
+   test_cut_source();
+   test_touch();
    test_layout_screens();
    test_layout_stereo();
    test_layout_one_screen();
    test_clip();
    test_map_point();
    test_ui_point();
+   test_pick_chains();
+   test_draw_placements();
+   test_targets();
+   test_ui_helpers();
 
    if (failures)
    {

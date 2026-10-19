@@ -66,6 +66,7 @@ bool	video_windowed_fullscreen	1	1
 bool	video_vsync	1	1
 bool	video_scan_subframes	1	0
 bool	video_waitable_swapchains	1	1
+bool	video_d3d9ex_present	1	0
 bool	video_threaded_present_repeat	1	0
 bool	video_threaded_display_pacing	1	0
 bool	video_present_timing_from_display	1	1
@@ -562,6 +563,7 @@ uint	video_hdr_subpixel_layout	1	0
 uint	video_stereo_mode	1	0
 uint	video_screen_layout	1	0
 uint	video_openxr_refresh_rate	1	0
+uint	video_openxr_placement	1	0
 uint	video_openxr_controllers	1	0
 uint	video_openxr_laser	1	0
 uint	rewind_granularity	1	1
@@ -761,6 +763,7 @@ bool	video_windowed_fullscreen	1	1
 bool	video_vsync	1	1
 bool	video_scan_subframes	1	0
 bool	video_waitable_swapchains	1	1
+bool	video_d3d9ex_present	1	0
 bool	video_threaded_present_repeat	1	0
 bool	video_threaded_display_pacing	1	0
 bool	video_present_timing_from_display	1	1
@@ -1252,6 +1255,7 @@ uint	video_hdr_subpixel_layout	1	0
 uint	video_stereo_mode	1	0
 uint	video_screen_layout	1	0
 uint	video_openxr_refresh_rate	1	0
+uint	video_openxr_placement	1	0
 uint	video_openxr_controllers	1	0
 uint	video_openxr_laser	1	0
 uint	rewind_granularity	1	1
@@ -1449,6 +1453,7 @@ bool	video_windowed_fullscreen	1	1
 bool	video_vsync	1	1
 bool	video_scan_subframes	1	0
 bool	video_waitable_swapchains	1	1
+bool	video_d3d9ex_present	1	0
 bool	video_threaded_present_repeat	1	0
 bool	video_threaded_display_pacing	1	0
 bool	video_present_timing_from_display	1	1
@@ -1964,6 +1969,7 @@ uint	video_hdr_subpixel_layout	1	0
 uint	video_stereo_mode	1	0
 uint	video_screen_layout	1	0
 uint	video_openxr_refresh_rate	1	0
+uint	video_openxr_placement	1	0
 uint	video_openxr_controllers	1	0
 uint	video_openxr_laser	1	0
 uint	rewind_granularity	1	1

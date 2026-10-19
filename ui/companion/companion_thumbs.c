@@ -1232,6 +1232,8 @@ static void ct_anim_thread(void *ud)
       sink.present    = ct_play_present;
       sink.feed       = ct_play_feed;
       sink.decoded    = NULL;
+      sink.start_hw   = NULL;
+      sink.slot_stride = NULL;
       vp = video_player_new(sess->stream, sess->type, sess->loop_count,
             &sink, VIDEO_PLAYER_INLINE);
 

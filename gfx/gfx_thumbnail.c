@@ -133,14 +133,31 @@ GFX_THUMB_STATUS_DIAG_POP
 #define GFX_THUMB_STATUS_STORE(ptr, val) gfx_thumb_status_store((ptr), (val))
 #define GFX_THUMB_STATUS_LOAD(ptr)       gfx_thumb_status_load((ptr))
 
+/* A still parked instead of uploaded (gfx_thumbnail_park_requests):
+ * the decoded image, kept for as long as content is loaded and
+ * uploaded from here, pixels borrowed, by every request for its path
+ * meanwhile. dying: dropped while an upload still reads it, so the
+ * completion frees it. */
+typedef struct
+{
+   struct texture_image img;
+   unsigned upscale_threshold;
+   unsigned downscale_cap;
+   char path[PATH_MAX_LENGTH];
+   uint8_t inflight;             /* uploads reading the pixels */
+   bool dying;
+} gfx_thumbnail_parked_t;
+
 /* Utility structure, sent as userdata when pushing
  * an image load */
 typedef struct
 {
    uint64_t list_id;
    gfx_thumbnail_t *thumbnail;
-   unsigned upscale_threshold;   /* while waiting for a set */
+   gfx_thumbnail_parked_t *parked; /* landing from this slot */
+   unsigned upscale_threshold;
    char path[PATH_MAX_LENGTH];
+   bool park;                    /* land parked, not uploaded */
 } gfx_thumbnail_tag_t;
 
 /* Stills asked for during a frame wait here for the frame's end, when
@@ -154,6 +171,85 @@ static unsigned             gfx_thumb_pending_n;
 static unsigned gfx_thumbnail_downscale_cap(void);
 
 static gfx_thumbnail_state_t gfx_thumb_st = {0}; /* uint64_t alignment */
+
+/* Stills requested while parking is on land here decoded instead of
+ * uploaded, the image moved in whole. Every later request for the same
+ * path uploads it from here, with no read or decode, until content
+ * is closed or the menu torn down. */
+#define GFX_THUMB_PARKED_MAX 4
+
+static gfx_thumbnail_parked_t gfx_thumb_parked[GFX_THUMB_PARKED_MAX];
+static unsigned gfx_thumb_parked_n;     /* slots holding a live image */
+static unsigned gfx_thumb_parked_next;
+static bool     gfx_thumb_parking;
+
+#define GFX_THUMB_PARKED_LIVE(p) ((p)->img.pixels && !(p)->dying)
+
+static void gfx_thumbnail_parked_drop(gfx_thumbnail_parked_t *p)
+{
+   if (!GFX_THUMB_PARKED_LIVE(p))
+      return;
+   gfx_thumb_parked_n--;
+   if (p->inflight)
+   {
+      p->dying = true;
+      return;
+   }
+   image_texture_free(&p->img);
+   p->img.pixels = NULL;
+}
+
+/* An upload is done reading a parked image */
+static void gfx_thumbnail_parked_done(void *payload)
+{
+   gfx_thumbnail_parked_t *p = (gfx_thumbnail_parked_t*)payload;
+   if (--p->inflight || !p->dying)
+      return;
+   image_texture_free(&p->img);
+   p->img.pixels = NULL;
+   p->dying      = false;
+}
+
+/* Takes @img, the struct included. A path already parked is replaced,
+ * else a free slot is used, else the oldest. False, the image left
+ * with the caller, when the oldest is still being read. */
+static bool gfx_thumbnail_park_image(const gfx_thumbnail_tag_t *tag,
+      struct texture_image *img)
+{
+   unsigned i;
+   gfx_thumbnail_parked_t *p = NULL;
+   for (i = 0; i < GFX_THUMB_PARKED_MAX; i++)
+      if (     GFX_THUMB_PARKED_LIVE(&gfx_thumb_parked[i])
+            && string_is_equal(gfx_thumb_parked[i].path, tag->path))
+         p = &gfx_thumb_parked[i];
+   for (i = 0; !p && i < GFX_THUMB_PARKED_MAX; i++)
+      if (!gfx_thumb_parked[i].img.pixels)
+         p = &gfx_thumb_parked[i];
+   if (!p)
+      p = &gfx_thumb_parked[gfx_thumb_parked_next++ % GFX_THUMB_PARKED_MAX];
+   gfx_thumbnail_parked_drop(p);
+   if (p->img.pixels)
+      return false;
+   p->img               = *img;
+   p->upscale_threshold = tag->upscale_threshold;
+   p->downscale_cap     = gfx_thumbnail_downscale_cap();
+   strlcpy(p->path, tag->path, sizeof(p->path));
+   gfx_thumb_parked_n++;
+   free(img);
+   return true;
+}
+
+void gfx_thumbnail_park_requests(bool park)
+{
+   gfx_thumb_parking = park;
+}
+
+void gfx_thumbnail_parked_free(void)
+{
+   unsigned i;
+   for (i = 0; gfx_thumb_parked_n && i < GFX_THUMB_PARKED_MAX; i++)
+      gfx_thumbnail_parked_drop(&gfx_thumb_parked[i]);
+}
 
 gfx_thumbnail_state_t *gfx_thumb_get_ptr(void)
 {
@@ -241,7 +337,7 @@ static void gfx_thumbnail_init_fade(
        || (p_gfx_thumb->fade_missing
        && (GFX_THUMB_STATUS_LOAD(&thumbnail->status) == GFX_THUMBNAIL_STATUS_MISSING)))
    {
-      if (p_gfx_thumb->fade_duration > 0.0f)
+      if (p_gfx_thumb->fade_duration > 0.0f && !runloop_is_content_switching())
       {
          gfx_animation_ctx_entry_t animation_entry;
 
@@ -385,49 +481,108 @@ static unsigned gfx_thumbnail_anim_threads_wanted(void)
    return config_get_ptr()->uints.menu_thumbnail_preview_threads;
 }
 
+typedef struct gfx_thumbnail_anim_lifetime
+{
+   struct gfx_thumbnail_anim_lifetime *next;
+   gfx_surface_player_t *player;
+   void *surface;
+   gfx_anim_preview_t *session;
+   void *stream;
+   void *buf;
+   struct data_transfer *dt;
+   enum image_type_enum type;
+} gfx_thumbnail_anim_lifetime_t;
+
+static gfx_thumbnail_anim_lifetime_t *gfx_thumb_retired;
+
+static void gfx_thumbnail_anim_dispose(gfx_thumbnail_anim_lifetime_t *life)
+{
+   gfx_surface_player_free(life->player);
+   gfx_surface_free((gfx_surface_t*)life->surface);
+   gfx_anim_preview_release(life->session);
+   image_transfer_anim_stream_free(life->stream, life->type);
+   if (life->dt)
+      data_transfer_free(life->dt);
+   else
+      free(life->buf);
+   free(life);
+}
+
+static void gfx_thumbnail_anim_reap(void)
+{
+   gfx_thumbnail_anim_lifetime_t **link = &gfx_thumb_retired;
+   while (*link)
+   {
+      gfx_thumbnail_anim_lifetime_t *life = *link;
+      if (video_player_stop(life->player->vp))
+      {
+         *link = life->next;
+         gfx_thumbnail_anim_dispose(life);
+      }
+      else
+         link = &life->next;
+   }
+}
+
 void gfx_thumbnail_anim_worker_deinit(void)
 {
    video_player_worker_deinit();
+   gfx_thumbnail_anim_reap();
+}
+
+static void gfx_thumbnail_anim_retired_release(void *user,
+      gfx_surface_t *surface, unsigned slot)
+{
+   (void)user;
+   (void)slot;
+   if (surface->imported && surface->dropped && surface->import.abandon)
+      surface->import.abandon(surface->import.owner, surface->import.done,
+            surface->import.done_value);
 }
 
 static void gfx_thumbnail_anim_close(gfx_thumbnail_t *thumbnail)
 {
-   /* First: a running decode is waited out and a queued one will not
-    * run, before the stream goes. The slots stay with the surface: one
-    * the video thread still reads outlives the player that filled it. */
-   gfx_surface_player_free((gfx_surface_player_t*)thumbnail->anim_player);
-   thumbnail->anim_player = NULL;
-   /* The shared preview session (gfx_anim_preview) drives the window
-    * feeder and the preview audio; it borrows the stream and mapping
-    * owned below, so stop its audio and release just the session. */
-   if (thumbnail->anim_sess)
+   gfx_thumbnail_anim_lifetime_t *life =
+      (gfx_thumbnail_anim_lifetime_t*)thumbnail->anim_lifetime;
+   if (life)
    {
-      gfx_anim_preview_audio_stop((gfx_anim_preview_t*)thumbnail->anim_sess);
-      gfx_anim_preview_release((gfx_anim_preview_t*)thumbnail->anim_sess);
-      thumbnail->anim_sess = NULL;
+      life->player  = (gfx_surface_player_t*)thumbnail->anim_player;
+      life->session = (gfx_anim_preview_t*)thumbnail->anim_sess;
+      life->stream  = thumbnail->anim;
+      life->buf     = thumbnail->anim_buf;
+      life->dt      = thumbnail->anim_dt;
+      life->type    = (enum image_type_enum)thumbnail->anim_type;
+      gfx_anim_preview_audio_stop(life->session);
+      if (!life->player || video_player_stop(life->player->vp))
+         gfx_thumbnail_anim_dispose(life);
+      else
+      {
+         gfx_surface_t *surface = (gfx_surface_t*)thumbnail->anim_surface;
+         /* The decoder still borrows slots and its window feeder. */
+         life->surface = surface;
+         life->player->surface = &life->surface;
+         if (surface)
+         {
+            surface->release = gfx_thumbnail_anim_retired_release;
+            surface->user = NULL;
+         }
+         thumbnail->anim_surface = NULL;
+         thumbnail->texture = 0;
+         life->next = gfx_thumb_retired;
+         gfx_thumb_retired = life;
+      }
    }
-   if (thumbnail->anim)
-      image_transfer_anim_stream_free(thumbnail->anim,
-            (enum image_type_enum)thumbnail->anim_type);
-   /* Stream first, buffer second: the stream borrows the buffer.
-    * An adopted animation's buffer lives inside the nbio handle
-    * (possibly as a file mapping) and is released with it; only the
-    * open-by-path fallback malloc's anim_buf. */
-   if (thumbnail->anim_dt)
-      /* Deselected before the adopted read finished: the transfer
-       * cancels the in-flight read before releasing the handle - the
-       * rest of the file is never read. */
-      data_transfer_free(thumbnail->anim_dt);
-   else if (thumbnail->anim_buf)
-      free(thumbnail->anim_buf);
-   thumbnail->anim            = NULL;
-   thumbnail->anim_buf        = NULL;
-   thumbnail->anim_dt         = NULL;
-   thumbnail->anim_buf_len    = 0;
-   thumbnail->anim_type       = 0;
+   thumbnail->anim_player       = NULL;
+   thumbnail->anim_lifetime     = NULL;
+   thumbnail->anim_sess         = NULL;
+   thumbnail->anim              = NULL;
+   thumbnail->anim_buf          = NULL;
+   thumbnail->anim_dt           = NULL;
+   thumbnail->anim_buf_len      = 0;
+   thumbnail->anim_type         = 0;
    thumbnail->anim_read_pending = 0;
-   thumbnail->anim_windowed   = 0;
-   thumbnail->flags          &= ~GFX_THUMB_FLAG_ANIM_ACTIVE;
+   thumbnail->anim_windowed     = 0;
+   thumbnail->flags            &= ~GFX_THUMB_FLAG_ANIM_ACTIVE;
 }
 
 static gfx_surface_t *gfx_thumbnail_anim_surface(void *user,
@@ -437,8 +592,7 @@ static void gfx_thumbnail_anim_shown(void *user, gfx_surface_t *s);
 /* The playback's window feed, on the thread that decodes. */
 static bool gfx_thumbnail_anim_feed(void *user)
 {
-   gfx_thumbnail_t *thumbnail = (gfx_thumbnail_t*)user;
-   return gfx_anim_preview_feed((gfx_anim_preview_t*)thumbnail->anim_sess);
+   return gfx_anim_preview_feed((gfx_anim_preview_t*)user);
 }
 
 /* Install an open animation stream on the thumbnail, applying the
@@ -489,6 +643,10 @@ static bool gfx_thumbnail_anim_install(gfx_thumbnail_t *thumbnail,
          goto fail;
    }
 
+   if (!(thumbnail->anim_lifetime = calloc(1,
+               sizeof(gfx_thumbnail_anim_lifetime_t))))
+      goto fail;
+
    /* The task hands the buffer over as the data_transfer that owns
     * it - possibly with its fill still in flight. */
    thumbnail->anim_dt = xfer;
@@ -498,6 +656,8 @@ static bool gfx_thumbnail_anim_install(gfx_thumbnail_t *thumbnail,
        * must never feed the decoders - keep the still, drop the
        * animation */
       thumbnail->anim_dt = NULL;
+      free(thumbnail->anim_lifetime);
+      thumbnail->anim_lifetime = NULL;
       goto fail;
    }
 
@@ -553,8 +713,11 @@ static bool gfx_thumbnail_anim_install(gfx_thumbnail_t *thumbnail,
       cb.surface = gfx_thumbnail_anim_surface;
       cb.shown   = gfx_thumbnail_anim_shown;
       cb.feed    = thumbnail->anim_sess ? gfx_thumbnail_anim_feed : NULL;
+      cb.feed_user = thumbnail->anim_sess;
+      /* frames decoded on the GPU where the stream and driver can */
       if (!(thumbnail->anim_player = gfx_surface_player_new(stream, type,
-            loop_count, &thumbnail->anim_surface, &cb, 0)))
+            loop_count, &thumbnail->anim_surface, &cb,
+            GFX_SURFACE_PLAYER_GPU)))
       {
          gfx_thumbnail_anim_close(thumbnail);
          return false;
@@ -592,7 +755,7 @@ static void gfx_thumbnail_anim_open_probed(gfx_thumbnail_t *thumbnail,
     * admission live in gfx_anim_preview (shared with the desktop
     * companions' preview panes). NULL: a still, or not admitted - keep
     * the static thumbnail. */
-   if (!(p = gfx_anim_preview_open(path, png_probe)))
+   if (!(p = gfx_anim_preview_open_hw(path, png_probe)))
       return;
 
    /* Hand the stream and the mapping to the thumbnail (install borrows
@@ -759,21 +922,24 @@ static void gfx_thumbnail_anim_slot_release(void *user, gfx_surface_t *s,
 }
 
 /* The thumbnail's surface for a @dims animation with @num_slots
- * producer slots in @pixfmt, or with none the still its images go to,
- * made on first use. A surface of another shape - a different
- * animation on a thumbnail that was not reset - is replaced; its
- * texture goes with it, so it is only asked for when a frame is about
- * to be shown. */
+ * producer slots in @pixfmt, or with none the still its images go to
+ * - or, in NV12, the imported surface GPU frames go to - made on first
+ * use. A surface of another shape - a different animation on a
+ * thumbnail that was not reset - is replaced; its texture goes with
+ * it, so it is only asked for when a frame is about to be shown. */
 static gfx_surface_t *gfx_thumbnail_anim_surface(void *user,
       unsigned dims, unsigned num_slots, uint32_t pixfmt)
 {
    gfx_thumbnail_t *thumbnail = (gfx_thumbnail_t*)user;
    gfx_surface_t *s           = (gfx_surface_t*)thumbnail->anim_surface;
+   bool import                = !num_slots && pixfmt == IMAGE_PIXFMT_NV12;
    if (     s
          && (     (num_slots && s->dims != dims)
                || s->num_slots < num_slots
                || (!num_slots && s->num_slots)
-               || (num_slots && s->pixfmt != pixfmt)))
+               || (num_slots && s->pixfmt != pixfmt)
+               || (s->imported ? 1 : 0) != (import ? 1 : 0)
+               || (import && s->dims != dims)))
    {
       thumbnail->texture = 0;
       gfx_surface_free(s);
@@ -785,7 +951,10 @@ static gfx_surface_t *gfx_thumbnail_anim_surface(void *user,
       /* Animated thumbnails update every frame; always plain linear
        * filtering here, so no per-frame mip-map generation regardless
        * of the menu_texture_mipmapping setting. */
-      if (num_slots)
+      if (import)
+         s = gfx_surface_new_import(dims, TEXTURE_FILTER_LINEAR,
+               gfx_thumbnail_anim_slot_release, thumbnail);
+      else if (num_slots)
          s = gfx_surface_new(dims, num_slots, pixfmt,
                TEXTURE_FILTER_LINEAR,
                gfx_thumbnail_anim_slot_release, thumbnail);
@@ -824,6 +993,7 @@ void gfx_thumbnail_animate(gfx_thumbnail_t *thumbnail,
    int64_t now = (int64_t)current_time;
    enum image_type_enum type;
 
+   gfx_thumbnail_anim_reap();
    if (   !thumbnail
        || !(thumbnail->flags & GFX_THUMB_FLAG_ANIM_ACTIVE)
        || !thumbnail->anim)
@@ -907,6 +1077,7 @@ static void gfx_thumbnail_still_landed(retro_task_t *task,
       int png_probe)
 {
    gfx_thumbnail_state_t *p_gfx_thumb = &gfx_thumb_st;
+   struct texture_image *src          = NULL;
    bool fade_enabled                  = false;
 
    /* Sanity check */
@@ -929,12 +1100,29 @@ static void gfx_thumbnail_still_landed(retro_task_t *task,
    if (thumbnail_tag->thumbnail->texture)
       gfx_thumbnail_reset(thumbnail_tag->thumbnail);
 
+   /* The image: the task's, or the parked one the request found */
+   if (thumbnail_tag->parked)
+      src = &thumbnail_tag->parked->img;
+   else
+      src = img;
+
    /* Check we have a valid image */
-   if (!img || (img->width < 1) || (img->height < 1))
+   if (!src || (src->width < 1) || (src->height < 1))
    {
       GFX_THUMB_STATUS_STORE(&thumbnail_tag->thumbnail->status,
             GFX_THUMBNAIL_STATUS_MISSING);
       fade_enabled = true;
+      goto end;
+   }
+
+   /* Parked: kept decoded for the requests that show it, which
+    * upload from it. The thumbnail asks again from UNKNOWN. */
+   if (     thumbnail_tag->park && img && img->pixels && !img->compressed
+         && gfx_thumbnail_park_image(thumbnail_tag, img))
+   {
+      img = NULL;
+      GFX_THUMB_STATUS_STORE(&thumbnail_tag->thumbnail->status,
+            GFX_THUMBNAIL_STATUS_UNKNOWN);
       goto end;
    }
 
@@ -947,13 +1135,31 @@ static void gfx_thumbnail_still_landed(retro_task_t *task,
     * gets the image narrowed, or for half floats no still at all, and
     * the animation brings the picture. */
    {
-      gfx_surface_t *s = VIDEO_SCALE_FITS(img->width, img->height)
+      gfx_thumbnail_parked_t *p = thumbnail_tag->parked;
+      gfx_surface_t *s = VIDEO_SCALE_FITS(src->width, src->height)
          ? gfx_thumbnail_anim_surface(thumbnail_tag->thumbnail, 0, 0, 0)
          : NULL;
       /* Dimensions now, so layout does not wait for the handle. */
-      unsigned dims    = VIDEO_SCALE_PACK(img->width, img->height);
+      unsigned dims    = VIDEO_SCALE_PACK(src->width, src->height);
+      bool up          = false;
 
-      if (s && gfx_surface_submit_image(s, img))
+      /* A parked image is lent to the upload and stays parked; one
+       * the surface will not take is dropped, and the thumbnail has
+       * nothing to show, as below. */
+      if (s && p)
+      {
+         p->inflight++;
+         if (!(up = gfx_surface_submit_image_borrowed(s, &p->img, p,
+                     gfx_thumbnail_parked_done)))
+         {
+            p->inflight--;
+            gfx_thumbnail_parked_drop(p);
+         }
+      }
+      else if (s)
+         up = gfx_surface_submit_image(s, img);
+
+      if (up)
       {
          thumbnail_tag->thumbnail->dims = dims;
          if (!s->inflight)
@@ -1080,6 +1286,38 @@ static unsigned gfx_thumbnail_set_width(void)
    return cores;
 }
 
+/* A request for a parked still lands it from the slot, uploaded now
+ * as a decode coming back would be, the image staying parked for the
+ * next request. One parked under other decode settings, or for a
+ * driver wanting the other channel order, is dropped and the still
+ * decoded again. False when nothing matched. */
+static bool gfx_thumbnail_unpark(gfx_thumbnail_tag_t *tag)
+{
+   unsigned i;
+   if (!gfx_thumb_parked_n || tag->park)
+      return false;
+   for (i = 0; i < GFX_THUMB_PARKED_MAX; i++)
+   {
+      gfx_thumbnail_parked_t *p = &gfx_thumb_parked[i];
+      if (!GFX_THUMB_PARKED_LIVE(p) || !string_is_equal(p->path, tag->path))
+         continue;
+      if (     p->img.supports_rgba    != gfx_thumbnail_use_rgba()
+            || p->upscale_threshold    != tag->upscale_threshold
+            || p->downscale_cap        != gfx_thumbnail_downscale_cap())
+      {
+         gfx_thumbnail_parked_drop(p);
+         return false;
+      }
+      tag->parked             = p;
+      tag->thumbnail->list_id = tag->list_id;
+      GFX_THUMB_STATUS_STORE(&tag->thumbnail->status,
+            GFX_THUMBNAIL_STATUS_PENDING);
+      gfx_thumbnail_still_landed(NULL, NULL, tag, -1);
+      return true;
+   }
+   return false;
+}
+
 /* The still at @tag's path, decoded on the task queue: held for the
  * frame's set where one can be made, else a task of its own. A video
  * always goes alone - only its task can hand the thumbnail the decoder
@@ -1088,12 +1326,14 @@ static bool gfx_thumbnail_push_still(gfx_thumbnail_tag_t *tag,
       unsigned upscale_threshold)
 {
    enum image_type_enum type = image_texture_get_type(tag->path);
+   tag->upscale_threshold    = upscale_threshold;
+   if (gfx_thumbnail_unpark(tag))
+      return false;
    if (     type != IMAGE_TYPE_WEBM && type != IMAGE_TYPE_MP4
          && gfx_thumbnail_set_width() > 1)
    {
       if (gfx_thumb_pending_n == GFX_THUMB_PENDING_MAX)
          gfx_thumbnail_flush_requests();
-      tag->upscale_threshold                      = upscale_threshold;
       gfx_thumb_pending[gfx_thumb_pending_n++] = tag;
       return true;
    }
@@ -1105,6 +1345,13 @@ static bool gfx_thumbnail_push_still(gfx_thumbnail_tag_t *tag,
 void gfx_thumbnail_flush_requests(void)
 {
    unsigned width, cap, i = 0, n = gfx_thumb_pending_n;
+   gfx_thumbnail_anim_reap();
+   /* Parked stills are for the content's close; once it is closed
+    * whatever was not taken back goes. */
+   if (     gfx_thumb_parked_n
+         && !runloop_is_content_switching()
+         && !runloop_content_loaded())
+      gfx_thumbnail_parked_free();
    if (!n)
       return;
    gfx_thumb_pending_n = 0;
@@ -1378,6 +1625,8 @@ void gfx_thumbnail_request(
                /* Configure user data */
                thumbnail_tag->thumbnail = thumbnail;
                thumbnail_tag->list_id   = p_gfx_thumb->list_id;
+               thumbnail_tag->park      = gfx_thumb_parking;
+               thumbnail_tag->parked    = NULL;
                strlcpy(thumbnail_tag->path, thumbnail_path,
                      sizeof(thumbnail_tag->path));
 
@@ -1513,8 +1762,14 @@ void gfx_thumbnail_request_file(
     * stopped. */
    thumbnail_tag->thumbnail = thumbnail;
    thumbnail_tag->list_id   = p_gfx_thumb->list_id;
+   thumbnail_tag->upscale_threshold = gfx_thumbnail_upscale_threshold;
+   thumbnail_tag->park      = gfx_thumb_parking;
+   thumbnail_tag->parked    = NULL;
    strlcpy(thumbnail_tag->path, file_path,
          sizeof(thumbnail_tag->path));
+
+   if (gfx_thumbnail_unpark(thumbnail_tag))
+      return;
 
    /* Would like to cancel any existing image load tasks
     * here, but can't see how to do it... */

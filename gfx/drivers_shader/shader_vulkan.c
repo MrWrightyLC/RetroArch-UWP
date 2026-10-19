@@ -803,9 +803,12 @@ struct CommonResources
 #ifdef VULKAN_ROLLING_SCANLINE_SIMULATION
    bool simulate_scanline;
 #endif /* VULKAN_ROLLING_SCANLINE_SIMULATION */
+   unsigned source_hdr;
+   unsigned passthrough;
 #ifdef VULKAN_HDR_SWAPCHAIN
    unsigned hdr_mode;
    float paper_white_nits;
+   float peak_nits;
    unsigned expand_gamut;
    float scanlines;
    unsigned subpixel_layout;
@@ -2214,7 +2217,8 @@ static VkFormat slang_chain_get_pass_rt_format(struct vulkan_filter_chain *chain
 
 static bool slang_chain_emits_hdr10(const struct vulkan_filter_chain *chain)
 {
-   return chain->emits_hdr_colorspace;
+   int mode = video_shader_get_hdr_mode(chain->common.shader_preset);
+   return mode >= 0 ? mode == 1 : chain->emits_hdr_colorspace;
 }
 
 static void slang_chain_set_emits_hdr10(struct vulkan_filter_chain *chain)
@@ -2224,7 +2228,8 @@ static void slang_chain_set_emits_hdr10(struct vulkan_filter_chain *chain)
 
 static bool slang_chain_emits_hdr16(const struct vulkan_filter_chain *chain)
 {
-   return chain->emits_hdr16_output;
+   int mode = video_shader_get_hdr_mode(chain->common.shader_preset);
+   return mode >= 0 ? mode == 2 : chain->emits_hdr16_output;
 }
 
 static void slang_chain_set_emits_hdr16(struct vulkan_filter_chain *chain)
@@ -2543,13 +2548,18 @@ static bool slang_chain_compile_full_pass(struct vulkan_filter_chain *chain,
       (p_info.source_filter == GLSLANG_FILTER_CHAIN_LINEAR && pass->mipmap)
       ? GLSLANG_FILTER_CHAIN_LINEAR
       : GLSLANG_FILTER_CHAIN_NEAREST;
+   output.meta.rt_format = glslang_hdr_output_format(
+         shader, pass_idx, output.meta.rt_format);
 
    explicit_format = output.meta.rt_format != SLANG_FORMAT_UNKNOWN;
 
    if (output.meta.rt_format == SLANG_FORMAT_UNKNOWN)
       output.meta.rt_format = SLANG_FORMAT_R8G8B8A8_UNORM;
 
-   if (!(pass->fbo.flags & FBO_SCALE_FLAG_VALID))
+   /* A last pass with no target of its own renders to the swapchain,
+    * whatever scale the preset gave it. */
+   if (     !(pass->fbo.flags & FBO_SCALE_FLAG_VALID)
+         || pass_idx + 1 == chain->pass_count)
    {
       p_info.scale_type_x = GLSLANG_FILTER_CHAIN_SCALE_SOURCE;
       p_info.scale_type_y = GLSLANG_FILTER_CHAIN_SCALE_SOURCE;
@@ -2592,6 +2602,8 @@ static bool slang_chain_compile_full_pass(struct vulkan_filter_chain *chain,
          output.meta.rt_format = SLANG_FORMAT_R16G16B16A16_SFLOAT;
       else if (pass->fbo.flags & FBO_SCALE_FLAG_RGB10_FBO)
          output.meta.rt_format = SLANG_FORMAT_A2B10G10R10_UNORM_PACK32;
+      output.meta.rt_format = glslang_hdr_output_format(
+            shader, pass_idx, output.meta.rt_format);
 
       p_info.rt_format = glslang_format_to_vk(output.meta.rt_format);
 
@@ -3655,11 +3667,12 @@ static void slang_pass_read_frame_in_place(struct slang_pass *pass)
    if (pass->frame_tried)
       return;
    pass->frame_tried = true;
-   pass->frame_copy  = !slang_rect_remap_pass(
+   pass->frame_copy  = slang_rect_remap_pass(
          &pass->vertex_shader, &pass->num_vertex_shader,
          &pass->fragment_shader, &pass->num_fragment_shader,
          pass->pass_number == 0, pass->common->frame_linear,
-         pass->common->frame_wrap);
+         pass->common->frame_wrap)
+         == SLANG_RECT_UNSUPPORTED;
 }
 
 static bool slang_pass_build(struct slang_pass *pass)
@@ -4071,12 +4084,24 @@ static void slang_pass_build_semantics(struct slang_pass *pass,
    slang_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_CORE_ASPECT_ROT,
                       pass->common->core_aspect_rot);
 
+   slang_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_MIN_NITS, 0.0f);
+   slang_pass_build_semantic_uint(pass, buffer, SLANG_SEMANTIC_TONEMAP_OPERATOR, 0);
+   slang_pass_build_semantic_uint(pass, buffer, SLANG_SEMANTIC_SOURCE_HDR, pass->common->source_hdr);
+   slang_pass_build_semantic_uint(pass, buffer, SLANG_SEMANTIC_PASSTHROUGH, pass->common->passthrough);
 #ifdef VULKAN_HDR_SWAPCHAIN
    slang_pass_build_semantic_uint(pass, buffer, SLANG_SEMANTIC_HDR,
                       pass->common->hdr_mode);
+   slang_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_ENABLE_HDR,
+                      pass->common->hdr_mode ? 1.0f : 0.0f);
 
    slang_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_PAPER_WHITE_NITS,
                       pass->common->paper_white_nits);
+   slang_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_PAPER_WHITE_ALIAS,
+                      pass->common->paper_white_nits);
+   slang_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_PEAK_NITS,
+                      pass->common->peak_nits);
+   slang_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_MAX_NITS_ALIAS,
+                      pass->common->peak_nits);
 
    slang_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_SCANLINES,
                       pass->common->scanlines);
@@ -4092,6 +4117,9 @@ static void slang_pass_build_semantics(struct slang_pass *pass,
 
    slang_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_HDR10,
                       pass->common->hdr10);
+#else
+   slang_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_ENABLE_HDR,
+                      0.0f);
 #endif /* VULKAN_HDR_SWAPCHAIN */
 
    /* Sensor uniforms — one coherent seqlock'd snapshot of the values
@@ -4123,8 +4151,8 @@ static void slang_pass_build_semantics(struct slang_pass *pass,
    for (i = 0; i < pass->num_filtered; i++)
       slang_pass_build_semantic_parameter(pass, buffer,
             pass->parameters[pass->filtered_parameters[i]].semantic_index,
-            pass->common->shader_preset->parameters[
-            pass->parameters[pass->filtered_parameters[i]].index].current);
+            video_shader_param_get(&pass->common->shader_preset->parameters[
+            pass->parameters[pass->filtered_parameters[i]].index]));
 
    /* Previous inputs. */
    for (i = 0; i < pass->common->num_original_history; i++)
@@ -4802,8 +4830,14 @@ vulkan_filter_chain_t *vulkan_filter_chain_create_from_preset(
     if (!video_shader_load_preset_into_shader(path, shader))
         goto error;
 
-   last_pass_is_fbo   = shader->pass[shader->passes - 1].fbo.flags &
-      FBO_SCALE_FLAG_VALID;
+   /* One include cache for every pass of this preset.  The passes share
+    * helper .inc files, so without this each pass re-reads them: a
+    * 24-pass preset over 8 shared helpers issues 216 reads for 32
+    * distinct files.  It is freed on every exit from here, including
+    * the error paths below. */
+   include_cache      = glslang_include_cache_new();
+
+   last_pass_is_fbo   = glslang_last_pass_needs_target(shader, include_cache);
    tmpinfo            = *info;
    tmpinfo.num_passes = shader->passes + (last_pass_is_fbo ? 1 : 0);
 
@@ -4816,13 +4850,7 @@ vulkan_filter_chain_t *vulkan_filter_chain_create_from_preset(
 
    shader->num_parameters = 0;
 
-   /* One include cache for every pass of this preset.  The passes share
-    * helper .inc files, so without this each pass re-reads them: a
-    * 24-pass preset over 8 shared helpers issues 216 reads for 32
-    * distinct files.  The guard frees it on every exit from here,
-    * including the error paths below. */
    {
-   include_cache = glslang_include_cache_new();
 
    for (i = 0; i < shader->passes; i++)
    {
@@ -4953,6 +4981,8 @@ vulkan_filter_chain_t *vulkan_filter_chain_create_from_preset(
          (pass_info.source_filter == GLSLANG_FILTER_CHAIN_LINEAR && pass->mipmap)
          ? GLSLANG_FILTER_CHAIN_LINEAR
          : GLSLANG_FILTER_CHAIN_NEAREST;
+      output.meta.rt_format = glslang_hdr_output_format(
+            shader, i, output.meta.rt_format);
 
       explicit_format              = output.meta.rt_format != SLANG_FORMAT_UNKNOWN;
 
@@ -4960,7 +4990,10 @@ vulkan_filter_chain_t *vulkan_filter_chain_create_from_preset(
       if (output.meta.rt_format == SLANG_FORMAT_UNKNOWN)
          output.meta.rt_format     = SLANG_FORMAT_R8G8B8A8_UNORM;
 
-      if (!(pass->fbo.flags & FBO_SCALE_FLAG_VALID))
+      /* A last pass with no target of its own renders to the
+       * swapchain, whatever scale the preset gave it. */
+      if (     !(pass->fbo.flags & FBO_SCALE_FLAG_VALID)
+            || (i + 1 == shader->passes && !last_pass_is_fbo))
       {
          pass_info.scale_type_x    = GLSLANG_FILTER_CHAIN_SCALE_SOURCE;
          pass_info.scale_type_y    = GLSLANG_FILTER_CHAIN_SCALE_SOURCE;
@@ -5017,6 +5050,8 @@ vulkan_filter_chain_t *vulkan_filter_chain_create_from_preset(
             output.meta.rt_format = SLANG_FORMAT_R16G16B16A16_SFLOAT;
          else if (pass->fbo.flags & FBO_SCALE_FLAG_RGB10_FBO)
             output.meta.rt_format = SLANG_FORMAT_A2B10G10R10_UNORM_PACK32;
+         output.meta.rt_format = glslang_hdr_output_format(
+               shader, i, output.meta.rt_format);
 
          pass_info.rt_format      = glslang_format_to_vk(output.meta.rt_format);
 
@@ -5155,8 +5190,7 @@ vulkan_filter_chain_t *vulkan_filter_chain_create_deferred(
       return NULL;
    }
 
-   last_pass_is_fbo   = shader->pass[shader->passes - 1].fbo.flags &
-      FBO_SCALE_FLAG_VALID;
+   last_pass_is_fbo   = glslang_last_pass_needs_target(shader, NULL);
    tmpinfo            = *info;
    tmpinfo.num_passes = shader->passes + (last_pass_is_fbo ? 1 : 0);
 
@@ -5301,6 +5335,18 @@ bool vulkan_filter_chain_reads_in_place(vulkan_filter_chain_t *chain)
    return chain->frame_in_place;
 }
 
+void vulkan_filter_chain_set_passthrough(
+      vulkan_filter_chain_t *chain, unsigned passthrough)
+{
+   chain->common.passthrough = passthrough ? 1 : 0;
+}
+
+void vulkan_filter_chain_set_source_hdr(
+      vulkan_filter_chain_t *chain, unsigned source_hdr)
+{
+   chain->common.source_hdr = source_hdr ? 1 : 0;
+}
+
 void vulkan_filter_chain_set_input_texture(
       vulkan_filter_chain_t *chain,
       const struct vulkan_filter_chain_texture *texture)
@@ -5410,6 +5456,12 @@ void vulkan_filter_chain_set_hdr_mode(
       unsigned hdr_mode)
 {
    slang_chain_set_hdr_mode(chain, hdr_mode);
+}
+
+void vulkan_filter_chain_set_peak_nits(vulkan_filter_chain_t *chain,
+      float peak_nits)
+{
+   chain->common.peak_nits = peak_nits;
 }
 
 void vulkan_filter_chain_set_paper_white_nits(

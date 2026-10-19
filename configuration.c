@@ -448,6 +448,7 @@ const struct input_bind_map input_config_bind_map[RARCH_BIND_LIST_END_NULL] = {
    DECLARE_META_BIND(2, video_filter_toggle,   RARCH_VIDEO_FILTER_TOGGLE,    MENU_ENUM_LABEL_VALUE_INPUT_META_VIDEO_FILTER_TOGGLE),
    DECLARE_META_BIND(2, headset_recenter,      RARCH_HEADSET_RECENTER,       MENU_ENUM_LABEL_VALUE_INPUT_META_HEADSET_RECENTER),
    DECLARE_META_BIND(2, laser_pointer_toggle,  RARCH_LASER_POINTER_TOGGLE,   MENU_ENUM_LABEL_VALUE_INPUT_META_LASER_POINTER_TOGGLE),
+   DECLARE_META_BIND(2, headset_view_toggle,   RARCH_HEADSET_VIEW_TOGGLE,    MENU_ENUM_LABEL_VALUE_INPUT_META_HEADSET_VIEW_TOGGLE),
    DECLARE_META_BIND(2, fps_toggle,            RARCH_FPS_TOGGLE,             MENU_ENUM_LABEL_VALUE_INPUT_META_FPS_TOGGLE),
    DECLARE_META_BIND(2, toggle_statistics,     RARCH_STATISTICS_TOGGLE,      MENU_ENUM_LABEL_VALUE_INPUT_META_STATISTICS_TOGGLE),
    DECLARE_META_BIND(2, ai_service,            RARCH_AI_SERVICE,             MENU_ENUM_LABEL_VALUE_INPUT_META_AI_SERVICE),
@@ -664,7 +665,9 @@ static const enum midi_driver_enum MIDI_DEFAULT_DRIVER = MIDI_ALSA;
 static const enum midi_driver_enum MIDI_DEFAULT_DRIVER = MIDI_NULL;
 #endif
 
-#if defined(HAVE_STEAM) && defined(__linux__) && defined(HAVE_SDL2)
+#if defined(HAVE_STEAM) && defined(__linux__) && defined(HAVE_SDL3)
+static const enum input_driver_enum INPUT_DEFAULT_DRIVER = INPUT_SDL3;
+#elif defined(HAVE_STEAM) && defined(__linux__) && defined(HAVE_SDL2)
 static const enum input_driver_enum INPUT_DEFAULT_DRIVER = INPUT_SDL2;
 #elif defined(__WINRT__) || defined(WINAPI_FAMILY) && WINAPI_FAMILY == WINAPI_FAMILY_PHONE_APP
 static const enum input_driver_enum INPUT_DEFAULT_DRIVER = INPUT_UWP;
@@ -732,7 +735,7 @@ static const enum input_driver_enum INPUT_DEFAULT_DRIVER = INPUT_DOS;
 static const enum input_driver_enum INPUT_DEFAULT_DRIVER = INPUT_NULL;
 #endif
 
-#if defined(HAVE_STEAM) && defined(__linux__) && defined(HAVE_SDL2)
+#if defined(HAVE_STEAM) && defined(__linux__) && (defined(HAVE_SDL2) || defined(HAVE_SDL3))
 static const enum joypad_driver_enum JOYPAD_DEFAULT_DRIVER = JOYPAD_SDL;
 #elif defined(HAVE_XINPUT)
 static const enum joypad_driver_enum JOYPAD_DEFAULT_DRIVER = JOYPAD_XINPUT;
@@ -979,7 +982,7 @@ static void config_settings_list_full(const char *key, unsigned cap)
  * many for its list wrote past the end of the allocation, and the
  * process died of heap corruption at the next allocation - at
  * startup, on every run. A setting there is no room for is now left
- * out and said so, loudly; tools/settings_capacity_check.py, in CI,
+ * out and said so, loudly; tools/settings_capacity_check.c, in CI,
  * counts what each list is given against what it holds, so that it
  * is found before anything is run. */
 #define GENERAL_SETTING(key, configval, default_enable, default_setting, type, handle_setting) \
@@ -2057,6 +2060,9 @@ static struct config_array_setting *populate_settings_array(
    SETTING_ARRAY("cpu_main_gov",                 settings->arrays.cpu_main_gov, false, NULL, true);
    SETTING_ARRAY("cpu_menu_gov",                 settings->arrays.cpu_menu_gov, false, NULL, true);
 #endif
+#ifdef HAVE_LAKKA_SWITCH
+   SETTING_ARRAY("reboot_payload_name",          settings->arrays.reboot_payload_name, false, NULL, true);
+#endif
 
    *size = count;
 
@@ -2261,6 +2267,7 @@ static struct config_bool_setting *populate_settings_bool(
    SETTING_BOOL("switch_oc",                     &settings->bools.switch_oc, true, DEFAULT_SWITCH_OC, false);
    SETTING_BOOL("switch_cec",                    &settings->bools.switch_cec, true, DEFAULT_SWITCH_CEC, false);
    SETTING_BOOL("bluetooth_ertm_disable",        &settings->bools.bluetooth_ertm_disable, true, DEFAULT_BLUETOOTH_ERTM, false);
+   SETTING_BOOL("reboot_force_self_on_update",   &settings->bools.reboot_force_self_on_update, true, DEFAULT_REBOOT_FORCE_SELF_ON_UPDATE, false);
 #endif
    SETTING_BOOL("audio_rate_control",            &settings->bools.audio_rate_control, true, DEFAULT_RATE_CONTROL, false);
    SETTING_BOOL("audio_enable_menu_ok",          &settings->bools.audio_enable_menu_ok, true, DEFAULT_AUDIO_ENABLE_MENU_OK, false);
@@ -4401,6 +4408,9 @@ static struct config_uint_setting *populate_settings_uint(
    SETTING_UINT("cpu_min_freq",                  &settings->uints.cpu_min_freq,        true,   1, false);
    SETTING_UINT("cpu_max_freq",                  &settings->uints.cpu_max_freq,        true, ~0U, false);
 #endif
+#ifdef HAVE_LAKKA_SWITCH
+   SETTING_UINT("reboot_payload_kind",           &settings->uints.reboot_payload_kind, true,   0, false);
+#endif
 
 
 
@@ -6327,7 +6337,8 @@ void config_set_defaults(settings_t *target)
             FILE_PATH_BUILTIN,
             sizeof(new_path));
 
-      if (!path_is_directory(new_path))
+      if (     !(retroarch_get_flags() & RARCH_FLAGS_USER_DIRS_HELD)
+            && !path_is_directory(new_path))
          path_mkdir(new_path);
 
       if (!*settings->paths.path_content_favorites)
@@ -7249,7 +7260,8 @@ static bool config_load_file(const char *path, settings_t *settings)
             FILE_PATH_BUILTIN,
             sizeof(new_path));
 
-      if (!path_is_directory(new_path))
+      if (     !(retroarch_get_flags() & RARCH_FLAGS_USER_DIRS_HELD)
+            && !path_is_directory(new_path))
          path_mkdir(new_path);
 
       if (!*settings->paths.path_content_favorites)
@@ -10377,6 +10389,10 @@ bool input_remapping_load_file(void *data, const char *path)
             if (!config_get_int(conf, ident, &_remap))
                _remap = RETROK_UNKNOWN;
 
+            if (   _remap < (int)RETROK_UNKNOWN
+                || _remap >= (int)RETROK_LAST)
+               _remap = RETROK_UNKNOWN;
+
             configuration_set_uint(settings,
                   settings->uints.input_keymapper_ids[i][j], _remap);
          }
@@ -10409,6 +10425,10 @@ bool input_remapping_load_file(void *data, const char *path)
             _remap = -1;
 
             if (!config_get_int(conf, ident, &_remap))
+               _remap = RETROK_UNKNOWN;
+
+            if (   _remap < (int)RETROK_UNKNOWN
+                || _remap >= (int)RETROK_LAST)
                _remap = RETROK_UNKNOWN;
 
             configuration_set_uint(settings,

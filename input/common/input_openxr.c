@@ -18,6 +18,7 @@
 
 #include <boolean.h>
 #include <compat/strl.h>
+#include <string/stdstring.h>
 #include <retro_miscellaneous.h>
 #include <retro_atomic.h>
 #include <features/features_cpu.h>
@@ -31,8 +32,9 @@
 #include "../input_defines.h"
 #include "../input_driver.h"
 #include "../../runloop.h"
+#include "../../tasks/tasks_internal.h"
 #include "../../gfx/video_views.h"
-#include "../../gfx/common/vulkan_openxr.h"
+#include "../../gfx/common/openxr_frame.h"
 #include "../../gfx/video_driver.h"
 #include "../../verbosity.h"
 
@@ -42,12 +44,17 @@
 
 #define INPUT_OPENXR_HANDS     2
 #define INPUT_OPENXR_MAX_BINDS 48
+/* With XR_EXT_palm_pose, every profile gets both hands' palm too. */
+#define INPUT_OPENXR_PALM_BINDS 2
 /* A steady rumble is applied again this often (us), each time for
  * INPUT_OPENXR_HAPTIC_DURATION (ns). */
 #define INPUT_OPENXR_HAPTIC_REFRESH  500000
 #define INPUT_OPENXR_HAPTIC_DURATION 1000000000
 /* Half a stick's travel. */
 #define INPUT_OPENXR_YIELD_STICK   0x4000
+/* Touch's one menu button opens the RetroArch menu once held this long
+ * (us). */
+#define INPUT_OPENXR_MENU_HOLD     1000000
 
 enum input_openxr_set
 {
@@ -81,6 +88,8 @@ enum input_openxr_action
    IXA_C_MENU,
    IXA_C_RECENTER,
    IXA_C_LASER,
+   IXA_C_VIEW,
+   IXA_C_START_MENU,
    IXA_S_B,
    IXA_S_A,
    IXA_S_R,
@@ -90,7 +99,10 @@ enum input_openxr_action
    IXA_S_MENU,
    IXA_S_RECENTER,
    IXA_S_LASER,
+   IXA_S_VIEW,
    IXA_AIM,
+   IXA_GRIP,
+   IXA_PALM,
    IXA_RUMBLE,
    IXA_COUNT
 };
@@ -128,6 +140,8 @@ static const input_openxr_action_def_t input_openxr_actions[IXA_COUNT] = {
    { INPUT_OPENXR_SET_COMBINED, "menu",        "RetroArch Menu", XR_ACTION_TYPE_BOOLEAN_INPUT,    false },
    { INPUT_OPENXR_SET_COMBINED, "recenter",    "Recenter",       XR_ACTION_TYPE_BOOLEAN_INPUT,    false },
    { INPUT_OPENXR_SET_COMBINED, "laser",       "Laser Pointer",  XR_ACTION_TYPE_BOOLEAN_INPUT,    false },
+   { INPUT_OPENXR_SET_COMBINED, "view",        "Headset View",   XR_ACTION_TYPE_BOOLEAN_INPUT,    false },
+   { INPUT_OPENXR_SET_COMBINED, "start_menu",  "Start (Held: RetroArch Menu)", XR_ACTION_TYPE_BOOLEAN_INPUT, false },
    { INPUT_OPENXR_SET_SEPARATE, "b",           "B",              XR_ACTION_TYPE_BOOLEAN_INPUT,    true  },
    { INPUT_OPENXR_SET_SEPARATE, "a",           "A",              XR_ACTION_TYPE_BOOLEAN_INPUT,    true  },
    { INPUT_OPENXR_SET_SEPARATE, "r",           "R",              XR_ACTION_TYPE_BOOLEAN_INPUT,    true  },
@@ -137,7 +151,10 @@ static const input_openxr_action_def_t input_openxr_actions[IXA_COUNT] = {
    { INPUT_OPENXR_SET_SEPARATE, "menu",        "RetroArch Menu", XR_ACTION_TYPE_BOOLEAN_INPUT,    false },
    { INPUT_OPENXR_SET_SEPARATE, "recenter",    "Recenter",       XR_ACTION_TYPE_BOOLEAN_INPUT,    false },
    { INPUT_OPENXR_SET_SEPARATE, "laser",       "Laser Pointer",  XR_ACTION_TYPE_BOOLEAN_INPUT,    false },
+   { INPUT_OPENXR_SET_SEPARATE, "view",        "Headset View",   XR_ACTION_TYPE_BOOLEAN_INPUT,    false },
    { INPUT_OPENXR_SET_POINTER,  "aim",         "Aim",            XR_ACTION_TYPE_POSE_INPUT,       true  },
+   { INPUT_OPENXR_SET_POINTER,  "grip",        "Grip",           XR_ACTION_TYPE_POSE_INPUT,       true  },
+   { INPUT_OPENXR_SET_POINTER,  "palm",        "Palm",           XR_ACTION_TYPE_POSE_INPUT,       true  },
    { INPUT_OPENXR_SET_POINTER,  "rumble",      "Rumble",         XR_ACTION_TYPE_VIBRATION_OUTPUT, true  }
 };
 
@@ -157,6 +174,7 @@ typedef struct input_openxr_bind
 #define IXB_BOTH(a, p) IXB_L(a, p), IXB_R(a, p)
 #define IXB_POINTER \
    IXB_BOTH(IXA_AIM, "aim/pose"), \
+   IXB_BOTH(IXA_GRIP, "grip/pose"), \
    { IXA_RUMBLE, "/user/hand/left/output/haptic" }, \
    { IXA_RUMBLE, "/user/hand/right/output/haptic" }
 
@@ -188,7 +206,7 @@ static const input_openxr_bind_t input_openxr_index[] = {
 };
 
 /* Oculus Touch: X and Y on the left, A and B on the right, and one menu
- * button (left), which Start takes. */
+ * button (left): Start, and the RetroArch menu once held a second. */
 static const input_openxr_bind_t input_openxr_touch[] = {
    IXB_R(IXA_C_B,      "a/click"),
    IXB_R(IXA_C_A,      "b/click"),
@@ -202,7 +220,7 @@ static const input_openxr_bind_t input_openxr_touch[] = {
    IXB_R(IXA_C_R3,     "thumbstick/click"),
    IXB_L(IXA_C_LSTICK, "thumbstick"),
    IXB_R(IXA_C_RSTICK, "thumbstick"),
-   IXB_L(IXA_C_START,  "menu/click"),
+   IXB_L(IXA_C_START_MENU, "menu/click"),
    IXB_L(IXA_S_B,      "x/click"),
    IXB_R(IXA_S_B,      "a/click"),
    IXB_L(IXA_S_A,      "y/click"),
@@ -330,15 +348,18 @@ typedef struct input_openxr
 {
    /* Written by the session hooks, while neither the poll nor the XR
     * thread runs. */
-   vulkan_openxr_t *xr;
+   openxr_frame_t *frame;
    XrInstance instance;
    XrSession session;
-   XrSpace local_space;
    XrPath hands[INPUT_OPENXR_HANDS];
    XrActionSet sets[INPUT_OPENXR_SETS];
    XrAction actions[IXA_COUNT];
    XrSpace aim[INPUT_OPENXR_HANDS];
+   XrSpace grip[INPUT_OPENXR_HANDS];
+   XrSpace palm[INPUT_OPENXR_HANDS];
+   XrHandTrackerEXT trackers[INPUT_OPENXR_HANDS];
    PFN_xrStringToPath StringToPath;
+   PFN_xrPathToString PathToString;
    PFN_xrCreateActionSet CreateActionSet;
    PFN_xrDestroyActionSet DestroyActionSet;
    PFN_xrCreateAction CreateAction;
@@ -350,11 +371,20 @@ typedef struct input_openxr
    PFN_xrGetActionStateBoolean GetActionStateBoolean;
    PFN_xrGetActionStateFloat GetActionStateFloat;
    PFN_xrGetActionStateVector2f GetActionStateVector2f;
+   PFN_xrGetActionStatePose GetActionStatePose;
+   PFN_xrGetCurrentInteractionProfile GetCurrentInteractionProfile;
    PFN_xrLocateSpace LocateSpace;
+   PFN_xrCreateHandTrackerEXT CreateHandTrackerEXT;
+   PFN_xrDestroyHandTrackerEXT DestroyHandTrackerEXT;
+   PFN_xrLocateHandJointsEXT LocateHandJointsEXT;
    PFN_xrApplyHapticFeedback ApplyHapticFeedback;
    PFN_xrStopHapticFeedback StopHapticFeedback;
+   bool palm_pose;
+   bool hand_data_source;
 
    /* Main thread. */
+   XrPath profile_path[INPUT_OPENXR_HANDS]; /* profile[]'s, or none */
+   char profile[INPUT_OPENXR_HANDS][XR_MAX_PATH_LENGTH];
    input_openxr_pad_t pads[INPUT_OPENXR_PADS];
    input_openxr_trigger_t trig[INPUT_OPENXR_HANDS];
    XrResult sync_result; /* the last xrSyncActions */
@@ -363,6 +393,10 @@ typedef struct input_openxr
    bool menu_toggle;
    bool recenter;
    bool laser_toggle;
+   bool view_toggle;
+   /* Touch's menu button: held since start_menu_since. */
+   bool start_menu_held;
+   retro_time_t start_menu_since;
    float haptic[INPUT_OPENXR_HANDS];      /* the amplitude last accepted */
    float haptic_attempt[INPUT_OPENXR_HANDS];
    bool haptic_retry[INPUT_OPENXR_HANDS];
@@ -403,10 +437,32 @@ static input_openxr_t input_openxr_st;
 #define INPUT_OPENXR_MENU_OPEN  4
 static retro_atomic_int_t input_openxr_pointer_config;
 
-/* A core's rumble per player, strong then weak, and whether a session's
- * controllers exist: cores set rumble from any thread. */
+/* A core's rumble per pad, strong then weak, and whether a session's
+ * controllers exist: asked from any thread. */
 static retro_atomic_int_t input_openxr_rumble[INPUT_OPENXR_PADS][2];
 static retro_atomic_int_t input_openxr_ready;
+
+/* The pads as joypad devices. Main thread; apart from input_openxr_st,
+ * which a session's release clears, so a session remade before the
+ * next poll keeps them. */
+typedef struct input_openxr_devices
+{
+   int slot[INPUT_OPENXR_PADS];    /* each pad's slot, or -1 */
+   int lost[INPUT_OPENXR_PADS];    /* a slot a pad took from it, or -1 */
+   unsigned count;                 /* named for 1 (Combined) or 2 pads */
+   bool landed[INPUT_OPENXR_PADS]; /* its last connect was applied */
+   bool warned;
+} input_openxr_devices_t;
+
+static input_openxr_devices_t input_openxr_devs = {
+   { -1, -1 }, { -1, -1 }, 0, { false, false }, false };
+
+/* The joypad driver under the devices' slots, and two tables to hand
+ * out: a new driver under them gets the other, as the snapshot bridge
+ * knows a driver by its table. */
+static const input_device_driver_t *input_openxr_inner;
+static input_device_driver_t input_openxr_wrap[2];
+static unsigned input_openxr_wrap_cur;
 
 #define INPUT_OPENXR_PROC(st, get, inst, name) \
    (XR_SUCCEEDED((get)((inst), "xr" #name, \
@@ -425,6 +481,7 @@ static bool input_openxr_load(input_openxr_t *st,
       PFN_xrGetInstanceProcAddr get, XrInstance inst)
 {
    return INPUT_OPENXR_PROC(st, get, inst, StringToPath)
+      && INPUT_OPENXR_PROC(st, get, inst, PathToString)
       && INPUT_OPENXR_PROC(st, get, inst, CreateActionSet)
       && INPUT_OPENXR_PROC(st, get, inst, DestroyActionSet)
       && INPUT_OPENXR_PROC(st, get, inst, CreateAction)
@@ -436,6 +493,8 @@ static bool input_openxr_load(input_openxr_t *st,
       && INPUT_OPENXR_PROC(st, get, inst, GetActionStateBoolean)
       && INPUT_OPENXR_PROC(st, get, inst, GetActionStateFloat)
       && INPUT_OPENXR_PROC(st, get, inst, GetActionStateVector2f)
+      && INPUT_OPENXR_PROC(st, get, inst, GetActionStatePose)
+      && INPUT_OPENXR_PROC(st, get, inst, GetCurrentInteractionProfile)
       && INPUT_OPENXR_PROC(st, get, inst, LocateSpace)
       && INPUT_OPENXR_PROC(st, get, inst, ApplyHapticFeedback)
       && INPUT_OPENXR_PROC(st, get, inst, StopHapticFeedback);
@@ -447,10 +506,15 @@ static void input_openxr_suggest(input_openxr_t *st,
       const input_openxr_profile_t *p)
 {
    unsigned i;
+   unsigned count;
    XrResult res;
    XrPath profile = XR_NULL_PATH;
-   XrActionSuggestedBinding binds[INPUT_OPENXR_MAX_BINDS];
+   XrActionSuggestedBinding binds[INPUT_OPENXR_MAX_BINDS
+      + INPUT_OPENXR_PALM_BINDS];
    XrInteractionProfileSuggestedBinding sb;
+   static const char *const palm[INPUT_OPENXR_PALM_BINDS] = {
+      "/user/hand/left/input/palm_ext/pose",
+      "/user/hand/right/input/palm_ext/pose" };
 
    if (p->count > INPUT_OPENXR_MAX_BINDS)
       return;
@@ -470,17 +534,33 @@ static void input_openxr_suggest(input_openxr_t *st,
          return;
       }
    }
-   memset(&sb, 0, sizeof(sb));
+   count = p->count;
+   if (st->palm_pose)
+      for (i = 0; i < INPUT_OPENXR_PALM_BINDS; i++)
+      {
+         binds[count].action = st->actions[IXA_PALM];
+         if (XR_SUCCEEDED(st->StringToPath(st->instance, palm[i],
+                     &binds[count].binding)))
+            count++;
+      }
    sb.type                   = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
+   sb.next                   = NULL;
    sb.interactionProfile     = profile;
-   sb.countSuggestedBindings = p->count;
+   sb.countSuggestedBindings = count;
    sb.suggestedBindings      = binds;
-   if (XR_FAILED(res = st->SuggestInteractionProfileBindings(st->instance,
-               &sb)))
+   res = st->SuggestInteractionProfileBindings(st->instance, &sb);
+
+   if (XR_FAILED(res) && count > p->count)
+   {
+      sb.countSuggestedBindings = p->count;
+      res = st->SuggestInteractionProfileBindings(st->instance, &sb);
+   }
+   if (XR_FAILED(res))
       RARCH_WARN("[OpenXR] Bindings refused for %s (%d).\n", p->path,
             (int)res);
    else
-      RARCH_LOG("[OpenXR] Bindings suggested for %s.\n", p->path);
+      RARCH_LOG("[OpenXR] Bindings suggested for %s%s.\n", p->path,
+            sb.countSuggestedBindings > p->count ? ", with the palm" : "");
 }
 
 static void input_openxr_release(input_openxr_t *st)
@@ -488,8 +568,16 @@ static void input_openxr_release(input_openxr_t *st)
    unsigned i;
    retro_atomic_store_release_int(&input_openxr_ready, 0);
    for (i = 0; i < INPUT_OPENXR_HANDS; i++)
+   {
       if (st->aim[i] && st->DestroySpace)
          st->DestroySpace(st->aim[i]);
+      if (st->grip[i] && st->DestroySpace)
+         st->DestroySpace(st->grip[i]);
+      if (st->palm[i] && st->DestroySpace)
+         st->DestroySpace(st->palm[i]);
+      if (st->trackers[i] && st->DestroyHandTrackerEXT)
+         st->DestroyHandTrackerEXT(st->trackers[i]);
+   }
    /* Its actions go with it. */
    for (i = 0; i < INPUT_OPENXR_SETS; i++)
       if (st->sets[i] && st->DestroyActionSet)
@@ -497,8 +585,58 @@ static void input_openxr_release(input_openxr_t *st)
    input_openxr_clear(st);
 }
 
+static void input_openxr_hand_trackers(input_openxr_t *st,
+      const openxr_input_handles_t *h)
+{
+   unsigned i;
+   XrResult res;
+   static const XrHandEXT hands[INPUT_OPENXR_HANDS] = {
+      XR_HAND_LEFT_EXT, XR_HAND_RIGHT_EXT };
+
+   if (     !INPUT_OPENXR_PROC(st, h->get_proc, h->instance,
+               CreateHandTrackerEXT)
+         || !INPUT_OPENXR_PROC(st, h->get_proc, h->instance,
+               DestroyHandTrackerEXT)
+         || !INPUT_OPENXR_PROC(st, h->get_proc, h->instance,
+               LocateHandJointsEXT))
+   {
+      RARCH_WARN("[OpenXR] No hand joints: the runtime lacks the hand tracking functions.\n");
+      return;
+   }
+   for (i = 0; i < INPUT_OPENXR_HANDS; i++)
+   {
+      XrHandTrackerCreateInfoEXT ci;
+      XrHandTrackingDataSourceInfoEXT src;
+      /* Seen hands, and hands guessed around a held controller. */
+      XrHandTrackingDataSourceEXT sources[2] = {
+         XR_HAND_TRACKING_DATA_SOURCE_UNOBSTRUCTED_EXT,
+         XR_HAND_TRACKING_DATA_SOURCE_CONTROLLER_EXT };
+      src.type                     = XR_TYPE_HAND_TRACKING_DATA_SOURCE_INFO_EXT;
+      src.next                     = NULL;
+      src.requestedDataSourceCount = 2;
+      src.requestedDataSources     = sources;
+      ci.type                      = XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT;
+      ci.next                      = h->hand_data_source ? &src : NULL;
+      ci.hand                      = hands[i];
+      ci.handJointSet              = XR_HAND_JOINT_SET_DEFAULT_EXT;
+      if (XR_FAILED(res = st->CreateHandTrackerEXT(h->session, &ci,
+                  &st->trackers[i])))
+      {
+         RARCH_WARN("[OpenXR] No hand joints (xrCreateHandTrackerEXT: %d).\n",
+               (int)res);
+         if (i && st->trackers[0])
+            st->DestroyHandTrackerEXT(st->trackers[0]);
+         st->trackers[0] = XR_NULL_HANDLE;
+         st->trackers[1] = XR_NULL_HANDLE;
+         return;
+      }
+   }
+   st->hand_data_source = h->hand_data_source;
+   RARCH_LOG("[OpenXR] Hand joints tracked.\n");
+}
+
 static void input_openxr_session_created(void *user,
-      const vulkan_openxr_handles_t *h)
+      const openxr_input_handles_t *h)
 {
    unsigned i;
    XrResult res             = XR_SUCCESS;
@@ -516,7 +654,7 @@ static void input_openxr_session_created(void *user,
    }
    st->instance    = h->instance;
    st->session     = h->session;
-   st->local_space = h->local_space;
+   st->palm_pose   = h->palm_pose;
    if (     XR_FAILED(res = st->StringToPath(h->instance,
                "/user/hand/left", &st->hands[0]))
          || XR_FAILED(res = st->StringToPath(h->instance,
@@ -529,8 +667,9 @@ static void input_openxr_session_created(void *user,
    for (i = 0; i < INPUT_OPENXR_SETS; i++)
    {
       XrActionSetCreateInfo ci;
-      memset(&ci, 0, sizeof(ci));
-      ci.type = XR_TYPE_ACTION_SET_CREATE_INFO;
+      ci.type     = XR_TYPE_ACTION_SET_CREATE_INFO;
+      ci.next     = NULL;
+      ci.priority = 0;
       strlcpy(ci.actionSetName, input_openxr_set_names[i],
             sizeof(ci.actionSetName));
       strlcpy(ci.localizedActionSetName, input_openxr_set_labels[i],
@@ -546,9 +685,11 @@ static void input_openxr_session_created(void *user,
    {
       XrActionCreateInfo ci;
       const input_openxr_action_def_t *d = &input_openxr_actions[i];
-      memset(&ci, 0, sizeof(ci));
-      ci.type       = XR_TYPE_ACTION_CREATE_INFO;
-      ci.actionType = d->type;
+      ci.type                = XR_TYPE_ACTION_CREATE_INFO;
+      ci.next                = NULL;
+      ci.countSubactionPaths = 0;
+      ci.subactionPaths      = NULL;
+      ci.actionType          = d->type;
       strlcpy(ci.actionName, d->name, sizeof(ci.actionName));
       strlcpy(ci.localizedActionName, d->label,
             sizeof(ci.localizedActionName));
@@ -571,8 +712,8 @@ static void input_openxr_session_created(void *user,
 
    /* All three are attached; each poll syncs the pad set in use and the
     * pointer set. */
-   memset(&ai, 0, sizeof(ai));
    ai.type            = XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO;
+   ai.next            = NULL;
    ai.countActionSets = INPUT_OPENXR_SETS;
    ai.actionSets      = st->sets;
    if (XR_FAILED(res = st->AttachSessionActionSets(h->session, &ai)))
@@ -584,8 +725,14 @@ static void input_openxr_session_created(void *user,
    for (i = 0; i < INPUT_OPENXR_HANDS; i++)
    {
       XrActionSpaceCreateInfo si;
-      memset(&si, 0, sizeof(si));
       si.type                            = XR_TYPE_ACTION_SPACE_CREATE_INFO;
+      si.next                            = NULL;
+      si.poseInActionSpace.orientation.x = 0.0f;
+      si.poseInActionSpace.orientation.y = 0.0f;
+      si.poseInActionSpace.orientation.z = 0.0f;
+      si.poseInActionSpace.position.x    = 0.0f;
+      si.poseInActionSpace.position.y    = 0.0f;
+      si.poseInActionSpace.position.z    = 0.0f;
       si.action                          = st->actions[IXA_AIM];
       si.subactionPath                   = st->hands[i];
       si.poseInActionSpace.orientation.w = 1.0f;
@@ -595,9 +742,27 @@ static void input_openxr_session_created(void *user,
          step = "xrCreateActionSpace";
          goto error;
       }
+      si.action = st->actions[IXA_GRIP];
+      if (XR_FAILED(res = st->CreateActionSpace(h->session, &si,
+                  &st->grip[i])))
+      {
+         step = "xrCreateActionSpace";
+         goto error;
+      }
+      si.action = st->actions[IXA_PALM];
+      if (     st->palm_pose
+            && XR_FAILED(res = st->CreateActionSpace(h->session, &si,
+                  &st->palm[i])))
+      {
+         step = "xrCreateActionSpace";
+         goto error;
+      }
    }
 
-   st->xr = h->xr;
+   if (h->hand_tracking)
+      input_openxr_hand_trackers(st, h);
+
+   st->frame = h->frame;
    retro_atomic_store_release_int(&input_openxr_ready, 1);
    RARCH_LOG("[OpenXR] Headset controllers ready.\n");
    return;
@@ -608,10 +773,9 @@ error:
    input_openxr_release(st);
 }
 
-static void input_openxr_session_destroying(void *user, vulkan_openxr_t *xr)
+static void input_openxr_session_destroying(void *user)
 {
    (void)user;
-   (void)xr;
    input_openxr_release(&input_openxr_st);
 }
 
@@ -627,8 +791,8 @@ static int16_t input_openxr_axis(float v)
 static void input_openxr_get_info(input_openxr_t *st, unsigned a,
       XrPath hand, XrActionStateGetInfo *gi)
 {
-   memset(gi, 0, sizeof(*gi));
    gi->type          = XR_TYPE_ACTION_STATE_GET_INFO;
+   gi->next          = NULL;
    gi->action        = st->actions[a];
    gi->subactionPath = hand;
 }
@@ -638,8 +802,10 @@ static bool input_openxr_bool(input_openxr_t *st, unsigned a, XrPath hand)
    XrActionStateGetInfo gi;
    XrActionStateBoolean s;
    input_openxr_get_info(st, a, hand, &gi);
-   memset(&s, 0, sizeof(s));
-   s.type = XR_TYPE_ACTION_STATE_BOOLEAN;
+   s.type         = XR_TYPE_ACTION_STATE_BOOLEAN;
+   s.next         = NULL;
+   s.currentState = XR_FALSE;
+   s.isActive     = XR_FALSE;
    return XR_SUCCEEDED(st->GetActionStateBoolean(st->session, &gi, &s))
       && s.isActive && s.currentState;
 }
@@ -649,8 +815,10 @@ static float input_openxr_float(input_openxr_t *st, unsigned a, XrPath hand)
    XrActionStateGetInfo gi;
    XrActionStateFloat s;
    input_openxr_get_info(st, a, hand, &gi);
-   memset(&s, 0, sizeof(s));
-   s.type = XR_TYPE_ACTION_STATE_FLOAT;
+   s.type         = XR_TYPE_ACTION_STATE_FLOAT;
+   s.next         = NULL;
+   s.currentState = 0.0f;
+   s.isActive     = XR_FALSE;
    if (     XR_FAILED(st->GetActionStateFloat(st->session, &gi, &s))
          || !s.isActive)
       return 0.0f;
@@ -664,13 +832,38 @@ static void input_openxr_stick(input_openxr_t *st, unsigned a, XrPath hand,
    XrActionStateGetInfo gi;
    XrActionStateVector2f s;
    input_openxr_get_info(st, a, hand, &gi);
-   memset(&s, 0, sizeof(s));
-   s.type = XR_TYPE_ACTION_STATE_VECTOR2F;
+   s.type           = XR_TYPE_ACTION_STATE_VECTOR2F;
+   s.next           = NULL;
+   s.currentState.x = 0.0f;
+   s.currentState.y = 0.0f;
+   s.isActive       = XR_FALSE;
    if (     XR_FAILED(st->GetActionStateVector2f(st->session, &gi, &s))
          || !s.isActive)
       return;
    xy[0] = input_openxr_axis(s.currentState.x);
    xy[1] = input_openxr_axis(-s.currentState.y);
+}
+
+/* Touch's one menu button: Start while it is held, and the RetroArch
+ * menu too when let go after a second. */
+static void input_openxr_start_menu(input_openxr_t *st, bool down,
+      input_openxr_pad_t *pad)
+{
+   retro_time_t now;
+   if (!down)
+   {
+      st->start_menu_held = false;
+      return;
+   }
+   now = cpu_features_get_time_usec();
+   if (!st->start_menu_held)
+   {
+      st->start_menu_held  = true;
+      st->start_menu_since = now;
+   }
+   pad->buttons |= (uint16_t)(1u << RETRO_DEVICE_ID_JOYPAD_START);
+   if (now - st->start_menu_since >= INPUT_OPENXR_MENU_HOLD)
+      st->menu_toggle = true;
 }
 
 static void input_openxr_read_combined(input_openxr_t *st)
@@ -694,12 +887,16 @@ static void input_openxr_read_combined(input_openxr_t *st)
    st->menu_toggle   = input_openxr_bool(st, IXA_C_MENU, XR_NULL_PATH);
    st->recenter      = input_openxr_bool(st, IXA_C_RECENTER, XR_NULL_PATH);
    st->laser_toggle  = input_openxr_bool(st, IXA_C_LASER, XR_NULL_PATH);
+   st->view_toggle   = input_openxr_bool(st, IXA_C_VIEW, XR_NULL_PATH);
+   input_openxr_start_menu(st,
+         input_openxr_bool(st, IXA_C_START_MENU, XR_NULL_PATH), pad);
 }
 
 /* The left hand player 1, the right player 2. */
 static void input_openxr_read_separate(input_openxr_t *st)
 {
    unsigned h;
+   st->start_menu_held = false;
    for (h = 0; h < INPUT_OPENXR_HANDS; h++)
    {
       XrPath hand             = st->hands[h];
@@ -720,6 +917,7 @@ static void input_openxr_read_separate(input_openxr_t *st)
    st->menu_toggle  = input_openxr_bool(st, IXA_S_MENU, XR_NULL_PATH);
    st->recenter     = input_openxr_bool(st, IXA_S_RECENTER, XR_NULL_PATH);
    st->laser_toggle = input_openxr_bool(st, IXA_S_LASER, XR_NULL_PATH);
+   st->view_toggle  = input_openxr_bool(st, IXA_S_VIEW, XR_NULL_PATH);
 }
 
 static bool input_openxr_pressing(enum input_openxr_role role)
@@ -764,38 +962,10 @@ static void input_openxr_triggers(input_openxr_t *st, float threshold)
    }
 }
 
-/* Analog to Digital as a gamepad on the port gets it: the D-pad (or
- * Twin Stick's face buttons) from the sticks the mode takes, which then
- * read as centred. The menu reads the sticks itself, as it does a
- * gamepad's. */
-static void input_openxr_dpad(input_openxr_t *st, float threshold)
-{
-   unsigned p;
-#ifdef HAVE_MENU
-   if (menu_driver_alive())
-      return;
-#endif
-   for (p = 0; p < INPUT_OPENXR_PADS; p++)
-   {
-      input_openxr_pad_t *pad = &st->pads[p];
-      unsigned mode           = input_driver_analog_dpad_mode(p);
-      pad->buttons |= input_driver_analog_dpad_buttons(mode, pad->analog,
-            threshold);
-      if (     mode == ANALOG_DPAD_LSTICK
-            || mode == ANALOG_DPAD_LRSTICK
-            || mode == ANALOG_DPAD_TWINSTICK)
-         pad->analog[0] = pad->analog[1] = 0;
-      if (     mode == ANALOG_DPAD_RSTICK
-            || mode == ANALOG_DPAD_LRSTICK
-            || mode == ANALOG_DPAD_TWINSTICK)
-         pad->analog[2] = pad->analog[3] = 0;
-   }
-}
-
-/* A hand's aim ray in LOCAL space at time, when it is tracked. Either
+/* A hand's aim ray in space at time, when it is tracked. Either
  * thread: it only reads what the session hooks wrote. */
 static bool input_openxr_ray(const input_openxr_t *st, unsigned h,
-      XrTime time, video_xr_vec3_t *o, video_xr_vec3_t *d)
+      XrSpace space, XrTime time, video_xr_vec3_t *o, video_xr_vec3_t *d)
 {
    XrSpaceLocation loc;
    video_xr_quat_t q;
@@ -803,11 +973,11 @@ static bool input_openxr_ray(const input_openxr_t *st, unsigned h,
    XrSpaceLocationFlags valid = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT
       | XR_SPACE_LOCATION_POSITION_VALID_BIT;
 
-   memset(&loc, 0, sizeof(loc));
-   loc.type = XR_TYPE_SPACE_LOCATION;
+   loc.type          = XR_TYPE_SPACE_LOCATION;
+   loc.next          = NULL;
+   loc.locationFlags = 0;
    if (     !st->aim[h] || !time
-         || XR_FAILED(st->LocateSpace(st->aim[h], st->local_space, time,
-               &loc))
+         || XR_FAILED(st->LocateSpace(st->aim[h], space, time, &loc))
          || (loc.locationFlags & valid) != valid)
       return false;
    q.x   = loc.pose.orientation.x;
@@ -826,15 +996,31 @@ static bool input_openxr_ray(const input_openxr_t *st, unsigned h,
 }
 
 /* A point on a screen's quad as the core's pointer coordinates: into
- * the core's view map when it has one, over the whole frame when not. */
+ * the core's view map when it has one, over the whole frame when not.
+ * A window has the frame where the video driver's viewport puts it, as
+ * the window's own pointer does. */
 static bool input_openxr_frame_point(const video_xr_quad_t *q, float u,
       float v, int16_t *x, int16_t *y)
 {
    unsigned dims                = 0;
    const video_views_map_t *map = NULL;
+   if (q->kind == VIDEO_XR_QUAD_WINDOW)
+   {
+      video_viewport_t vp;
+      if (     !video_driver_get_viewport_info(&vp)
+            || !video_xr_window_point(&vp, &u, &v))
+         return false;
+   }
    if (!video_driver_get_views_core(&map, &dims))
       return false;
    return video_xr_quad_to_frame(q, u, v, map, dims, x, y);
+}
+
+/* The menu's own quad, or a window while the menu is open over it. */
+static bool input_openxr_on_menu(const video_xr_quad_t *q, bool menu_open)
+{
+   return q->kind == VIDEO_XR_QUAD_MENU
+      || (q->kind == VIDEO_XR_QUAD_WINDOW && menu_open);
 }
 
 /* Where each hand points, which hand is the pointer, and what it points
@@ -852,6 +1038,7 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
    bool pulled[INPUT_OPENXR_HANDS];
    bool tracked[INPUT_OPENXR_HANDS];
    XrTime time              = 0;
+   XrSpace space            = XR_NULL_HANDLE;
    const video_xr_quad_t *q = NULL;
    bool menu_live           = false;
    bool touch_on            = st->touch_on;
@@ -873,22 +1060,23 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
          st->role[h] = INPUT_OPENXR_ROLE_SPENT;
    }
 
-   st->pointer = -1;
+   st->pointer         = -1;
+   st->quads.num_quads = 0;
    if (     laser != VIDEO_OPENXR_LASER_OFF
-         && (time = vulkan_openxr_predicted_time(st->xr))
-         && vulkan_openxr_get_quads(st->xr, &st->quads))
-      for (i = 0; i < st->quads.num_quads; i++)
-      {
-         const video_xr_quad_t *lq = &st->quads.quads[i];
-         if (!video_xr_quad_live(lq, laser, menu_open))
-            continue;
-         /* Without a live screen, the mouse and the overlay keep the
-          * core's pointer and gun. */
-         if (lq->kind == VIDEO_XR_QUAD_MENU)
-            menu_live     = true;
-         else
-            st->ptr_owned = true;
-      }
+         && (time = openxr_frame_predicted_time(st->frame)))
+      openxr_frame_get_shown_quads(st->frame, &st->quads, &space);
+   for (i = 0; i < st->quads.num_quads; i++)
+   {
+      const video_xr_quad_t *lq = &st->quads.quads[i];
+      if (!video_xr_quad_live(lq, laser, menu_open))
+         continue;
+      /* Without a live screen, the mouse and the overlay keep the
+       * core's pointer and gun. */
+      if (input_openxr_on_menu(lq, menu_open))
+         menu_live     = true;
+      else
+         st->ptr_owned = true;
+   }
    /* A press ends with its quads. */
    for (h = 0; h < INPUT_OPENXR_HANDS; h++)
       if (     (st->role[h] == INPUT_OPENXR_ROLE_MENU && !menu_live)
@@ -904,7 +1092,7 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
       video_xr_vec3_t o, d;
       /* A press keeps its hand off the quads too. */
       can[h]     = input_openxr_pressing(st->role[h]);
-      tracked[h] = input_openxr_ray(st, h, time, &o, &d);
+      tracked[h] = input_openxr_ray(st, h, space, time, &o, &d);
       if (tracked[h])
       {
          st->hit[h] = video_xr_pick(&st->quads, laser, menu_open, &o, &d,
@@ -937,8 +1125,8 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
             st->role[h] = INPUT_OPENXR_ROLE_SPENT;
       }
       else if (pulled[h] && st->hit[h] >= 0)
-         st->role[h] = (st->quads.quads[st->hit[h]].kind
-               == VIDEO_XR_QUAD_MENU)
+         st->role[h] = input_openxr_on_menu(
+               &st->quads.quads[st->hit[h]], menu_open)
             ? INPUT_OPENXR_ROLE_MENU : INPUT_OPENXR_ROLE_TOUCH;
       else if (pulled[h] && laser == VIDEO_OPENXR_LASER_ALWAYS)
          st->role[h] = INPUT_OPENXR_ROLE_TOUCH;
@@ -953,7 +1141,7 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
    if (st->role[p] == INPUT_OPENXR_ROLE_MENU)
    {
       /* Off the quad, the press stays where it left it. */
-      if (q && q->kind == VIDEO_XR_QUAD_MENU)
+      if (q && input_openxr_on_menu(q, menu_open))
       {
          st->menu_u = st->hit_u[p];
          st->menu_v = st->hit_v[p];
@@ -962,7 +1150,7 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
       st->menu_pressed = !lift;
       return;
    }
-   if (q && q->kind == VIDEO_XR_QUAD_MENU)
+   if (q && input_openxr_on_menu(q, menu_open))
    {
       st->menu_on = true;
       st->menu_u  = st->hit_u[p];
@@ -1050,6 +1238,7 @@ static unsigned input_openxr_frame_layers(void *user, XrTime time,
    XrSwapchain cursor;
    video_xr_quad_set_t set;
    unsigned n         = 0;
+   XrSpace space      = XR_NULL_HANDLE;
    input_openxr_t *st = &input_openxr_st;
    int config         = retro_atomic_load_acquire_int(
          &input_openxr_pointer_config);
@@ -1057,11 +1246,11 @@ static unsigned input_openxr_frame_layers(void *user, XrTime time,
    bool menu_open     = (config & INPUT_OPENXR_MENU_OPEN) != 0;
    (void)user;
 
-   if (     !st->xr || laser == VIDEO_OPENXR_LASER_OFF
-         || !vulkan_openxr_focused(st->xr)
-         || !(cursor = vulkan_openxr_cursor(st->xr))
-         || !vulkan_openxr_get_quads(st->xr, &set))
+   if (     !st->frame || laser == VIDEO_OPENXR_LASER_OFF
+         || !openxr_session_focused(st->frame->session)
+         || !(cursor = openxr_frame_cursor(st->frame)))
       return 0;
+   openxr_frame_get_shown_quads(st->frame, &set, &space);
    for (h = 0; h < INPUT_OPENXR_HANDS && n < cap; h++)
    {
       int q;
@@ -1069,20 +1258,23 @@ static unsigned input_openxr_frame_layers(void *user, XrTime time,
       video_xr_pose_t pose;
       video_xr_vec3_t o, d;
       XrCompositionLayerQuad *l = &st->cursors[h];
-      if (     !input_openxr_ray(st, h, time, &o, &d)
+      if (     !input_openxr_ray(st, h, space, time, &o, &d)
             || (q = video_xr_pick(&set, (unsigned)laser, menu_open,
                   &o, &d, &u, &v, &t)) < 0)
          continue;
       size = video_xr_cursor(&set.quads[q], u, v, t, &pose);
-      memset(l, 0, sizeof(*l));
       l->type                             = XR_TYPE_COMPOSITION_LAYER_QUAD;
+      l->next                             = NULL;
+      l->subImage.imageRect.offset.x      = 0;
+      l->subImage.imageRect.offset.y      = 0;
+      l->subImage.imageArrayIndex         = 0;
       l->layerFlags                       =
          XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-      l->space                            = st->local_space;
+      l->space                            = space;
       l->eyeVisibility                    = XR_EYE_VISIBILITY_BOTH;
       l->subImage.swapchain               = cursor;
-      l->subImage.imageRect.extent.width  = VULKAN_OPENXR_CURSOR_DIM;
-      l->subImage.imageRect.extent.height = VULKAN_OPENXR_CURSOR_DIM;
+      l->subImage.imageRect.extent.width  = VIDEO_XR_CURSOR_DIM;
+      l->subImage.imageRect.extent.height = VIDEO_XR_CURSOR_DIM;
       l->pose.orientation.x               = pose.orientation.x;
       l->pose.orientation.y               = pose.orientation.y;
       l->pose.orientation.z               = pose.orientation.z;
@@ -1136,15 +1328,15 @@ static void input_openxr_haptics(input_openxr_t *st, bool separate,
             && (amp <= 0.0f
                || now - st->haptic_time[h] < INPUT_OPENXR_HAPTIC_REFRESH))
          continue;
-      memset(&info, 0, sizeof(info));
       info.type          = XR_TYPE_HAPTIC_ACTION_INFO;
+      info.next          = NULL;
       info.action        = st->actions[IXA_RUMBLE];
       info.subactionPath = st->hands[h];
       if (amp > 0.0f)
       {
          XrHapticVibration vib;
-         memset(&vib, 0, sizeof(vib));
          vib.type      = XR_TYPE_HAPTIC_VIBRATION;
+         vib.next      = NULL;
          vib.duration  = INPUT_OPENXR_HAPTIC_DURATION;
          vib.frequency = XR_FREQUENCY_UNSPECIFIED;
          vib.amplitude = amp;
@@ -1162,8 +1354,248 @@ static void input_openxr_haptics(input_openxr_t *st, bool separate,
    }
 }
 
-void input_openxr_poll(unsigned controllers, unsigned laser,
-      float threshold)
+/* The pad in @slot, or -1. */
+static int input_openxr_pad_of(unsigned slot)
+{
+   unsigned p;
+   for (p = 0; p < INPUT_OPENXR_PADS; p++)
+      if (input_openxr_devs.slot[p] == (int)slot)
+         return (int)p;
+   return -1;
+}
+
+static const char *input_openxr_device_name(unsigned p)
+{
+   if (p)
+      return INPUT_OPENXR_JOYPAD_RIGHT;
+   return input_openxr_devs.count < 2 ? INPUT_OPENXR_JOYPAD_COMBINED
+      : INPUT_OPENXR_JOYPAD_LEFT;
+}
+
+/* Pad @p's device reported in its slot. Its layout is RetroArch's own,
+ * the runtime binding the controllers, so its profile loads with
+ * autodetect off too. */
+static void input_openxr_announce(unsigned p)
+{
+   input_openxr_devs.landed[p] = false;
+   input_autoconfigure_connect_ex(input_openxr_device_name(p), NULL, NULL,
+         INPUT_OPENXR_JOYPAD, (unsigned)input_openxr_devs.slot[p], 0, 0,
+         AUTOCONF_FLAG_AUTOCONFIG_ENABLED);
+}
+
+/* The lowest slot no controller has, as a pad plugged in gets. */
+static int input_openxr_free_slot(void)
+{
+   unsigned s;
+   for (s = 0; s < MAX_USERS; s++)
+      if (!input_config_get_device_name(s) && input_openxr_pad_of(s) < 0)
+         return (int)s;
+   return -1;
+}
+
+/* A device for each pad the session's controllers make: none without
+ * them or once the session has ended, one in Combined, a hand each in
+ * Separate. */
+static void input_openxr_devices(unsigned max_users, bool separate)
+{
+   unsigned p;
+   input_openxr_devices_t *dv = &input_openxr_devs;
+   input_openxr_t *st         = &input_openxr_st;
+   /* an ended session keeps its controllers until the driver goes */
+   bool ended                 = st->frame
+      && openxr_session_ended(st->frame->session);
+   unsigned want              = (!input_openxr_active() || ended) ? 0
+      : separate ? 2 : 1;
+   /* a connect still to come may be for a slot that looks free */
+   bool pending               = input_autoconfigure_pending();
+
+   /* Gone once its connect has landed, so the registry is told of the
+    * one before the other. */
+   for (p = want; p < INPUT_OPENXR_PADS; p++)
+   {
+      dv->lost[p] = -1;
+      if (dv->slot[p] >= 0 && dv->landed[p])
+      {
+         input_autoconfigure_disconnect((unsigned)dv->slot[p],
+               input_openxr_device_name(p));
+         dv->slot[p]   = -1;
+         dv->landed[p] = false;
+      }
+   }
+   if (!want)
+   {
+      dv->warned = false;
+      return;
+   }
+   /* A mode switch renames the first in place, so the left hand keeps
+    * the pair's port. */
+   if (want != dv->count)
+   {
+      dv->count = want;
+      if (dv->slot[0] >= 0)
+         input_openxr_announce(0);
+   }
+
+   for (p = 0; p < want; p++)
+   {
+      int s = dv->slot[p];
+      if (s >= 0)
+      {
+         /* forgotten, as a config load forgets */
+         if (     dv->landed[p]
+               && !input_config_get_device_autoconfigured((unsigned)s))
+            input_openxr_announce(p);
+         continue;
+      }
+      if (pending)
+         continue;
+      if ((s = input_openxr_free_slot()) < 0)
+      {
+         if (!dv->warned)
+            RARCH_WARN("[OpenXR] No free slot for the headset's controllers.\n");
+         dv->warned = true;
+         continue;
+      }
+      dv->slot[p] = s;
+      /* a pad took its slot: the port goes where it went, for this run */
+      if (dv->lost[p] >= 0)
+         input_driver_exchange_ports((unsigned)dv->lost[p], (unsigned)s);
+      dv->lost[p] = -1;
+      input_openxr_announce(p);
+      if ((unsigned)s >= max_users && !dv->warned)
+      {
+         RARCH_WARN("[OpenXR] The headset's controllers are in slot %d, past Max Users (%u).\n",
+               s, max_users);
+         dv->warned = true;
+      }
+   }
+}
+
+/* The joypad driver readers get while the devices have slots: theirs
+ * answered from their pads, the RetroPad's ids as buttons, the sticks
+ * as axes 0 to 3 and L2 and R2 as 4 and 5, every other slot by the
+ * driver under them. */
+static const input_openxr_pad_t *input_openxr_slot_pad(unsigned slot)
+{
+   int p = input_openxr_pad_of(slot);
+   return p >= 0 ? &input_openxr_st.pads[p] : NULL;
+}
+
+static int16_t input_openxr_pad_axis(const input_openxr_pad_t *pad,
+      unsigned axis)
+{
+   if (axis < 4)
+      return pad->analog[axis];
+   return pad->trigger[axis - 4];
+}
+
+static bool input_openxr_joypad_query(unsigned pad)
+{
+   if (input_openxr_slot_pad(pad))
+      return true;
+   return input_openxr_inner->query_pad
+      && input_openxr_inner->query_pad(pad);
+}
+
+static int32_t input_openxr_joypad_button(unsigned port, uint16_t joykey)
+{
+   const input_openxr_pad_t *pad = input_openxr_slot_pad(port);
+   if (!pad)
+      return input_openxr_inner->button
+         ? input_openxr_inner->button(port, joykey) : 0;
+   return joykey < RARCH_FIRST_CUSTOM_BIND
+      && (pad->buttons & (1u << joykey));
+}
+
+static int16_t input_openxr_joypad_axis(unsigned port, uint32_t joyaxis)
+{
+   int16_t v;
+   const input_openxr_pad_t *pad = input_openxr_slot_pad(port);
+   if (!pad)
+      return input_openxr_inner->axis
+         ? input_openxr_inner->axis(port, joyaxis) : 0;
+   if (AXIS_NEG_GET(joyaxis) < 6)
+   {
+      v = input_openxr_pad_axis(pad, AXIS_NEG_GET(joyaxis));
+      return v < 0 ? v : 0;
+   }
+   if (AXIS_POS_GET(joyaxis) < 6)
+   {
+      v = input_openxr_pad_axis(pad, AXIS_POS_GET(joyaxis));
+      return v > 0 ? v : 0;
+   }
+   return 0;
+}
+
+static int16_t input_openxr_joypad_state(rarch_joypad_info_t *joypad_info,
+      const uint16_t *joykeys, const uint32_t *joyaxes, unsigned port)
+{
+   int i;
+   int16_t ret       = 0;
+   uint16_t port_idx = joypad_info->joy_idx;
+
+   if (!input_openxr_slot_pad(port_idx))
+      return input_openxr_inner->state ? input_openxr_inner->state(
+            joypad_info, joykeys, joyaxes, port) : 0;
+   for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
+   {
+      const uint64_t joykey  = joykeys[i];
+      const uint32_t joyaxis = joyaxes[i];
+      if (     (uint16_t)joykey != NO_BTN
+            && input_openxr_joypad_button(port_idx, (uint16_t)joykey))
+         ret |= (1 << i);
+      else if (joyaxis != AXIS_NONE &&
+            ((float)abs(input_openxr_joypad_axis(port_idx, joyaxis))
+             / 0x8000) > joypad_info->axis_threshold)
+         ret |= (1 << i);
+   }
+   return ret;
+}
+
+static void input_openxr_joypad_get_buttons(unsigned port,
+      input_bits_t *state)
+{
+   unsigned id;
+   const input_openxr_pad_t *pad = input_openxr_slot_pad(port);
+   if (!pad)
+   {
+      input_openxr_inner->get_buttons(port, state);
+      return;
+   }
+   BIT256_CLEAR_ALL_PTR(state);
+   for (id = 0; id < RARCH_FIRST_CUSTOM_BIND; id++)
+      if (pad->buttons & (1u << id))
+         BIT256_SET_PTR(state, id);
+}
+
+/* A core's rumble, applied at the next poll. */
+static bool input_openxr_joypad_rumble(unsigned pad,
+      enum retro_rumble_effect effect, uint16_t strength)
+{
+   int p;
+   if (pad >= MAX_USERS
+         || (effect != RETRO_RUMBLE_STRONG && effect != RETRO_RUMBLE_WEAK))
+      return false;
+   p = input_openxr_pad_of(pad);
+   if (p < 0)
+      return input_openxr_inner->set_rumble
+         && input_openxr_inner->set_rumble(pad, effect, strength);
+   retro_atomic_store_release_int(
+         &input_openxr_rumble[p][(effect == RETRO_RUMBLE_STRONG) ? 0 : 1],
+         (int)strength);
+   return input_openxr_active();
+}
+
+static const char *input_openxr_joypad_name(unsigned pad)
+{
+   int p = input_openxr_pad_of(pad);
+   if (p >= 0)
+      return input_openxr_device_name((unsigned)p);
+   return input_openxr_inner->name ? input_openxr_inner->name(pad) : NULL;
+}
+
+void input_openxr_poll(unsigned max_users, unsigned controllers,
+      unsigned laser, float threshold)
 {
    unsigned p;
    XrResult res;
@@ -1178,6 +1610,8 @@ void input_openxr_poll(unsigned controllers, unsigned laser,
 #else
    bool menu_open       = false;
 #endif
+
+   input_openxr_devices(max_users, separate);
 
    /* The XR thread places the dots by these: none while the laser
     * yields, which a closed menu or the laser Off ends. */
@@ -1201,6 +1635,7 @@ void input_openxr_poll(unsigned controllers, unsigned laser,
    st->menu_toggle  = false;
    st->recenter     = false;
    st->laser_toggle = false;
+   st->view_toggle  = false;
    st->hit[0]       = -1;
    st->hit[1]       = -1;
    st->ptr_owned    = false;
@@ -1209,13 +1644,17 @@ void input_openxr_poll(unsigned controllers, unsigned laser,
    st->gun_pressed  = false;
    st->menu_on      = false;
    st->menu_pressed = false;
-   if (!st->xr)
+   if (!st->frame)
+   {
+      st->start_menu_held = false;
       return;
-   if (!vulkan_openxr_focused(st->xr))
+   }
+   if (!openxr_session_focused(st->frame->session))
    {
       if (st->focused)
          RARCH_LOG("[OpenXR] Controllers released: the headset is not focused.\n");
       st->focused = false;
+      st->start_menu_held = false;
       input_openxr_triggers_lost(st);
       /* So their return is logged too. */
       st->mode    = -1;
@@ -1228,21 +1667,23 @@ void input_openxr_poll(unsigned controllers, unsigned laser,
    }
    st->focused = true;
 
-   memset(active, 0, sizeof(active));
    active[0].actionSet      = st->sets[separate
       ? INPUT_OPENXR_SET_SEPARATE : INPUT_OPENXR_SET_COMBINED];
+   active[0].subactionPath  = XR_NULL_PATH;
    active[1].actionSet      = st->sets[INPUT_OPENXR_SET_POINTER];
-   memset(&si, 0, sizeof(si));
+   active[1].subactionPath  = XR_NULL_PATH;
    si.type                  = XR_TYPE_ACTIONS_SYNC_INFO;
+   si.next                  = NULL;
    si.countActiveActionSets = 2;
    si.activeActionSets      = active;
    /* XR_SESSION_NOT_FOCUSED succeeds too, with nothing active. */
    if ((res = st->SyncActions(st->session, &si)) != XR_SUCCESS)
    {
-      if (res != st->sync_result)
+      if (res != st->sync_result && XR_FAILED(res))
          RARCH_WARN("[OpenXR] Controllers not read: xrSyncActions %d.\n",
                (int)res);
       st->sync_result = res;
+      st->start_menu_held = false;
       input_openxr_triggers_lost(st);
       return;
    }
@@ -1264,49 +1705,87 @@ void input_openxr_poll(unsigned controllers, unsigned laser,
          (int)laser | (menu_open ? INPUT_OPENXR_MENU_OPEN : 0));
    input_openxr_laser_poll(st, laser, menu_open, threshold, was_pressed);
    input_openxr_triggers(st, threshold);
-   input_openxr_dpad(st, threshold);
    input_openxr_haptics(st, separate,
          (run_flags & RUNLOOP_FLAG_PAUSED) ? true : false);
 }
 
-bool input_openxr_button(unsigned port, unsigned id)
+const input_device_driver_t *input_openxr_joypad(
+      const input_device_driver_t *joypad)
 {
-   input_openxr_t *st = &input_openxr_st;
-   if (id < RARCH_FIRST_CUSTOM_BIND)
-      return port < INPUT_OPENXR_PADS
-         && (st->pads[port].buttons & (1u << id));
+   input_device_driver_t *wrap;
+   if (     !joypad
+         || (input_openxr_devs.slot[0] < 0 && input_openxr_devs.slot[1] < 0))
+      return joypad;
+   if (joypad != input_openxr_inner)
+   {
+      input_openxr_wrap_cur ^= 1;
+      wrap                   = &input_openxr_wrap[input_openxr_wrap_cur];
+      *wrap                  = *joypad;
+      wrap->init             = NULL;
+      wrap->destroy          = NULL;
+      wrap->query_pad        = input_openxr_joypad_query;
+      wrap->button           = input_openxr_joypad_button;
+      wrap->state            = input_openxr_joypad_state;
+      wrap->axis             = input_openxr_joypad_axis;
+      wrap->set_rumble       = input_openxr_joypad_rumble;
+      wrap->name             = input_openxr_joypad_name;
+      if (joypad->get_buttons)
+         wrap->get_buttons   = input_openxr_joypad_get_buttons;
+      input_openxr_inner     = joypad;
+   }
+   return &input_openxr_wrap[input_openxr_wrap_cur];
+}
+
+bool input_openxr_has_slot(unsigned slot)
+{
+   return input_openxr_pad_of(slot) >= 0;
+}
+
+void input_openxr_slot_connected(unsigned slot, const char *provider)
+{
+   int p = input_openxr_pad_of(slot);
+   if (p < 0)
+      return;
+   if (string_is_equal(provider, INPUT_OPENXR_JOYPAD))
+      input_openxr_devs.landed[p] = true;
+   else
+   {
+      /* the pad's now; the device moves at the next poll */
+      input_openxr_devs.lost[p]   = (int)slot;
+      input_openxr_devs.slot[p]   = -1;
+      input_openxr_devs.landed[p] = false;
+   }
+}
+
+void input_openxr_reannounce(void)
+{
+   unsigned p;
+   for (p = 0; p < INPUT_OPENXR_PADS; p++)
+      if (input_openxr_devs.slot[p] >= 0)
+         input_openxr_announce(p);
+}
+
+bool input_openxr_autoconfigure(unsigned slot)
+{
+   int p = input_openxr_pad_of(slot);
+   if (p < 0)
+      return false;
+   input_openxr_announce((unsigned)p);
+   return true;
+}
+
+bool input_openxr_hotkey(unsigned id)
+{
+   const input_openxr_t *st = &input_openxr_st;
    if (id == RARCH_MENU_TOGGLE)
       return st->menu_toggle;
    if (id == RARCH_HEADSET_RECENTER)
       return st->recenter;
    if (id == RARCH_LASER_POINTER_TOGGLE)
       return st->laser_toggle;
+   if (id == RARCH_HEADSET_VIEW_TOGGLE)
+      return st->view_toggle;
    return false;
-}
-
-int16_t input_openxr_analog(unsigned port, unsigned idx, unsigned id,
-      int16_t res)
-{
-   int v                     = 0;
-   int r                     = res;
-   const input_openxr_pad_t *pad;
-   if (port >= INPUT_OPENXR_PADS)
-      return res;
-   pad = &input_openxr_st.pads[port];
-   if (idx == RETRO_DEVICE_INDEX_ANALOG_BUTTON)
-   {
-      if (id == RETRO_DEVICE_ID_JOYPAD_L2)
-         v = pad->trigger[0];
-      else if (id == RETRO_DEVICE_ID_JOYPAD_R2)
-         v = pad->trigger[1];
-   }
-   else if (     idx <= RETRO_DEVICE_INDEX_ANALOG_RIGHT
-              && id  <= RETRO_DEVICE_ID_ANALOG_Y)
-      v = pad->analog[idx * 2 + id];
-   /* Analog values keep the larger magnitude, as the overlay's do. */
-   if ((v < 0 ? -v : v) > (r < 0 ? -r : r))
-      return (int16_t)v;
-   return res;
 }
 
 bool input_openxr_pointer(unsigned port, unsigned device, unsigned idx,
@@ -1375,29 +1854,224 @@ bool input_openxr_menu_pointer(float *u, float *v, bool *pressed)
    return true;
 }
 
-bool input_openxr_set_rumble(unsigned port, enum retro_rumble_effect effect,
-      uint16_t strength)
+/* location and velocity. */
+static void input_openxr_vr_pose(const XrPosef *pose, XrSpaceLocationFlags lf,
+      const XrVector3f *lin, const XrVector3f *ang, XrSpaceVelocityFlags vf,
+      struct retro_vr_pose *out)
 {
-   if (port >= INPUT_OPENXR_PADS
-         || (effect != RETRO_RUMBLE_STRONG && effect != RETRO_RUMBLE_WEAK))
+   memset(out, 0, sizeof(*out));
+   if (lf & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)
+   {
+      out->orientation[0] = pose->orientation.x;
+      out->orientation[1] = pose->orientation.y;
+      out->orientation[2] = pose->orientation.z;
+      out->orientation[3] = pose->orientation.w;
+      out->flags         |= RETRO_VR_POSE_ORIENTATION_VALID;
+      if (lf & XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT)
+         out->flags      |= RETRO_VR_POSE_ORIENTATION_TRACKED;
+   }
+   if (lf & XR_SPACE_LOCATION_POSITION_VALID_BIT)
+   {
+      out->position[0]    = pose->position.x;
+      out->position[1]    = pose->position.y;
+      out->position[2]    = pose->position.z;
+      out->flags         |= RETRO_VR_POSE_POSITION_VALID;
+      if (lf & XR_SPACE_LOCATION_POSITION_TRACKED_BIT)
+         out->flags      |= RETRO_VR_POSE_POSITION_TRACKED;
+   }
+   if (vf & XR_SPACE_VELOCITY_LINEAR_VALID_BIT)
+   {
+      out->linear_velocity[0]  = lin->x;
+      out->linear_velocity[1]  = lin->y;
+      out->linear_velocity[2]  = lin->z;
+      out->flags              |= RETRO_VR_POSE_LINEAR_VELOCITY_VALID;
+   }
+   if (vf & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT)
+   {
+      out->angular_velocity[0] = ang->x;
+      out->angular_velocity[1] = ang->y;
+      out->angular_velocity[2] = ang->z;
+      out->flags              |= RETRO_VR_POSE_ANGULAR_VELOCITY_VALID;
+   }
+}
+
+static void input_openxr_locate_pose(const input_openxr_t *st,
+      XrSpace space, XrSpace base, XrTime time, struct retro_vr_pose *out)
+{
+   XrSpaceVelocity vel;
+   XrSpaceLocation loc;
+
+   memset(out, 0, sizeof(*out));
+   if (!space)
+      return;
+   vel.type = XR_TYPE_SPACE_VELOCITY;
+   vel.next = NULL;
+   loc.type = XR_TYPE_SPACE_LOCATION;
+   loc.next = &vel;
+   if (XR_FAILED(st->LocateSpace(space, base, time, &loc)))
+      return;
+   input_openxr_vr_pose(&loc.pose, loc.locationFlags, &vel.linearVelocity,
+         &vel.angularVelocity, vel.velocityFlags, out);
+}
+
+/* The joints are copied by index: libretro's order is OpenXR's. */
+typedef char input_openxr_joint_order_check[
+   (     (int)RETRO_VR_HAND_JOINT_COUNT      == (int)XR_HAND_JOINT_COUNT_EXT
+      && (int)RETRO_VR_HAND_JOINT_WRIST      == (int)XR_HAND_JOINT_WRIST_EXT
+      && (int)RETRO_VR_HAND_JOINT_LITTLE_TIP == (int)XR_HAND_JOINT_LITTLE_TIP_EXT)
+   ? 1 : -1];
+
+static void input_openxr_locate_joints(const input_openxr_t *st,
+      unsigned h, XrSpace base, XrTime time, struct retro_vr_hand_state *out)
+{
+   unsigned j;
+   XrHandJointsLocateInfoEXT li;
+   XrHandJointLocationsEXT locs;
+   XrHandJointVelocitiesEXT vels;
+   XrHandTrackingDataSourceStateEXT src;
+   XrHandJointLocationEXT jl[XR_HAND_JOINT_COUNT_EXT];
+   XrHandJointVelocityEXT jv[XR_HAND_JOINT_COUNT_EXT];
+
+   if (!st->trackers[h])
+      return;
+   li.type              = XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT;
+   li.next              = NULL;
+   li.baseSpace         = base;
+   li.time              = time;
+   src.type             = XR_TYPE_HAND_TRACKING_DATA_SOURCE_STATE_EXT;
+   src.next             = NULL;
+   vels.type            = XR_TYPE_HAND_JOINT_VELOCITIES_EXT;
+   vels.next            = st->hand_data_source ? &src : NULL;
+   vels.jointCount      = XR_HAND_JOINT_COUNT_EXT;
+   vels.jointVelocities = jv;
+   locs.type            = XR_TYPE_HAND_JOINT_LOCATIONS_EXT;
+   locs.next            = &vels;
+   locs.jointCount      = XR_HAND_JOINT_COUNT_EXT;
+   locs.jointLocations  = jl;
+   if (     XR_FAILED(st->LocateHandJointsEXT(st->trackers[h], &li, &locs))
+         || !locs.isActive)
+      return;
+
+   for (j = 0; j < RETRO_VR_HAND_JOINT_COUNT; j++)
+   {
+      input_openxr_vr_pose(&jl[j].pose, jl[j].locationFlags,
+            &jv[j].linearVelocity, &jv[j].angularVelocity,
+            jv[j].velocityFlags, &out->joints[j].pose);
+      out->joints[j].radius = jl[j].radius;
+   }
+   out->flags |= RETRO_VR_HAND_JOINTS;
+   if (st->hand_data_source && src.isActive)
+   {
+      if (src.dataSource == XR_HAND_TRACKING_DATA_SOURCE_UNOBSTRUCTED_EXT)
+         out->flags |= RETRO_VR_HAND_JOINTS_OPTICAL;
+      else if (src.dataSource == XR_HAND_TRACKING_DATA_SOURCE_CONTROLLER_EXT)
+         out->flags |= RETRO_VR_HAND_JOINTS_CONTROLLER;
+   }
+}
+
+static bool input_openxr_locate_hands(void *user, XrSpace base, XrTime time,
+      struct retro_vr_controller_poses *out)
+{
+   unsigned h;
+   const input_openxr_t *st = &input_openxr_st;
+   (void)user;
+
+   memset(out, 0, sizeof(*out));
+   if (!input_openxr_active())
       return false;
-   retro_atomic_store_release_int(
-         &input_openxr_rumble[port][(effect == RETRO_RUMBLE_STRONG) ? 0 : 1],
-         (int)strength);
-   return retro_atomic_load_acquire_int(&input_openxr_ready) != 0;
+   for (h = 0; h < INPUT_OPENXR_HANDS; h++)
+   {
+      struct retro_vr_hand_state *hs = &out->hands[h];
+      input_openxr_locate_pose(st, st->grip[h], base, time, &hs->grip);
+      input_openxr_locate_pose(st, st->aim[h],  base, time, &hs->aim);
+      input_openxr_locate_pose(st, st->palm[h], base, time, &hs->palm);
+      input_openxr_locate_joints(st, h, base, time, hs);
+   }
+   return true;
+}
+
+static bool input_openxr_pose_active(input_openxr_t *st, unsigned a,
+      XrPath hand)
+{
+   XrActionStateGetInfo gi;
+   XrActionStatePose s;
+   input_openxr_get_info(st, a, hand, &gi);
+   s.type = XR_TYPE_ACTION_STATE_POSE;
+   s.next = NULL;
+   return XR_SUCCEEDED(st->GetActionStatePose(st->session, &gi, &s))
+      && s.isActive;
+}
+
+void input_openxr_controller_poses(struct retro_vr_controller_poses *out)
+{
+   unsigned h;
+   input_openxr_t *st = &input_openxr_st;
+   /* The pose actions' states are those of the last sync. */
+   bool synced        = input_openxr_active() && st->focused
+      && st->sync_result == XR_SUCCESS;
+
+   for (h = 0; h < INPUT_OPENXR_HANDS; h++)
+   {
+      struct retro_vr_hand_state *hs = &out->hands[h];
+      bool held                      = false;
+
+      hs->interaction_profile = NULL;
+      if (synced)
+      {
+         XrInteractionProfileState ps;
+         held = input_openxr_pose_active(st, IXA_GRIP, st->hands[h])
+             || input_openxr_pose_active(st, IXA_AIM,  st->hands[h]);
+         ps.type = XR_TYPE_INTERACTION_PROFILE_STATE;
+         ps.next = NULL;
+         if (     XR_SUCCEEDED(st->GetCurrentInteractionProfile(st->session,
+                     st->hands[h], &ps))
+               && ps.interactionProfile != XR_NULL_PATH)
+         {
+            /* The string is looked up when the profile changes. */
+            if (ps.interactionProfile != st->profile_path[h])
+            {
+               uint32_t n = 0;
+               st->profile_path[h] = XR_NULL_PATH;
+               if (XR_SUCCEEDED(st->PathToString(st->instance,
+                           ps.interactionProfile, sizeof(st->profile[h]),
+                           &n, st->profile[h])))
+                  st->profile_path[h] = ps.interactionProfile;
+            }
+            if (st->profile_path[h] != XR_NULL_PATH)
+               hs->interaction_profile = st->profile[h];
+         }
+      }
+
+      if (!held)
+      {
+         memset(&hs->grip, 0, sizeof(hs->grip));
+         memset(&hs->aim,  0, sizeof(hs->aim));
+         memset(&hs->palm, 0, sizeof(hs->palm));
+      }
+      if (held || (hs->flags & RETRO_VR_HAND_JOINTS))
+         hs->flags |= RETRO_VR_HAND_ACTIVE;
+      else
+         memset(hs, 0, sizeof(*hs));
+   }
 }
 
 bool input_openxr_can_rumble(void)
+{
+   return input_openxr_active();
+}
+
+bool input_openxr_active(void)
 {
    return retro_atomic_load_acquire_int(&input_openxr_ready) != 0;
 }
 
 void input_openxr_register(void)
 {
-   vulkan_openxr_hooks_t hooks;
+   openxr_input_hooks_t hooks;
    hooks.session_created    = input_openxr_session_created;
    hooks.session_destroying = input_openxr_session_destroying;
    hooks.frame_layers       = input_openxr_frame_layers;
+   hooks.locate_hands       = input_openxr_locate_hands;
    hooks.user               = NULL;
-   vulkan_openxr_set_hooks(&hooks);
+   openxr_frame_set_input_hooks(&hooks);
 }

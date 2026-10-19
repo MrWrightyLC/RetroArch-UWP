@@ -33,11 +33,15 @@
 #ifdef __cplusplus
 extern const GUID DECLSPEC_SELECTANY libretro_IID_IDXGIOutput6 = { 0x068346e8,0xaaec,
 0x4b84, {0xad,0xd7,0x13,0x7f,0x51,0x3f,0x77,0xa1 } };
+extern const GUID DECLSPEC_SELECTANY libretro_IID_IDXGISwapChain2 = { 0xa8be2ac4,0x199f,
+0x4946, {0xb3,0x31,0x79,0x59,0x9f,0xb9,0x8d,0xe7 } };
 extern const GUID DECLSPEC_SELECTANY libretro_IID_IDXGISwapChain3 = { 0x94d99bdb,0xf1f8,
 0x4ab0, {0xb2,0x36,0x7d,0xa0,0x17,0x0e,0xda,0xb1 } };
 extern const GUID DECLSPEC_SELECTANY libretro_IID_IDXGISwapChain4 = { 0x3d585d5a,0xbd4a,
 0x489e, {0xb1,0xf4,0x3d,0xbc,0xb6,0x45,0x2f,0xfb } };
 #else
+const GUID DECLSPEC_SELECTANY libretro_IID_IDXGISwapChain2 = { 0xa8be2ac4,0x199f,
+0x4946, {0xb3,0x31,0x79,0x59,0x9f,0xb9,0x8d,0xe7 } };
 const GUID DECLSPEC_SELECTANY libretro_IID_IDXGIOutput6 = { 0x068346e8,0xaaec,
 0x4b84, {0xad,0xd7,0x13,0x7f,0x51,0x3f,0x77,0xa1 } };
 const GUID DECLSPEC_SELECTANY libretro_IID_IDXGISwapChain3 = { 0x94d99bdb,0xf1f8,
@@ -67,6 +71,11 @@ static bool dxgi_swapchain_implements(DXGISwapChain chain, const GUID *iid)
    ((IUnknown*)probe)->lpVtbl->Release((IUnknown*)probe);
 #endif
    return true;
+}
+
+bool dxgi_swapchain_waitable(DXGISwapChain chain)
+{
+   return dxgi_swapchain_implements(chain, &libretro_IID_IDXGISwapChain2);
 }
 
 #ifdef HAVE_DXGI_HDR
@@ -2863,6 +2872,10 @@ void dxgi_swapchain_color_space(
          *chain_color_space = color_space;
       }
    }
+   video_driver_set_hdr_output_mode(
+         *chain_color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+         ? 1 : (*chain_color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+         ? 2 : 0));
 }
 
 void dxgi_set_hdr_metadata(
@@ -2877,8 +2890,6 @@ void dxgi_set_hdr_metadata(
       float                         display_peak
 )
 {
-   /* TODO/FIXME - static globals - not thread-safe */
-   static DXGI_HDR_METADATA_HDR10 g_hdr10_meta_data = {0};
    static const display_chromaticities_t
       display_chromaticity_list[]                   =
    {
@@ -2970,27 +2981,16 @@ void dxgi_set_hdr_metadata(
    hdr10_meta_data.MaxFrameAverageLightLevel    =
       (UINT16)(max_fall);
 
-   if (memcmp(g_hdr10_meta_data.RedPrimary,   hdr10_meta_data.RedPrimary,   sizeof(hdr10_meta_data.RedPrimary))   ||
-       memcmp(g_hdr10_meta_data.GreenPrimary, hdr10_meta_data.GreenPrimary, sizeof(hdr10_meta_data.GreenPrimary)) ||
-       memcmp(g_hdr10_meta_data.BluePrimary,  hdr10_meta_data.BluePrimary,  sizeof(hdr10_meta_data.BluePrimary))  ||
-       memcmp(g_hdr10_meta_data.WhitePoint,   hdr10_meta_data.WhitePoint,   sizeof(hdr10_meta_data.WhitePoint))   ||
-       g_hdr10_meta_data.MaxContentLightLevel       != hdr10_meta_data.MaxContentLightLevel  ||
-       g_hdr10_meta_data.MaxMasteringLuminance      != hdr10_meta_data.MaxMasteringLuminance ||
-       g_hdr10_meta_data.MinMasteringLuminance      != hdr10_meta_data.MinMasteringLuminance ||
-       g_hdr10_meta_data.MaxFrameAverageLightLevel  != hdr10_meta_data.MaxFrameAverageLightLevel)
-   {
 #ifdef __cplusplus
-      if (FAILED(handle->SetHDRMetaData(
-                  DXGI_HDR_METADATA_TYPE_HDR10, sizeof(DXGI_HDR_METADATA_HDR10), &hdr10_meta_data)))
+   if (FAILED(handle->SetHDRMetaData(
+               DXGI_HDR_METADATA_TYPE_HDR10, sizeof(DXGI_HDR_METADATA_HDR10), &hdr10_meta_data)))
 #else
-      if (FAILED(handle->lpVtbl->SetHDRMetaData(handle,
-                  DXGI_HDR_METADATA_TYPE_HDR10, sizeof(DXGI_HDR_METADATA_HDR10), &hdr10_meta_data)))
+   if (FAILED(handle->lpVtbl->SetHDRMetaData(handle,
+               DXGI_HDR_METADATA_TYPE_HDR10, sizeof(DXGI_HDR_METADATA_HDR10), &hdr10_meta_data)))
 #endif
-      {
-         RARCH_ERR("[DXGI] Failed to set HDR meta data for HDR10.\n");
-         return;
-      }
-      g_hdr10_meta_data = hdr10_meta_data;
+   {
+      RARCH_ERR("[DXGI] Failed to set HDR meta data for HDR10.\n");
+      return;
    }
 }
 
@@ -3355,10 +3355,10 @@ void dxgi_hdr_meta_fill(
    meta->matrix_coefficients   = 0;  /* RGB (must be 0 for PNG) */
    meta->video_full_range_flag = 1;
 
-   meta->max_cll  = max_cll;
-   meta->max_fall = max_fall;
+   meta->max_cll               = max_cll;
+   meta->max_fall              = max_fall;
 
-   meta->write_mdcv = 1;
+   meta->write_mdcv            = 1;
    if (is_scrgb)
    {
       /* Rec.709 primaries. */

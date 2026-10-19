@@ -16,6 +16,7 @@ typedef unsigned VkPipelineStageFlags;
 #define VK_NULL_HANDLE 0
 struct fence_values {
    unsigned sType, waitSemaphoreValuesCount, signalSemaphoreValuesCount;
+   const void *pNext;
    const uint64_t *pWaitSemaphoreValues, *pSignalSemaphoreValues;
 };
 typedef struct fence_values VkD3D12FenceSubmitInfoKHR;
@@ -36,8 +37,8 @@ typedef struct presenter {
 static unsigned next_index, submissions;
 static int failed;
 static VkResult submit_result;
-static unsigned ra_dxgi_bridge_index(void *bridge)
-{ (void)bridge; return next_index; }
+static unsigned ra_dxgi_bridge_index(void *bridge, unsigned interval)
+{ (void)bridge; assert(interval == 0); return next_index; }
 static int ra_dxgi_bridge_failed(void *bridge)
 { (void)bridge; return failed; }
 static uint64_t ra_dxgi_bridge_last_use(void *bridge, unsigned index)
@@ -58,6 +59,7 @@ static VkResult ra_vulkan_dxgi_submit(ra_vulkan_dxgi_t *p,
 #define VK_COMMAND_BUFFER_LEVEL_PRIMARY 0
 typedef struct command_info {
    unsigned sType, commandPool, level, commandBufferCount;
+   const void *pNext;
 } VkCommandBufferAllocateInfo;
 static unsigned allocations;
 static VkResult allocation_result;
@@ -89,13 +91,13 @@ int main(void)
    ra_vulkan_dxgi_t p;
    memset(&p, 0, sizeof(p));
    next_index = ~0u;
-   assert(ra_vulkan_dxgi_acquire(&p, 1, VK_NULL_HANDLE, &index) == VK_NOT_READY);
+   assert(ra_vulkan_dxgi_acquire(&p, 1, VK_NULL_HANDLE, &index, 0) == VK_NOT_READY);
    assert(index == 0 && submissions == 0);
    failed = 1;
-   assert(ra_vulkan_dxgi_acquire(&p, 1, VK_NULL_HANDLE, &index) == VK_ERROR_OUT_OF_DATE_KHR);
+   assert(ra_vulkan_dxgi_acquire(&p, 1, VK_NULL_HANDLE, &index, 0) == VK_ERROR_OUT_OF_DATE_KHR);
    assert(index == 0 && submissions == 0);
    failed = 0; next_index = 1;
-   assert(ra_vulkan_dxgi_acquire(&p, 1, VK_NULL_HANDLE, &index) == VK_SUCCESS);
+   assert(ra_vulkan_dxgi_acquire(&p, 1, VK_NULL_HANDLE, &index, 0) == VK_SUCCESS);
    assert(index == 1 && submissions == 1);
    p.pool = 7;
    for (i = 0; i < 4; i++) assert(record_command(&p, 1, &buffers[i]));

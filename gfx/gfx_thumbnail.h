@@ -253,6 +253,7 @@ typedef struct
    /* The playback (gfx_surface_player_t*): its clock and loops, and
     * the decode, a frame ahead on a worker where there is one. */
    void *anim_player;
+   void *anim_lifetime;
    /* The GPU surface (gfx_surface_t*) the still goes to, and the
     * animation's frames are decoded into and shown from: one
     * persistent texture updated per frame, kept after the animation
@@ -310,6 +311,7 @@ static INLINE void gfx_thumbnail_init_blank(gfx_thumbnail_t *t)
    t->anim_dt         = NULL;
    t->anim_sess       = NULL;
    t->anim_player     = NULL;
+   t->anim_lifetime   = NULL;
    t->anim_surface    = NULL;
    t->anim_buf_len    = 0;
    t->list_id         = 0;
@@ -407,6 +409,16 @@ void gfx_thumbnail_anim_worker_deinit(void);
  *    gfx_thumbnail_process_stream(), otherwise
  *    heap-use-after-free errors *will* occur */
 void gfx_thumbnail_cancel_pending_requests(void);
+
+/* While on, still requests land decoded and are held instead of
+ * uploaded (at most four, by path); the next request for the same
+ * path uploads the held image without reading or decoding the file.
+ * For a menu whose thumbnails are not shown while content runs:
+ * requested as content starts, they upload when shown or on close. */
+void gfx_thumbnail_park_requests(bool park);
+
+/* Frees the held images */
+void gfx_thumbnail_parked_free(void);
 
 /* True if 'thumbnail' is waiting on a request that has since been
  * superseded, i.e. it is PENDING with nothing behind it.  Resets the

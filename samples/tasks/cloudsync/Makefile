@@ -60,6 +60,7 @@ ADDS_SOURCES := cloudsync_manifest_adds_test.c \
 	$(LIBRETRO_COMM_DIR)/features/features_cpu.c \
 	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.c
 PACING_TARGET := cloudsync_pacing_test
+COMMIT_TARGET := cloudsync_commit_test
 
 ASYNC_TARGET  := cloudsync_async_test
 ASYNC_SOURCES := cloudsync_async_test.c \
@@ -88,7 +89,7 @@ ifneq ($(FORCE_LOCK),)
    ADDS_DEFS += -DTASK_CLOUDSYNC_FORCE_LOCK
 endif
 
-CFLAGS += -Wall -pedantic -std=gnu99 -g -O1 -fno-omit-frame-pointer \
+CFLAGS += -Wall -pedantic -std=gnu99 -g1 -O1 -fno-omit-frame-pointer \
           -I$(LIBRETRO_COMM_DIR)/include -I$(CORE_DIR)
 
 ifneq ($(SANITIZER),)
@@ -96,7 +97,7 @@ ifneq ($(SANITIZER),)
    LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
 endif
 
-all: $(TARGET) $(PATH_TARGET) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET)
+all: $(TARGET) $(PATH_TARGET) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET) $(COMMIT_TARGET)
 
 %.o: %.c
 	$(CC) -c -o $@ $< $(CFLAGS)
@@ -120,15 +121,19 @@ $(PACING_TARGET): cloudsync_pacing_test.c $(filter-out cloudsync_manifest_adds_t
 $(ASYNC_TARGET): $(ASYNC_SOURCES) $(CORE_DIR)/network/cloud_sync_driver.h
 	$(CC) -o $@ $(ASYNC_SOURCES) $(filter-out -pedantic,$(CFLAGS)) $(ASYNC_DEFS) $(LDFLAGS) -lpthread
 
-check: $(TARGET) $(PATH_TARGET) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET)
+$(COMMIT_TARGET): cloudsync_commit_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(CORE_DIR)/tasks/task_cloudsync.c
+	$(CC) -o $@ cloudsync_commit_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -lpthread
+
+check: $(TARGET) $(PATH_TARGET) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET) $(COMMIT_TARGET)
 	./$(TARGET)
 	./$(PATH_TARGET)
 	./$(ADDS_TARGET)
 	./$(PACING_TARGET)
 	./$(ASYNC_TARGET)
+	./$(COMMIT_TARGET)
 
 clean:
 	rm -rf $(SAMPLE_OBJDIR)
-	rm -f $(TARGET) $(OBJS) $(PATH_TARGET) $(PATH_OBJS) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET)
+	rm -f $(TARGET) $(OBJS) $(PATH_TARGET) $(PATH_OBJS) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET) $(COMMIT_TARGET) $(COMMIT_TARGET).exe
 
 .PHONY: all check clean

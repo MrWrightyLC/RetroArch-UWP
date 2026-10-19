@@ -833,6 +833,12 @@ struct gl3_common_resources
    GLuint quad_program;
    GLuint quad_vbo;
    gl3_buffer_locations quad_loc;
+   unsigned source_hdr;
+   unsigned passthrough;
+   unsigned hdr_mode;
+   float paper_white_nits;
+   float peak_nits;
+   unsigned expand_gamut;
 
    /* Frames may come inside a larger texture: passes are built to read
     * them there, sampling as the first pass samples. */
@@ -1349,11 +1355,12 @@ static void gl3_pass_set_pass_number(struct gl3_pass *pass, unsigned number)
  * copied out. */
 static void gl3_pass_read_frame_in_place(struct gl3_pass *pass)
 {
-   pass->frame_copy = !slang_rect_remap_pass(
+   pass->frame_copy = slang_rect_remap_pass(
          &pass->vertex_shader, &pass->num_vertex_shader,
          &pass->fragment_shader, &pass->num_fragment_shader,
          pass->pass_number == 0, pass->common->frame_linear,
-         pass->common->frame_wrap);
+         pass->common->frame_wrap)
+         == SLANG_RECT_UNSUPPORTED;
 }
 
 static bool gl3_pass_build(struct gl3_pass *pass)
@@ -1371,8 +1378,11 @@ static bool gl3_pass_build(struct gl3_pass *pass)
    pass->framebuffer_feedback = NULL;
 
    if (!pass->final_pass)
-      pass->framebuffer = gl3_framebuffer_new(pass->pass_info.rt_format,
-            pass->pass_info.max_levels);
+   {
+      if (!(pass->framebuffer = gl3_framebuffer_new(
+                  pass->pass_info.rt_format, pass->pass_info.max_levels)))
+         return false;
+   }
 
    for (i = 0; i < pass->num_parameters; i++)
    {
@@ -1683,6 +1693,17 @@ static bool gl3_pass_init_pipeline(struct gl3_pass *pass)
    gl3_pass_reflect_parameter(pass, "OriginalAspectRotated", &pass->reflection.semantics[SLANG_SEMANTIC_CORE_ASPECT_ROT]);
    gl3_pass_reflect_parameter(pass, "TotalSubFrames", &pass->reflection.semantics[SLANG_SEMANTIC_TOTAL_SUBFRAMES]);
    gl3_pass_reflect_parameter(pass, "CurrentSubFrame", &pass->reflection.semantics[SLANG_SEMANTIC_CURRENT_SUBFRAME]);
+   gl3_pass_reflect_parameter(pass, "HDRMode", &pass->reflection.semantics[SLANG_SEMANTIC_HDR]);
+   gl3_pass_reflect_parameter(pass, "BrightnessNits", &pass->reflection.semantics[SLANG_SEMANTIC_PAPER_WHITE_NITS]);
+   gl3_pass_reflect_parameter(pass, "PaperWhiteNits", &pass->reflection.semantics[SLANG_SEMANTIC_PAPER_WHITE_ALIAS]);
+   gl3_pass_reflect_parameter(pass, "PeakNits", &pass->reflection.semantics[SLANG_SEMANTIC_PEAK_NITS]);
+   gl3_pass_reflect_parameter(pass, "MaxNits", &pass->reflection.semantics[SLANG_SEMANTIC_MAX_NITS_ALIAS]);
+   gl3_pass_reflect_parameter(pass, "EnableHDR", &pass->reflection.semantics[SLANG_SEMANTIC_ENABLE_HDR]);
+   gl3_pass_reflect_parameter(pass, "MinNits", &pass->reflection.semantics[SLANG_SEMANTIC_MIN_NITS]);
+   gl3_pass_reflect_parameter(pass, "SourceHDR", &pass->reflection.semantics[SLANG_SEMANTIC_SOURCE_HDR]);
+   gl3_pass_reflect_parameter(pass, "Passthrough", &pass->reflection.semantics[SLANG_SEMANTIC_PASSTHROUGH]);
+   gl3_pass_reflect_parameter(pass, "TonemapOperator", &pass->reflection.semantics[SLANG_SEMANTIC_TONEMAP_OPERATOR]);
+   gl3_pass_reflect_parameter(pass, "ExpandGamut", &pass->reflection.semantics[SLANG_SEMANTIC_EXPAND_GAMUT]);
    gl3_pass_reflect_parameter(pass, "Gyroscope", &pass->reflection.semantics[SLANG_SEMANTIC_GYROSCOPE]);
    gl3_pass_reflect_parameter(pass, "Accelerometer", &pass->reflection.semantics[SLANG_SEMANTIC_ACCELEROMETER]);
    gl3_pass_reflect_parameter(pass, "AccelerometerRest", &pass->reflection.semantics[SLANG_SEMANTIC_ACCELEROMETER_REST]);
@@ -2351,6 +2372,24 @@ static void gl3_pass_build_semantics(struct gl3_pass *pass, uint8_t *buffer,
                       pass->total_subframes);
    gl3_pass_build_semantic_uint(pass, buffer, SLANG_SEMANTIC_CURRENT_SUBFRAME,
                       pass->current_subframe);
+   gl3_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_MIN_NITS, 0.0f);
+   gl3_pass_build_semantic_uint(pass, buffer, SLANG_SEMANTIC_TONEMAP_OPERATOR, 0);
+   gl3_pass_build_semantic_uint(pass, buffer, SLANG_SEMANTIC_SOURCE_HDR, pass->common->source_hdr);
+   gl3_pass_build_semantic_uint(pass, buffer, SLANG_SEMANTIC_PASSTHROUGH, pass->common->passthrough);
+   gl3_pass_build_semantic_uint(pass, buffer, SLANG_SEMANTIC_HDR,
+                      pass->common->hdr_mode);
+   gl3_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_ENABLE_HDR,
+                      pass->common->hdr_mode ? 1.0f : 0.0f);
+   gl3_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_PAPER_WHITE_NITS,
+                      pass->common->paper_white_nits);
+   gl3_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_PAPER_WHITE_ALIAS,
+                      pass->common->paper_white_nits);
+   gl3_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_PEAK_NITS,
+                      pass->common->peak_nits);
+   gl3_pass_build_semantic_float(pass, buffer, SLANG_SEMANTIC_MAX_NITS_ALIAS,
+                      pass->common->peak_nits);
+   gl3_pass_build_semantic_uint(pass, buffer, SLANG_SEMANTIC_EXPAND_GAMUT,
+                      pass->common->expand_gamut);
    /* Each sub-frame is its own present; CurrentSubFrame is 1-based. */
    gl3_pass_build_semantic_uint(pass, buffer, SLANG_SEMANTIC_SWAP_COUNT,
                       (uint32_t)(pass->swap_count
@@ -2384,7 +2423,8 @@ static void gl3_pass_build_semantics(struct gl3_pass *pass, uint8_t *buffer,
    {
       const struct gl3_pass_parameter *m = &pass->parameters[pass->filtered_parameters[i]];
       gl3_pass_build_semantic_parameter(pass, buffer, m->semantic_index,
-            pass->common->shader_preset->parameters[m->index].current);
+            video_shader_param_get(
+               &pass->common->shader_preset->parameters[m->index]));
    }
 
    /* Previous inputs. */
@@ -3406,13 +3446,18 @@ static bool gl3_chain_compile_full_pass(struct gl3_filter_chain *chain, unsigned
       && pass->mipmap
       ? GLSLANG_FILTER_CHAIN_LINEAR
       : GLSLANG_FILTER_CHAIN_NEAREST;
+   output.meta.rt_format = glslang_hdr_output_format(
+         shader, pass_idx, output.meta.rt_format);
 
    explicit_format = output.meta.rt_format != SLANG_FORMAT_UNKNOWN;
 
    if (output.meta.rt_format == SLANG_FORMAT_UNKNOWN)
       output.meta.rt_format = SLANG_FORMAT_R8G8B8A8_UNORM;
 
-   if (!(pass->fbo.flags & FBO_SCALE_FLAG_VALID))
+   /* A last pass with no target of its own renders to the framebuffer,
+    * whatever scale the preset gave it. */
+   if (     !(pass->fbo.flags & FBO_SCALE_FLAG_VALID)
+         || pass_idx + 1 == chain->num_passes)
    {
       bool scale_viewport = pass_idx + 1 == shader->passes;
       if (scale_viewport)
@@ -3448,6 +3493,8 @@ static bool gl3_chain_compile_full_pass(struct gl3_filter_chain *chain, unsigned
          output.meta.rt_format = SLANG_FORMAT_R16G16B16A16_SFLOAT;
       else if (pass->fbo.flags & FBO_SCALE_FLAG_RGB10_FBO)
          output.meta.rt_format = SLANG_FORMAT_A2B10G10R10_UNORM_PACK32;
+      output.meta.rt_format = glslang_hdr_output_format(
+            shader, pass_idx, output.meta.rt_format);
 
       p_info.rt_format =
          convert_glslang_format(output.meta.rt_format);
@@ -3809,6 +3856,51 @@ gl3_filter_chain_t *gl3_filter_chain_create_default(
    return chain;
 }
 
+gl3_filter_chain_t *gl3_filter_chain_create_shrink(void)
+{
+   unsigned i;
+   struct gl3_filter_chain_pass_info pass_info;
+   struct gl3_filter_chain *chain = gl3_chain_new(2);
+   if (!chain)
+      return NULL;
+
+   /* A copy at the source's size; max_levels gives its framebuffer
+    * every mip level, which the chain builds after the pass. */
+   pass_info.scale_type_x  = GLSLANG_FILTER_CHAIN_SCALE_ORIGINAL;
+   pass_info.scale_type_y  = GLSLANG_FILTER_CHAIN_SCALE_ORIGINAL;
+   pass_info.scale_x       = 1.0f;
+   pass_info.scale_y       = 1.0f;
+   pass_info.rt_format     = GL_RGBA8;
+   pass_info.source_filter = GLSLANG_FILTER_CHAIN_NEAREST;
+   pass_info.mip_filter    = GLSLANG_FILTER_CHAIN_NEAREST;
+   pass_info.address       = GLSLANG_FILTER_CHAIN_ADDRESS_CLAMP_TO_EDGE;
+   pass_info.max_levels    = ~0u;
+   gl3_chain_set_pass_info(chain, 0, pass_info);
+
+   /* Trilinear from those mips into the viewport. */
+   pass_info.scale_type_x  = GLSLANG_FILTER_CHAIN_SCALE_VIEWPORT;
+   pass_info.scale_type_y  = GLSLANG_FILTER_CHAIN_SCALE_VIEWPORT;
+   pass_info.rt_format     = 0;
+   pass_info.source_filter = GLSLANG_FILTER_CHAIN_LINEAR;
+   pass_info.mip_filter    = GLSLANG_FILTER_CHAIN_LINEAR;
+   pass_info.max_levels    = 0;
+   gl3_chain_set_pass_info(chain, 1, pass_info);
+
+   for (i = 0; i < 2; i++)
+   {
+      gl3_chain_set_shader(chain, i, GL_VERTEX_SHADER,
+            gl3_opaque_vert, sizeof(gl3_opaque_vert) / sizeof(uint32_t));
+      gl3_chain_set_shader(chain, i, GL_FRAGMENT_SHADER,
+            gl3_opaque_frag, sizeof(gl3_opaque_frag) / sizeof(uint32_t));
+   }
+   if (!gl3_chain_init(chain))
+   {
+      gl3_chain_free(chain);
+      return NULL;
+   }
+   return chain;
+}
+
 gl3_filter_chain_t *gl3_filter_chain_create_from_preset(
       const char *path, glslang_filter_chain_filter filter, bool frame_rect)
 {
@@ -3818,6 +3910,7 @@ gl3_filter_chain_t *gl3_filter_chain_create_from_preset(
    bool explicit_format;
    struct video_shader_parameter *itr;
    struct gl3_filter_chain *chain;
+   void *include_cache;
    struct video_shader *shader = (struct video_shader*)calloc(1, sizeof(*shader));
    if (!shader)
       return NULL;
@@ -3828,12 +3921,19 @@ gl3_filter_chain_t *gl3_filter_chain_create_from_preset(
       return NULL;
    }
 
-   last_pass_is_fbo = shader->pass[shader->passes - 1].fbo.flags &
-      FBO_SCALE_FLAG_VALID;
+   /* One include cache for every pass of this preset.  The passes share
+    * helper .inc files, so without this each pass re-reads them: a
+    * 24-pass preset over 8 shared helpers issues 216 reads for 32
+    * distinct files.  Each exit below frees it explicitly, next to the
+    * chain and preset it already releases. */
+   include_cache    = glslang_include_cache_new();
+
+   last_pass_is_fbo = glslang_last_pass_needs_target(shader, include_cache);
 
    chain = gl3_chain_new(shader->passes + (last_pass_is_fbo ? 1 : 0));
    if (!chain)
       {
+         glslang_include_cache_free(include_cache);
          free(shader);
          gl3_chain_free(chain);
          return NULL;
@@ -3843,6 +3943,7 @@ gl3_filter_chain_t *gl3_filter_chain_create_from_preset(
    if (      shader->luts
          && !gl3_filter_chain_load_luts(chain, shader))
       {
+         glslang_include_cache_free(include_cache);
          free(shader);
          gl3_chain_free(chain);
          return NULL;
@@ -3850,16 +3951,7 @@ gl3_filter_chain_t *gl3_filter_chain_create_from_preset(
 
    shader->num_parameters = 0;
 
-   /* One include cache for every pass of this preset.  The passes share
-    * helper .inc files, so without this each pass re-reads them: a
-    * 24-pass preset over 8 shared helpers issues 216 reads for 32
-    * distinct files.  The guard frees it on every exit from here,
-    * including the error paths below. */
    {
-   /* The C++ guard freed this on every exit; in C each exit below frees
-    * it explicitly, next to the chain and preset it already released. */
-   void *include_cache = glslang_include_cache_new();
-
    for (i = 0; i < shader->passes; i++)
    {
       glslang_output output;
@@ -4005,6 +4097,8 @@ gl3_filter_chain_t *gl3_filter_chain_create_from_preset(
          && pass->mipmap
          ? GLSLANG_FILTER_CHAIN_LINEAR
          : GLSLANG_FILTER_CHAIN_NEAREST;
+      output.meta.rt_format = glslang_hdr_output_format(
+            shader, i, output.meta.rt_format);
 
       explicit_format = output.meta.rt_format != SLANG_FORMAT_UNKNOWN;
 
@@ -4012,7 +4106,10 @@ gl3_filter_chain_t *gl3_filter_chain_create_from_preset(
       if (output.meta.rt_format == SLANG_FORMAT_UNKNOWN)
          output.meta.rt_format = SLANG_FORMAT_R8G8B8A8_UNORM;
 
-      if (!(pass->fbo.flags & FBO_SCALE_FLAG_VALID))
+      /* A last pass with no target of its own renders to the
+       * framebuffer, whatever scale the preset gave it. */
+      if (     !(pass->fbo.flags & FBO_SCALE_FLAG_VALID)
+            || (i + 1 == shader->passes && !last_pass_is_fbo))
       {
          bool scale_viewport       = i + 1 == shader->passes;
          if (scale_viewport)
@@ -4053,6 +4150,8 @@ gl3_filter_chain_t *gl3_filter_chain_create_from_preset(
             output.meta.rt_format = SLANG_FORMAT_R16G16B16A16_SFLOAT;
          else if (pass->fbo.flags & FBO_SCALE_FLAG_RGB10_FBO)
             output.meta.rt_format = SLANG_FORMAT_A2B10G10R10_UNORM_PACK32;
+         output.meta.rt_format = glslang_hdr_output_format(
+               shader, i, output.meta.rt_format);
 
          pass_info.rt_format = convert_glslang_format(output.meta.rt_format);
          RARCH_LOG("[GLCore] Using render target format %s for pass output #%u.\n",
@@ -4165,8 +4264,7 @@ gl3_filter_chain_t *gl3_filter_chain_create_deferred(
       return NULL;
    }
 
-   last_pass_is_fbo = shader->pass[shader->passes - 1].fbo.flags &
-      FBO_SCALE_FLAG_VALID;
+   last_pass_is_fbo = glslang_last_pass_needs_target(shader, NULL);
 
    total_passes = shader->passes + (last_pass_is_fbo ? 1 : 0);
    chain = gl3_chain_new(total_passes);
@@ -4294,6 +4392,18 @@ bool gl3_filter_chain_init(gl3_filter_chain_t *chain)
    return gl3_chain_init(chain);
 }
 
+void gl3_filter_chain_set_passthrough(
+      gl3_filter_chain_t *chain, unsigned passthrough)
+{
+   chain->common.passthrough = passthrough ? 1 : 0;
+}
+
+void gl3_filter_chain_set_source_hdr(
+      gl3_filter_chain_t *chain, unsigned source_hdr)
+{
+   chain->common.source_hdr = source_hdr ? 1 : 0;
+}
+
 void gl3_filter_chain_set_input_texture(
       gl3_filter_chain_t *chain,
       const struct gl3_filter_chain_texture *texture)
@@ -4332,6 +4442,16 @@ void gl3_filter_chain_set_frame_time_delta(
       uint32_t time_delta)
 {
    gl3_chain_set_frame_time_delta(chain, time_delta);
+}
+
+void gl3_filter_chain_set_hdr_parameters(
+      gl3_filter_chain_t *chain, unsigned mode,
+      float paper_white_nits, unsigned expand_gamut, float peak_nits)
+{
+   chain->common.hdr_mode         = mode;
+   chain->common.paper_white_nits = paper_white_nits;
+   chain->common.peak_nits        = peak_nits;
+   chain->common.expand_gamut     = expand_gamut;
 }
 
 void gl3_filter_chain_set_original_fps(

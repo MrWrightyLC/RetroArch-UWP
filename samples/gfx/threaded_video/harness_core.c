@@ -644,8 +644,10 @@ void retro_set_audio_sample(retro_audio_sample_t cb) { (void)cb; }
 void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { (void)cb; }
 void retro_set_input_poll(retro_input_poll_t cb) { (void)cb; }
 void retro_set_input_state(retro_input_state_t cb) { (void)cb; }
-void retro_init(void) { }
-void retro_deinit(void) { }
+static void harness_env_init(void);
+static void harness_env_report(void);
+void retro_init(void) { harness_env_init(); }
+void retro_deinit(void) { harness_env_report(); }
 unsigned retro_api_version(void) { return RETRO_API_VERSION; }
 void retro_get_system_info(struct retro_system_info *info)
 {
@@ -716,12 +718,68 @@ RETRO_API void harness_core_set_run_us(unsigned us)
  * the base size, so two ways of drawing it can be compared on screen */
 static unsigned harness_frozen;
 RETRO_API void harness_core_freeze(unsigned n) { harness_frozen = n; }
+/* Says a new pixel format, as a core restarting its video would, and
+ * draws in it from the next run: 16-bit pixels for RGB565 and 0RGB1555,
+ * 32-bit for XRGB8888 and XRGB2101010. False when the frontend refuses. */
+RETRO_API bool harness_core_set_format(unsigned fmt)
+{
+   enum retro_pixel_format f = (enum retro_pixel_format)fmt;
+   if (!environ_cb || !environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &f))
+      return false;
+   pixel_format = f;
+   bpp          = (f == RETRO_PIXEL_FORMAT_XRGB8888
+         || f == RETRO_PIXEL_FORMAT_XRGB2101010) ? 4 : 2;
+   return true;
+}
+/* The access a framebuffer is asked with: read and write by default,
+ * as a core that snapshots its frame for a wipe asks; write only for
+ * one that only draws */
+static unsigned harness_fb_access = RETRO_MEMORY_ACCESS_WRITE
+                                  | RETRO_MEMORY_ACCESS_READ;
+RETRO_API void harness_core_fb_access(unsigned a) { harness_fb_access = a; }
+/* Nonzero: every frame is the run's number, its low 8 bits as eight
+ * bands across the frame, each all ones or all zeroes, so the number a
+ * scaled, filtered frame on screen came from can still be read; at the
+ * base size always */
+static unsigned harness_stamp;
+/* The number the last frame pushed, not a dupe, carried */
+static unsigned harness_last_pushed;
+RETRO_API void harness_core_stamp(unsigned on)      { harness_stamp = on; }
+RETRO_API unsigned harness_core_last_pushed(void)   { return harness_last_pushed; }
 RETRO_API unsigned harness_core_fb_granted(void)   { return harness_fb_granted; }
 RETRO_API unsigned harness_core_fb_uncached(void)  { return harness_fb_uncached; }
 
+/* The same switches from the environment, for a core RetroArch loads
+ * itself (samples/gfx/menu_wine/swfb.py): HARNESS_CORE_SW_FB as
+ * harness_core_use_framebuffer, HARNESS_CORE_FREEZE and
+ * HARNESS_CORE_STAMP as theirs, and HARNESS_CORE_REPORT, which prints
+ * how many framebuffers were asked for and lent at deinit. */
+static void harness_env_init(void)
+{
+   const char *v;
+   if ((v = getenv("HARNESS_CORE_SW_FB")) && *v)
+      harness_use_fb = atoi(v);
+   if ((v = getenv("HARNESS_CORE_FREEZE")) && *v)
+      harness_frozen = (unsigned)atoi(v);
+   if ((v = getenv("HARNESS_CORE_STAMP")) && *v)
+      harness_stamp  = (unsigned)atoi(v);
+}
+
+static void harness_env_report(void)
+{
+   const char *v = getenv("HARNESS_CORE_REPORT");
+   if (v && *v)
+   {
+      fprintf(stderr, "harness: %u runs, %u framebuffers lent\n",
+            runs, harness_fb_granted);
+      fflush(stderr);
+   }
+}
+
 void retro_run(void)
 {
-   unsigned h = (runs % 61 == 60 && !harness_frozen) ? H_OVERSIZE : H;
+   unsigned h = (runs % 61 == 60 && !harness_frozen && !harness_stamp)
+      ? H_OVERSIZE : H;
    unsigned i, n;
    uint8_t *dst   = frame;
    size_t   pitch = W * bpp;
@@ -768,10 +826,7 @@ void retro_run(void)
       memset(&fb, 0, sizeof(fb));
       fb.width        = W;
       fb.height       = H;
-      /* Read as well as write, as a core that snapshots its frame
-       * for a wipe asks: the lend must not be refused for it. */
-      fb.access_flags = RETRO_MEMORY_ACCESS_WRITE
-                      | RETRO_MEMORY_ACCESS_READ;
+      fb.access_flags = harness_fb_access;
       if (     environ_cb(RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER, &fb)
             && fb.format == pixel_format)
       {
@@ -791,10 +846,13 @@ void retro_run(void)
    for (i = 0; i < W * h; i++)
    {
       uint8_t *px = dst + (i / W) * pitch + (i % W) * bpp;
+      uint32_t v  = (uint32_t)(n + i);
+      if (harness_stamp)
+         v = ((n >> ((i % W) / (W / 8))) & 1) ? 0xffffffffu : 0;
       if (bpp == 4)
-         *(uint32_t*)px = (uint32_t)(n + i);
+         *(uint32_t*)px = v;
       else
-         *(uint16_t*)px = (uint16_t)(n + i);
+         *(uint16_t*)px = (uint16_t)v;
    }
    push = dst;
    if (harness_use_fb == 2 && h == H)
@@ -808,7 +866,10 @@ void retro_run(void)
    if (runs % 3 == 0)
       video_cb(NULL, out_w, out_h, pitch);
    else
+   {
+      harness_last_pushed = n;
       video_cb(push, out_w, out_h, pitch);
+   }
 }
 size_t retro_serialize_size(void) { return 0; }
 bool retro_serialize(void *data, size_t size) { (void)data; (void)size; return false; }

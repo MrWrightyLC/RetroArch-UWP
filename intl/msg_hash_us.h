@@ -3822,7 +3822,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_THREADED,
-   "Threaded Video"
+   "Threaded Video Pipeline"
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_VIDEO_THREADED,
@@ -7740,6 +7740,18 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_OFF,
    "Off"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_PLACEMENT_FIXED,
+   "Fixed in Room"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_PLACEMENT_FOLLOW,
+   "Follow Head"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_PLACEMENT_LAZY,
+   "Lazy Follow"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_AUTO,
@@ -12332,6 +12344,14 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_META_LASER_POINTER_TOGGLE,
    "Switches the headset's Laser Pointer between Off and its last mode."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_META_HEADSET_VIEW_TOGGLE,
+   "Headset View (Toggle)"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_META_HEADSET_VIEW_TOGGLE,
+   "Cycles what the core is told the headset currently displays: Immersive (head-tracked), Stereoscopic (a 3D screen) or Flat. Returns to core's default on core closure."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_META_FPS_TOGGLE,
@@ -30495,10 +30515,7 @@ MSG_HASH(
    MENU_ENUM_LABEL_VALUE_OZONE_COLOR_THEME_SELENIUM,
    "Selenium"
    )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_OZONE_COLOR_THEME_BRIGHT,
-   "Bright"
-   )
+
 
 /* MaterialUI: Settings > User Interface > Appearance */
 
@@ -33035,6 +33052,10 @@ MSG_HASH(
    MSG_SENDING_COMMAND,
    "Sending command"
    )
+MSG_HASH( /* %s is the address and %u the port the MCP server was set to listen on */
+   MSG_MCP_SERVER_NOT_LISTENING,
+   "MCP server could not listen on %s:%u. Is another RetroArch running?"
+   )
 MSG_HASH(
    MSG_SEVERAL_PATCHES_ARE_EXPLICITLY_DEFINED,
    "Several patches are explicitly defined, ignoring all..."
@@ -33198,6 +33219,10 @@ MSG_HASH(
 MSG_HASH(
    MSG_VALUE_REBOOTING,
    "Rebooting..."
+   )
+MSG_HASH(
+   MSG_VALUE_INSTALL_UPDATE,
+   "Install Update"
    )
 MSG_HASH(
    MSG_VALUE_SHUTTING_DOWN,
@@ -33982,6 +34007,22 @@ MSG_HASH(
 MSG_HASH(
    MSG_OPENXR_LASER_POINTER,
    "Laser Pointer: %s"
+   )
+MSG_HASH(
+   MSG_OPENXR_HEADSET_VIEW,
+   "Headset View: %s"
+   )
+MSG_HASH(
+   MSG_OPENXR_HEADSET_VIEW_IMMERSIVE,
+   "Immersive"
+   )
+MSG_HASH(
+   MSG_OPENXR_HEADSET_VIEW_STEREOSCOPIC,
+   "Stereoscopic"
+   )
+MSG_HASH(
+   MSG_OPENXR_HEADSET_VIEW_FLAT,
+   "Flat"
    )
 
 
@@ -35612,6 +35653,22 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_SUBLABEL_BLUETOOTH_ERTM_DISABLE,
    "Disable Bluetooth ERTM to fix pairing of some devices"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_REBOOT_PAYLOAD,
+   "Reboot Payload"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_REBOOT_PAYLOAD,
+   "Choose which Hekate entry 'Reboot' in the Main Menu boots into. Use Left/Right to cycle through the entries in hekate_ipl.ini and bootloader/ini/. Defaults to the entry currently running."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_REBOOT_FORCE_SELF_ON_UPDATE,
+   "Force Reboot to Lakka if Update Exists"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_REBOOT_FORCE_SELF_ON_UPDATE,
+   "When a Lakka update is staged, reboot back into Lakka instead of the selected payload so the update is installed. Disable to always honour the payload selection."
    )
 #endif
 MSG_HASH(

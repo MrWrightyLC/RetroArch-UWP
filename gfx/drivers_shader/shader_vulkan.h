@@ -139,6 +139,12 @@ void vulkan_filter_chain_notify_sync_index(vulkan_filter_chain_t *chain,
 
 bool vulkan_filter_chain_init(vulkan_filter_chain_t *chain);
 
+void vulkan_filter_chain_set_passthrough(
+      vulkan_filter_chain_t *chain, unsigned passthrough);
+
+void vulkan_filter_chain_set_source_hdr(
+      vulkan_filter_chain_t *chain, unsigned source_hdr);
+
 void vulkan_filter_chain_set_input_texture(vulkan_filter_chain_t *chain,
       const struct vulkan_filter_chain_texture *texture);
 
@@ -192,6 +198,9 @@ void vulkan_filter_chain_set_core_aspect_rot(vulkan_filter_chain_t *chain,
 #ifdef VULKAN_HDR_SWAPCHAIN
 void vulkan_filter_chain_set_hdr_mode(vulkan_filter_chain_t *chain,
       unsigned hdr_mode);
+
+void vulkan_filter_chain_set_peak_nits(vulkan_filter_chain_t *chain,
+      float peak_nits);
 
 void vulkan_filter_chain_set_paper_white_nits(vulkan_filter_chain_t *chain,
       float paper_white_nits);

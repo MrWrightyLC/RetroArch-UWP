@@ -22,7 +22,8 @@
 
 /* ratrac3p against a reference decoder's output for a stereo stream
  * (tonal components, gain points in both channels, explicit and
- * all-band swap and negate masks) and a mono one. Then the s16
+ * all-band swap and negate masks), a mono one and a synthetic one for
+ * the second channel's tonal coding. Then the s16
  * output, the fmt chunk, bad frames, reset, and garbage. */
 
 #include <stdio.h>
@@ -65,12 +66,11 @@ static unsigned n_of(unsigned ch)
    return ch == 2 ? STEREO_N : MONO_N;
 }
 
-static double compare(unsigned ch, const float *ref, unsigned nref,
-      const char *name)
+static double compare(unsigned ch, const uint8_t *s, unsigned ba,
+      unsigned n, const float *ref, unsigned nref, const char *name)
 {
-   static float   pcm[STEREO_N * RATRAC3P_SAMPLES * 2];
-   unsigned       ba = ba_of(ch), n = n_of(ch), f, i;
-   const uint8_t *s  = stream_of(ch);
+   static float   pcm[GHA_N * RATRAC3P_SAMPLES * 2];
+   unsigned       f, i;
    ratrac3p_t    *d  = ratrac3p_new(ch, ba);
    double         err = 0.0, sig = 0.0, worst = 0.0;
 
@@ -100,12 +100,15 @@ static double compare(unsigned ch, const float *ref, unsigned nref,
 
 static void lane_reference(void)
 {
-   double a = compare(2, &ref_st[0][0],
+   double a = compare(2, stream_st, STEREO_BA, STEREO_N, &ref_st[0][0],
          sizeof(ref_st) / sizeof(ref_st[0]), "stereo");
-   double b = compare(1, &ref_mo[0][0],
+   double b = compare(1, stream_mo, MONO_BA, MONO_N, &ref_mo[0][0],
          sizeof(ref_mo) / sizeof(ref_mo[0]), "mono");
-   printf("stereo %.1f dB, mono %.1f dB against the reference\n", a, b);
-   CHECK(a > 100.0 && b > 100.0, "reference match");
+   double c = compare(2, stream_gha, GHA_BA, GHA_N, &ref_gha[0][0],
+         sizeof(ref_gha) / sizeof(ref_gha[0]), "tonal");
+   printf("stereo %.1f dB, mono %.1f dB, tonal %.1f dB against the reference\n",
+         a, b, c);
+   CHECK(a > 100.0 && b > 100.0 && c > 100.0, "reference match");
 }
 
 /* s16 is the float output times 32768, rounded and clamped */
@@ -315,8 +318,74 @@ static void lane_garbage(void)
    }
 }
 
+/* Mono, one coded QU, master code-table mode 3 with no indices.
+ * Two frames decode to silence in the reference decoder. */
+static void lane_master_table_default(void)
+{
+   static const uint8_t frame[16] = {
+      0x00, 0x04, 0x00, 0xC0, 0x30
+   };
+   float pcm[RATRAC3P_SAMPLES];
+   int16_t pcm16[RATRAC3P_SAMPLES];
+   ratrac3p_t *d = ratrac3p_new(1, sizeof(frame));
+   unsigned i, f;
+   CHECK(d != NULL, "master default: allocate");
+   if (!d)
+      return;
+   for (f = 0; f < 2; f++)
+   {
+      CHECK(ratrac3p_decode_float(d, frame, sizeof(frame), pcm)
+            == RATRAC3P_SAMPLES, "master default: frame %u", f);
+      for (i = 0; i < RATRAC3P_SAMPLES; i++)
+         if (pcm[i] != 0.0f)
+            break;
+      CHECK(i == RATRAC3P_SAMPLES, "master default: not silent");
+   }
+   ratrac3p_reset(d);
+   CHECK(ratrac3p_decode_s16(d, frame, sizeof(frame), pcm16)
+         == RATRAC3P_SAMPLES, "master default: s16");
+   for (i = 0; i < RATRAC3P_SAMPLES; i++)
+      if (pcm16[i] != 0)
+         break;
+   CHECK(i == RATRAC3P_SAMPLES, "master default: s16 not silent");
+   ratrac3p_free(d);
+}
+
+/* Two declared subbands, one coded subband. Stereo flags cover only
+ * the coded band; window shapes still cover both declared bands. */
+static void coded_band_flags(void)
+{
+   static const uint8_t frame[31] = {
+      0x28, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x19, 0xB2, 0x06, 0xD9, 0x81, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+   };
+   int16_t pcm[2 * RATRAC3P_SAMPLES];
+   ratrac3p_t *d = ratrac3p_new(2, sizeof(frame));
+   unsigned f, i;
+   int audible = 0;
+   CHECK(d != NULL, "coded bands: allocate");
+   if (!d)
+      return;
+   for (f = 0; f < 3; f++)
+   {
+      CHECK(ratrac3p_decode_s16(d, frame, sizeof(frame), pcm)
+            == RATRAC3P_SAMPLES, "coded bands: frame %u", f);
+      for (i = 0; i < RATRAC3P_SAMPLES; i++)
+      {
+         if (pcm[2 * i] != 0)
+            audible = 1;
+         if (pcm[2 * i] != pcm[2 * i + 1])
+            break;
+      }
+      CHECK(i == RATRAC3P_SAMPLES, "coded bands: copied stereo differs");
+   }
+   CHECK(audible, "coded bands: no decoded audio");
+   ratrac3p_free(d);
+}
+
 int main(void)
 {
+   lane_master_table_default();
+   coded_band_flags();
    lane_reference();
    lane_s16();
    lane_fmt();

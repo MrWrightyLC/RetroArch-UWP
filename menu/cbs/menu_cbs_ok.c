@@ -190,7 +190,7 @@ static int (funcname)(const char *path, const char *label, unsigned type, size_t
 #define DEFAULT_ACTION_DIALOG_START_TYPE(funcname, _label, _idx, _cb, _text_type) \
 static int (funcname)(const char *path, const char *label_setting, unsigned type, size_t idx, size_t entry_idx) \
 { \
-   menu_input_ctx_line_t line; \
+   menu_input_ctx_line_t line = {0}; \
    line.label         = _label; \
    line.label_setting = label_setting; \
    line.type          = type; \
@@ -3594,7 +3594,7 @@ static void menu_input_wifi_cb(void *userdata, const char *passphrase)
 static int action_ok_wifi(const char *path, const char *label_setting,
       unsigned type, size_t idx, size_t entry_idx)
 {
-   menu_input_ctx_line_t line;
+   menu_input_ctx_line_t line = {0};
    wifi_network_scan_t* scan = driver_wifi_get_ssids();
    if (idx >= RBUF_LEN(scan->net_list))
       return -1;
@@ -4069,7 +4069,7 @@ DEFAULT_ACTION_DIALOG_START_TYPE(action_ok_disable_kiosk_mode,
 static int action_ok_rename_entry(const char *path,
       const char *label_setting, unsigned type, size_t idx, size_t entry_idx)
 {
-   menu_input_ctx_line_t line;
+   menu_input_ctx_line_t line = {0};
    playlist_t *playlist;
    const struct playlist_entry *entry = NULL;
 
@@ -4079,14 +4079,15 @@ static int action_ok_rename_entry(const char *path,
    line.idx                           = (unsigned)entry_idx;
    line.text_type                     = MENU_INPUT_DIALOG_KB_TYPE_TEXT;
    line.cb                            = menu_input_st_string_cb_rename_entry;
-
-   if (!menu_input_dialog_start(&line))
-      return -1;
+   line.dialog_type                   = MENU_INPUT_DIALOG_TYPE_EDIT;
 
    if ((playlist = playlist_get_cached()))
       playlist_get_index(playlist, entry_idx, &entry);
-   if (entry && entry->label && *entry->label)
-      input_driver_keyboard_line_append(entry->label, strlen(entry->label));
+   if (entry)
+      line.initial_text = entry->label;
+
+   if (!menu_input_dialog_start(&line))
+      return -1;
 
    return 0;
 }
@@ -6869,7 +6870,7 @@ static void action_input_add_entry_to_new_playlist_quickmenu(void *userdata, con
 static int action_ok_add_entry_to_new_playlist(const char *path,
    const char *label, unsigned type, size_t idx, size_t entry_idx)
 {
-   menu_input_ctx_line_t line;
+   menu_input_ctx_line_t line = {0};
    line.label                 = msg_hash_to_str(MENU_ENUM_LABEL_VALUE_CREATE_NEW_PLAYLIST);
    line.label_setting         = NULL;
    line.type                  = 0;
@@ -7108,6 +7109,13 @@ STATIC_DEFAULT_ACTION_OK_FUNC(action_ok_menu_bottom_list, ACTION_OK_DL_MENU_BOTT
 #endif
 #ifdef HAVE_LAKKA_SWITCH
 STATIC_DEFAULT_ACTION_OK_FUNC(action_ok_lakka_switch_options, ACTION_OK_DL_LAKKA_SWITCH_OPTIONS_LIST)
+
+/* Left/Right cycles the payload selection; OK does nothing. */
+static int action_ok_reboot_payload(const char *path, const char *label,
+      unsigned type, size_t idx, size_t entry_idx)
+{
+   return 0;
+}
 #endif
 STATIC_DEFAULT_ACTION_OK_FUNC(action_ok_rdb_entry, ACTION_OK_DL_RDB_ENTRY)
 #ifdef HAVE_AUDIOMIXER
@@ -7724,7 +7732,7 @@ static int generic_action_ok_dropdown_setting(const char *path, const char *labe
       case ST_STRING_OPTIONS:
          if (setting->actions->repr)
          {
-            const char *tok       = setting->values;
+            const char *tok       = setting->aux.values;
             unsigned tok_idx      = 0;
 
             while (tok)
@@ -7880,13 +7888,13 @@ static int action_ok_push_dropdown_item_video_shader_param_generic(const char *p
       return -1;
 
    /* Clamp against the live parameter's stable range, then submit
-    * through the owning-thread setter (see menu_cbs_right.c). */
+    * through the driver-level setter (see menu_cbs_right.c). */
    param_prev           = &shader_info.data->parameters[entry_idx - offset];
    val                  = MIN(MAX(param_prev->minimum, val),
          param_prev->maximum);
    video_shader_driver_set_parameter(shader_info.data,
          (unsigned)(entry_idx - offset), val);
-   param_menu->current  = val;
+   video_shader_param_set(param_menu, val);
 
    shader->flags       |= SHDR_FLAG_MODIFIED;
 
@@ -9952,6 +9960,7 @@ static int menu_cbs_init_bind_ok_compare_label(menu_file_list_cbs_t *cbs,
 #endif
 #ifdef HAVE_LAKKA_SWITCH
          {MENU_ENUM_LABEL_LAKKA_SWITCH_OPTIONS,                action_ok_lakka_switch_options},
+         {MENU_ENUM_LABEL_REBOOT_PAYLOAD,                      action_ok_reboot_payload},
 #endif
          {MENU_ENUM_LABEL_SCREEN_RESOLUTION,                   action_ok_video_resolution},
          {MENU_ENUM_LABEL_PLAYLIST_MANAGER_DEFAULT_CORE,       action_ok_playlist_default_core},

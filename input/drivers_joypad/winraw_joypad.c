@@ -1750,11 +1750,18 @@ static bool winraw_joypad_create_msg_window(void)
 {
    WNDCLASSEXA wc;
 
-   memset(&wc, 0, sizeof(wc));
    wc.cbSize        = sizeof(wc);
+   wc.style         = 0;
    wc.lpfnWndProc   = winraw_joypad_joypad_wndproc;
-   wc.hInstance      = GetModuleHandle(NULL);
-   wc.lpszClassName  = "RetroArchRawInputJoypad";
+   wc.cbClsExtra    = 0;
+   wc.cbWndExtra    = 0;
+   wc.hInstance     = GetModuleHandle(NULL);
+   wc.hIcon         = NULL;
+   wc.hCursor       = NULL;
+   wc.hbrBackground = NULL;
+   wc.lpszMenuName  = NULL;
+   wc.lpszClassName = "RetroArchRawInputJoypad";
+   wc.hIconSm       = NULL;
 
    if (!RegisterClassExA(&wc))
    {
@@ -1845,8 +1852,6 @@ static void winraw_joypad_enumerate_devices(void)
 
 static void *winraw_joypad_joypad_init(void *data)
 {
-   unsigned i;
-
    memset(winraw_joypad_pads, 0, sizeof(winraw_joypad_pads));
    memset(winraw_joypad_held, 0, sizeof(winraw_joypad_held));
    winraw_joypad_pad_count      = 0;

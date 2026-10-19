@@ -309,7 +309,12 @@ struct input_keyboard_line
    size_t size;
    size_t capacity;  /* Allocated size of buffer (excluding NUL) */
    bool enabled;
+   bool select_all;
+   bool fixed;       /* a native keyboard owns the buffer: it cannot move */
 };
+
+/* The buffer a native (Android, iOS) keyboard puts under the line */
+#define INPUT_NATIVE_KEYBOARD_BUFFER_SIZE 512
 
 struct rarch_joypad_info
 {
@@ -388,15 +393,6 @@ typedef struct input_remote_state
    /* Left X, Left Y, Right X, Right Y */
    int16_t analog[4][MAX_USERS];
 } input_remote_state_t;
-
-typedef struct input_list_element_t
-{
-   int16_t *state;
-   unsigned port;
-   unsigned device;
-   unsigned index;
-   unsigned int state_size;
-} input_list_element;
 
 /**
  * Organizes the functions and data structures of each driver that are accessed
@@ -830,6 +826,8 @@ typedef struct
    uint32_t core_hold_gun[MAX_USERS];
    uint8_t  core_hold_pointer[MAX_USERS];
    bool core_hold_armed;
+   /* any of cmd_buttons or cmd_analog is held */
+   bool cmd_input;
    /* The same for what the run loop and the menu see - the RetroPad
     * bits and the hotkeys: 1 takes what is down at the next frame, 2
     * holds it back, 0 is no hold. */
@@ -848,6 +846,11 @@ typedef struct
     * input_driver_poll(), and when the core's first analog request
     * changes analog-to-d-pad for the port. */
    int16_t frame_view_joypad[MAX_USERS];
+   /* What SET_INPUT holds for each port: stick axes (left X and Y,
+    * right X and Y) standing in for the port's own while not 0, and
+    * RetroPad buttons added to its own. */
+   int16_t  cmd_analog[MAX_USERS][4];
+   uint16_t cmd_buttons[MAX_USERS];
    /* Full-range triggers, per controller, as bits by axis: axes bound
     * to L2 or R2 that were seen resting at the far end from their
     * bind (the pull is counted from there), and axes not to be looked
@@ -1175,6 +1178,21 @@ const char *input_config_get_test_input_file(bool joypad);
 /* What a driver may ask the frontend, and tell it, without taking its
  * state (input_state_get_ptr()): each is one thing, by name. */
 void input_driver_set_native_keyboard_available(bool available);
+/* What a command holds for a port's RetroPad, over the player's own
+ * input: control below 16 is a button, down for any value but 0, and
+ * 16 to 19 the sticks' axes at the value. */
+void input_driver_command_hold(unsigned port, unsigned control,
+      int16_t value);
+/* Lets go of what a command holds for a port, or with MAX_USERS for
+ * every port. */
+void input_driver_command_release(unsigned port);
+/* The buttons a command holds for a port, one bit each, and the four
+ * axes into analog. */
+uint16_t input_driver_command_held(unsigned port, int16_t *analog);
+
+/* Whether a replay is being recorded: what a state restored outside
+ * the replay's own data would break. */
+bool input_driver_replay_recording(void);
 void input_driver_set_native_keyboard_shown(bool shown);
 bool input_driver_native_keyboard_shown(void);
 bool input_driver_keyboard_mapping_blocked(void);
@@ -1193,7 +1211,7 @@ enum input_text_type
 };
 const char **input_driver_text_entry_open(void *userdata,
       input_keyboard_line_complete_t cb,
-      const char *label, enum input_text_type type);
+      const char *label, enum input_text_type type, const char *initial_text);
 /* The open line's label and type, for a platform's keyboard that shows
  * them; whether a line is open is input_driver_keyboard_line_enabled(). */
 const char *input_driver_text_entry_label(void);
@@ -1287,6 +1305,7 @@ void input_driver_keyboard_line_append(const char *utf8, size_t len);
  * NULL, and where the cursor stands in them. And whether the text box
  * has the focus, and not the on-screen keyboard. */
 const char *input_driver_keyboard_line_view(size_t *cursor);
+bool input_driver_keyboard_line_selected(void);
 bool input_driver_keyboard_textbox_focus(void);
 void input_driver_keyboard_line_end(void);
 bool input_driver_pointer_input_blocked(void);
@@ -1933,14 +1952,9 @@ size_t input_config_get_device_name_size(unsigned port);
 unsigned input_driver_lightgun_id_convert(unsigned id);
 
 #ifdef HAVE_OPENXR
-/* The Analog to Digital mode user port's sticks follow: none while the
- * core reads that port's sticks, unless the mode is forced. */
-unsigned input_driver_analog_dpad_mode(unsigned port);
-
-/* The RetroPad buttons an Analog to Digital mode makes of analog (left
- * x, left y, right x, right y). */
-uint16_t input_driver_analog_dpad_buttons(unsigned mode,
-      const int16_t *analog, float axis_threshold);
+/* The ports that read slot @a read slot @b, and the other way round,
+ * for this run only: the config file keeps what the user set. */
+void input_driver_exchange_ports(unsigned a, unsigned b);
 #endif
 
 bool input_driver_pointer_is_offscreen(int16_t x, int16_t y);
@@ -2398,7 +2412,7 @@ static INLINE unsigned input_config_binds_generation(void)
 /* How everything outside input/ gets at a bind: a user's, and the one
  * a pad's autoconfig profile gave it. The arrays are the input code's
  * own, and how the binds are kept is its to change; a check holds that
- * nothing else names them (tools/input_state_grab_check.py). To read
+ * nothing else names them (tools/input_state_grab_check.c). To read
  * one, these; to write one, the _edit calls, which count the change. */
 static INLINE const struct retro_keybind *input_config_bind(
       unsigned user, unsigned id)

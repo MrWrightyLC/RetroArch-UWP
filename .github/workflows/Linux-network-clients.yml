@@ -83,6 +83,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
       - name: Built-in TLS client against a local openssl server
         shell: bash
         working-directory: ${{ github.workspace }}
@@ -132,6 +135,17 @@ jobs:
             make -C samples/network/mcp_server check
           make -C samples/network/mcp_server clean
 
+      - name: GET_LOG's ring, written from four threads while read
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -eu
+          make -C samples/runloop/log_ring clean
+          make -C samples/runloop/log_ring SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+            make -C samples/runloop/log_ring check
+          make -C samples/runloop/log_ring clean
+
       - name: Command options and speed setters
         shell: bash
         working-directory: ${{ github.workspace }}
@@ -173,8 +187,7 @@ jobs:
           make -C samples/network/mcp_server compiler=x86_64-w64-mingw32-gcc
           (cd samples/network/mcp_server && wine ./mcp_server_test.exe)
           make -C samples/network/mcp_server clean
-          make -C samples/network/command_options compiler=x86_64-w64-mingw32-gcc
-          (cd samples/network/command_options && wine ./command_options_test.exe)
+          make -C samples/network/command_options check compiler=x86_64-w64-mingw32-gcc RUNNER=wine
           make -C samples/network/command_options clean
           export CC=x86_64-w64-mingw32-gcc RUNNER=wine EXE=.exe
           make -C samples/network/tls_retro clean
@@ -229,7 +242,7 @@ jobs:
           # for memory errors, undefined behaviour and leaks. UBSan found
           # a NULL memcpy in the SHA-2 stream updates on the SHA-384 PRF
           # path the first time this ran.
-          export CFLAGS="-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+          export CFLAGS="-O1 -g1 -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
           export LDFLAGS="-fsanitize=address,undefined"
           export ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1
           export UBSAN_OPTIONS=print_stacktrace=1

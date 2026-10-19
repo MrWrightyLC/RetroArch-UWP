@@ -52,9 +52,9 @@ bool video_driver_texture_can_update(void) { return false; }
 int video_driver_texture_update(uintptr_t id, void *data)
 { (void)id; (void)data; return 0; }
 unsigned video_driver_get_disp_flags(void) { return 0; }
-void video_driver_get_video_output_size(unsigned *dims, char *d, size_t l)
-{ *dims = VIDEO_SCALE_PACK(1920, 1080); (void)d; (void)l; }
-void video_driver_get_viewport_info(void *vp) { (void)vp; }
+bool video_driver_get_video_output_size(unsigned *dims, char *d, size_t l)
+{ *dims = VIDEO_SCALE_PACK(1920, 1080); (void)d; (void)l; return true; }
+bool video_driver_get_viewport_info(void *vp) { (void)vp; return false; }
 void *video_state_get_ptr(void) { static char b[4096]; return b; }
 unsigned gfx_display_texture_filter(void) { return 0; }
 /* gfx_thumbnail_draw() reaches the display driver through this rather
@@ -188,6 +188,9 @@ static char g_menu_blob[65536];
 static char g_runloop_blob[1 << 18];
 void *menu_state_get_ptr(void) { return g_menu_blob; }
 void *runloop_state_get_ptr(void) { return g_runloop_blob; }
+/* No content switch, no content: what a menu without a core sees */
+bool runloop_is_content_switching(void) { return false; }
+bool runloop_content_loaded(void)       { return false; }
 
 /* A one-entry playlist, cached while a test holds it: the entry is laid
  * out by settings_layout_uut.c, which sees the UUT's struct layouts. */
@@ -411,8 +414,10 @@ bool video_driver_texture_fit(struct texture_image *ti)
 }
 
 /* No driver lends upload memory here: every slot stays the surface's. */
-void *video_driver_texture_lend(uintptr_t id, unsigned slot, size_t pitch)
+void *video_driver_texture_lend(uintptr_t id, unsigned slot, size_t pitch, size_t *out_pitch)
 {
+   if (out_pitch)
+      *out_pitch = pitch;
    (void)id; (void)slot; (void)pitch;
    return NULL;
 }
@@ -429,4 +434,13 @@ bool video_driver_texture_lend_ready(uintptr_t id, unsigned slot)
 {
    (void)id; (void)slot;
    return true;
+}
+
+bool video_driver_texture_lend_needs_refresh(void) { return false; }
+bool video_thread_lend_get(int idx, void **mem, size_t *pitch)
+{
+   (void)idx;
+   (void)mem;
+   (void)pitch;
+   return false;
 }

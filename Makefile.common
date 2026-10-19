@@ -247,6 +247,7 @@ OBJ += frontend/frontend_driver.o \
        camera/camera_driver.o \
        record/record_driver.o \
        record/drivers/record_wav.o \
+       record/drivers/record_nvenc.o \
        command.o \
        msg_hash.o \
        intl/msg_hash_us.o \
@@ -1041,6 +1042,7 @@ endif
 
 ifeq ($(HAVE_LAKKA_SWITCH), 1)
    DEFINES += -DHAVE_LAKKA_SWITCH
+   OBJ += misc/reboot2payload/reboot2payload.o
 endif
 
 ifeq ($(HAVE_MENU_COMMON), 1)
@@ -1195,12 +1197,10 @@ ifeq ($(TARGET), retroarch_wiiu)
 endif
 
 ifeq ($(TARGET), retroarch_switch)
-   ifeq ($(HAVE_LIBNX), 1)
-      OBJ += gfx/drivers/switch_nx_gfx.o \
-             audio/drivers/switch_libnx_audren_audio.o
-      ifeq ($(HAVE_OPENGL), 1)
-         OBJ += gfx/drivers_context/switch_ctx.o
-      endif
+   OBJ += gfx/drivers/switch_nx_gfx.o \
+          audio/drivers/switch_libnx_audren_audio.o
+   ifeq ($(HAVE_OPENGL), 1)
+      OBJ += gfx/drivers_context/switch_ctx.o
    endif
    OBJ += audio/drivers/switch_audio.o \
           input/drivers/switch_input.o \
@@ -1646,8 +1646,8 @@ ifeq ($(HAVE_METAL), 1)
    LIBS += -framework Metal -framework MetalKit -framework QuartzCore
    # metal.m builds under both ARC and MRC (see the M_OBJC_* ownership
    # macros at the top of the file). The top-level Makefile still builds
-   # it with a per-file -fobjc-arc override — ARC is the preferred mode
-   # for the standalone object — but the griffin_objc.m unity TU may
+   # it with a per-file -fobjc-arc override â€” ARC is the preferred mode
+   # for the standalone object â€” but the griffin_objc.m unity TU may
    # compile it either way depending on the Xcode configuration.
    OBJ += gfx/drivers/metal.o
 endif
@@ -1776,6 +1776,11 @@ ifeq ($(HAVE_VULKAN), 1)
           gfx/common/vulkan_common.o \
           $(LIBRETRO_COMM_DIR)/vulkan/vulkan_symbol_wrapper.o
 
+   # H.264/HEVC previews decoded on the GPU
+   ifeq ($(HAVE_RMP4), 1)
+      OBJ += gfx/common/vulkan_video_decode.o
+   endif
+
    ifeq ($(HAVE_SLANG), 1)
       OBJ += gfx/drivers_shader/shader_vulkan.o
    endif
@@ -1784,9 +1789,7 @@ ifeq ($(HAVE_VULKAN), 1)
       OBJ += gfx/drivers_context/khr_display_ctx.o
    endif
    ifeq ($(HAVE_OPENXR), 1)
-      OBJ += gfx/common/vulkan_openxr.o \
-             gfx/video_xr.o \
-             input/common/input_openxr.o
+      OBJ += gfx/common/vulkan_openxr.o
    endif
    NEED_CXX_LINKER = 1
    DEFINES += -DHAVE_VULKAN
@@ -1889,8 +1892,25 @@ endif
 
 ifeq ($(HAVE_D3D12), 1)
    HAVE_D3D_COMMON = 1
-   OBJ += gfx/drivers/d3d12.o
+   OBJ += gfx/drivers/d3d12.o \
+          gfx/common/nvenc_d3d12.o \
+          record/record_gpu_queue.o \
+          record/record_gpu_capture_d3d12.o \
+          record/record_gpu_worker_d3d12.o \
+          record/record_mux_mp4.o \
+          record/record_file_win32.o \
+          record/record_gpu_output_d3d12.o \
+          record/record_gpu_session_d3d12.o \
+          record/record_gpu_dispatch_d3d12.o
    DEFINES += -DHAVE_D3D12
+endif
+
+# H.264 previews decoded on the GPU, as rh264's backend; D3D12 imports
+# its frames as well
+ifneq ($(findstring 1, $(HAVE_D3D11) $(HAVE_D3D12)),)
+   ifeq ($(HAVE_RMP4), 1)
+      OBJ += gfx/common/d3d11_video_decode.o
+   endif
 endif
 
 ifneq ($(findstring 1, $(HAVE_D3D10) $(HAVE_D3D11) $(HAVE_D3D12)),)
@@ -1954,6 +1974,29 @@ endif
 ifeq ($(HAVE_OPENXR), 1)
    NEED_CXX_LINKER = 1
    DEFINES += -DHAVE_OPENXR
+   OBJ += gfx/common/openxr_runtime.o \
+          gfx/common/openxr_session.o \
+          gfx/common/openxr_tracking.o \
+          gfx/common/openxr_host.o \
+          gfx/common/openxr_swapchain.o \
+          gfx/common/openxr_frame.o \
+          gfx/video_xr.o \
+          input/common/input_openxr.o
+
+   # Desktop GL headset output: a context in the window's share group on
+   # the XR thread, made by an EGL or GLX context driver.
+   ifneq ($(findstring Linux,$(OS)),)
+      ifneq ($(HAVE_OPENGLES), 1)
+         ifneq ($(filter 1,$(HAVE_OPENGL) $(HAVE_OPENGL_CORE)),)
+            ifneq ($(filter 1,$(HAVE_EGL) $(HAVE_X11)),)
+               DEFINES += -DHAVE_OPENXR_GL
+               OBJ += gfx/common/openxr_ring.o \
+                      gfx/common/openxr_binding_gl.o \
+                      gfx/common/gl_openxr.o
+            endif
+         endif
+      endif
+   endif
    ifneq ($(findstring Win32,$(OS)),)
       DEFINES += -DXR_OS_WINDOWS -DXR_USE_PLATFORM_WIN32
    else ifneq ($(findstring Darwin,$(OS)),)
@@ -2412,6 +2455,11 @@ endif
 endif
 endif
 
+ifeq ($(HAVE_RAV1), 1)
+   DEFINES += -DHAVE_RAV1
+   OBJ += $(LIBRETRO_COMM_DIR)/formats/av1/rav1_hw.o
+endif
+
 ifeq ($(HAVE_RVP9), 1)
    DEFINES += -DHAVE_RVP9
    OBJ += $(LIBRETRO_COMM_DIR)/formats/vp9/rvp9.o
@@ -2423,14 +2471,23 @@ endif
 ifeq ($(HAVE_RMPEG1), 1)
    DEFINES += -DHAVE_RMPEG1
    OBJ += $(LIBRETRO_COMM_DIR)/formats/mpeg1/rmpeg1_ps.o \
-          $(LIBRETRO_COMM_DIR)/formats/mpeg1/rmpeg1_video.o
+          $(LIBRETRO_COMM_DIR)/formats/mpeg1/rmpeg1_video.o \
+          $(LIBRETRO_COMM_DIR)/formats/dvd/rdvd_lpcm.o \
+          $(LIBRETRO_COMM_DIR)/formats/dvd/rdvd_ac3.o \
+          $(LIBRETRO_COMM_DIR)/formats/dvd/rdvd_demux.o \
+          $(LIBRETRO_COMM_DIR)/formats/dvd/rdvd_packet.o \
+          $(LIBRETRO_COMM_DIR)/formats/dvd/rdvd_spu.o \
+          $(LIBRETRO_COMM_DIR)/formats/dvd/rdvd_ifo.o \
+          $(LIBRETRO_COMM_DIR)/formats/dvd/rdvd_stream.o \
+          $(LIBRETRO_COMM_DIR)/formats/dvd/rdvd_source.o \
+          $(LIBRETRO_COMM_DIR)/formats/dvd/rdvd_vfs.o
    # MPEG-1 audio is layer II, which rmp3 already decodes; a consumer that
    # wants sound from an MPEG-1 stream needs HAVE_RMP3 as well.
 endif
 
 ifeq ($(HAVE_WEBMPLAYER), 1)
    DEFINES += -DHAVE_WEBMPLAYER
-   OBJ += cores/libretro-webm/webm_core.o
+   OBJ += cores/libretro-media/media_core.o
 endif
 
 OBJ += $(LIBRETRO_COMM_DIR)/formats/bmp/rbmp_encode.o \

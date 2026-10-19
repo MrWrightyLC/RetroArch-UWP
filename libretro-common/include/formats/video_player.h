@@ -98,6 +98,11 @@ typedef struct video_player_frame
    /* pixels are in the order the flags asked for; a canvas from a
     * stream that cannot emit it is R,G,B,A in memory */
    bool native;
+   /* A frame decoded on the GPU (start_hw), NULL otherwise. DONE or
+    * QUEUED makes it the sink's, to read or abandon; on BUSY a frame
+    * decoded on the worker is offered again, any other is given back
+    * by the player. */
+   const video_hw_frame_t *hw;
 } video_player_frame_t;
 
 typedef struct video_player_sink
@@ -122,6 +127,17 @@ typedef struct video_player_sink
    bool (*feed)(void *user);
    /* Optional, on the decoding thread after each decode. */
    void (*decoded)(void *user, enum video_player_how how);
+   /* Optional: the sink takes frames decoded on the GPU. Once, before
+    * the first decode, instead of start when the stream's decoder has
+    * a hardware backend for it (image_transfer_anim_stream_set_hw):
+    * frames then come as video_player_frame_t::hw, into no slot;
+    * @jobs is 2 when they are decoded on the worker, a frame ahead,
+    * and 1 in line. As start returns. */
+   int (*start_hw)(void *user, unsigned width, unsigned height,
+         unsigned jobs);
+   /* Optional, after slot_begin: row stride in pixels for that buffer.
+    * Absent means width. Snapshotted before the decode is posted. */
+   unsigned (*slot_stride)(void *user, unsigned slot);
 } video_player_sink_t;
 
 /* Plays @stream (borrowed; freed by the caller after the player) from
@@ -132,6 +148,11 @@ video_player_t *video_player_new(void *stream, enum image_type_enum type,
 /* Stops the playback: a queued decode will not run, a running one is
  * waited out. Every slot is ended. */
 void video_player_free(video_player_t *p);
+
+/* Cancels queued work without waiting. False: a running decode still
+ * borrows the player, stream and sink; retain them and poll stop again.
+ * True: free() will not wait. A stopped player cannot resume. */
+bool video_player_stop(video_player_t *p);
 
 /* Advances the playback to @now_us (any monotonic microsecond clock,
  * the same one every call): starts decodes, presents the frame that is
@@ -151,7 +172,8 @@ void video_player_slot_released(video_player_t *p, unsigned slot);
 void video_player_set_threads(unsigned threads);
 
 /* Tears down the shared worker and its pool, which the next player
- * that decodes threaded creates again. Call with no player decoding. */
+ * that decodes threaded creates again. Stop threaded players first;
+ * this joins any running stopped decode. */
 void video_player_worker_deinit(void);
 
 RETRO_END_DECLS

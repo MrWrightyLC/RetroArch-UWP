@@ -259,7 +259,6 @@ struct runloop
     * per access, and a constructor/destructor function-pointer pair
     * for what amounts to alloc/free of a data buffer. */
    retro_ctx_serialize_info_t runahead_savestate_info;
-   my_list *input_state_list;
    preempt_t *preempt_data;
 #endif
 
@@ -403,8 +402,8 @@ struct runloop
     * iteration (see menu_core_due_ns), so nothing that counts the
     * core's frames - achievements - steps either. Main thread only. */
    bool menu_core_skipped;
-   /* Set by RETRO_ENVIRONMENT_SET_VIDEO_VIEWS when a headset took the
-    * map, read by the GET_VR_FRAME_STATE/GET_VR_HEAD_POSE calls. */
+   /* The core uses a tracking headset: a tracked map was accepted or it
+    * asked for a pose. It is sampled before each run until it unloads. */
 #ifdef HAVE_OPENXR
    bool core_vr_content;
 #endif
@@ -841,7 +840,10 @@ enum runloop_frame_work
    RUNLOOP_WORK_PRESENCE = (1 << 1),  /* a rich-presence sink is up */
    RUNLOOP_WORK_CHEATS   = (1 << 2),  /* a cheat list is loaded */
    RUNLOOP_WORK_CAMERA   = (1 << 3),  /* the core started the camera */
-   RUNLOOP_WORK_CHEEVOS  = (1 << 4)   /* achievements attached to content */
+   RUNLOOP_WORK_CHEEVOS  = (1 << 4),  /* achievements attached to content */
+   RUNLOOP_WORK_RUN_FRAMES = (1 << 5), /* RUN_FRAMES is advancing frames */
+   RUNLOOP_WORK_PAUSE_LOADED = (1 << 6), /* pause once the content has run */
+   RUNLOOP_WORK_FREE_FRAME = (1 << 7) /* a frame with no job to tell of */
 };
 
 /* Raise or drop one frame_work bit from the product that owns it.

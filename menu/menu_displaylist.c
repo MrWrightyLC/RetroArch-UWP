@@ -145,6 +145,9 @@
 #include "../manual_content_scan.h"
 #include "../core_backup.h"
 #include "../misc/cpufreq/cpufreq.h"
+#ifdef HAVE_LAKKA_SWITCH
+#include "../misc/reboot2payload/reboot2payload.h"
+#endif
 #include "../input/input_remapping.h"
 
 #ifdef HAVE_MICROPHONE
@@ -5592,8 +5595,9 @@ static unsigned menu_displaylist_parse_playlists(
 
    if (horizontal)
    {
-      if (!dir_list_initialize(&str_list, path, NULL, true,
-            show_hidden_files, true, false))
+      if (     (retroarch_get_flags() & RARCH_FLAGS_USER_DIRS_HELD)
+            || !dir_list_initialize(&str_list, path, NULL, true,
+               show_hidden_files, true, false))
          return count;
 
       dir_list_sort_ignore_ext(&str_list, true);
@@ -8821,6 +8825,33 @@ static unsigned menu_displaylist_parse_settings_rows(
    return count;
 }
 
+/* Monitor Index offers Auto and the monitors the display server
+ * lists, plus the index chosen now whatever it is; a server without
+ * a list keeps the setting's full range. The output table lives in
+ * a frame of its own. */
+static VIDEO_NOINLINE void menu_displaylist_monitor_index_range(void)
+{
+   static float range_max   = -1.0f;
+   video_output_info_t outputs[16];
+   int n, cap;
+   unsigned cur;
+   rarch_setting_t *setting = menu_setting_find_enum(
+         MENU_ENUM_LABEL_VIDEO_MONITOR_INDEX);
+   if (!setting)
+      return;
+   if (range_max < 0.0f)
+      range_max             = setting->max;
+   cap                      = (int)range_max;
+   if (cap > (int)ARRAY_SIZE(outputs))
+      cap                   = (int)ARRAY_SIZE(outputs);
+   n                        = video_display_server_list_outputs(outputs, cap);
+   cur                      = setting_uint_get(setting);
+   if (n <= 0)
+      setting->max          = range_max;
+   else
+      setting->max          = (float)(cur > (unsigned)n ? cur : (unsigned)n);
+}
+
 unsigned menu_displaylist_build_list(
       file_list_t *list,
       settings_t *settings,
@@ -9242,7 +9273,8 @@ unsigned menu_displaylist_build_list(
                   continue;
 #ifndef HAVE_OPENXR
                else if (     key == RARCH_HEADSET_RECENTER
-                          || key == RARCH_LASER_POINTER_TOGGLE)
+                          || key == RARCH_LASER_POINTER_TOGGLE
+                          || key == RARCH_HEADSET_VIEW_TOGGLE)
                   continue;
 #endif
                /* Show combo entries before normal binds */
@@ -12004,14 +12036,11 @@ unsigned menu_displaylist_build_list(
             {
                static const menu_displaylist_settings_row_t dl_rows_8[] = {
                   { MENU_ENUM_LABEL_VIDEO_DRIVER, PARSE_ONLY_STRING_OPTIONS, false },
-#ifndef __APPLE__
-                  /* Hide 'Threaded Video' from the menu on Apple platforms;
-                   * the underlying video_threaded setting itself is kept. */
                   { MENU_ENUM_LABEL_VIDEO_THREADED, PARSE_ONLY_BOOL, false },
-#endif
                   { MENU_ENUM_LABEL_VIDEO_GPU_INDEX, PARSE_ONLY_INT, false },
                   { MENU_ENUM_LABEL_VIDEO_MONITOR_INDEX, PARSE_ONLY_UINT, false },
                   { MENU_ENUM_LABEL_VIDEO_SWAPCHAIN_BIT_DEPTH, PARSE_ONLY_UINT, false },
+                  { MENU_ENUM_LABEL_VIDEO_HW_DECODE, PARSE_ONLY_UINT, false },
                };
                count += menu_displaylist_parse_settings_rows(list, settings,
                      dl_rows_8, (unsigned)ARRAY_SIZE(dl_rows_8));
@@ -12037,6 +12066,7 @@ unsigned menu_displaylist_build_list(
                   if (gpu_setting && gpu_devices && gpu_devices->size > 0)
                      gpu_setting->max = (float)(gpu_devices->size - 1);
                }
+               menu_displaylist_monitor_index_range();
             }
 #if defined(WIIU)
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
@@ -12153,6 +12183,7 @@ unsigned menu_displaylist_build_list(
                {MENU_ENUM_LABEL_VIDEO_ADAPTIVE_VSYNC,       PARSE_ONLY_BOOL, false},
                {MENU_ENUM_LABEL_VIDEO_HARD_SYNC,            PARSE_ONLY_BOOL, false},
                {MENU_ENUM_LABEL_VIDEO_HARD_SYNC_FRAMES,     PARSE_ONLY_UINT, false},
+               {MENU_ENUM_LABEL_VIDEO_D3D9EX_PRESENT,       PARSE_ONLY_BOOL, false},
                {MENU_ENUM_LABEL_VIDEO_WAITABLE_SWAPCHAINS,  PARSE_ONLY_BOOL, false},
                {MENU_ENUM_LABEL_VIDEO_THREADED_PRESENT_REPEAT, PARSE_ONLY_BOOL, false},
                {MENU_ENUM_LABEL_VIDEO_THREADED_DISPLAY_PACING, PARSE_ONLY_BOOL, false},
@@ -12193,6 +12224,15 @@ unsigned menu_displaylist_build_list(
                      break;
                   case MENU_ENUM_LABEL_VIDEO_HARD_SYNC_FRAMES:
                      build_list[i].checked = video_vsync && hard_sync && video_hard_sync;
+                     break;
+                  case MENU_ENUM_LABEL_VIDEO_D3D9EX_PRESENT:
+                     {
+                        /* Only the Direct3D 9 drivers read it */
+                        const char *ident = video_driver_get_ident();
+                        build_list[i].checked =
+                              string_is_equal(ident, "d3d9_hlsl")
+                           || string_is_equal(ident, "d3d9_cg");
+                     }
                      break;
                   case MENU_ENUM_LABEL_VIDEO_WAITABLE_SWAPCHAINS:
                      build_list[i].checked = video_vsync && frame_latency;
@@ -12304,9 +12344,14 @@ unsigned menu_displaylist_build_list(
          break;
       case DISPLAYLIST_VIDEO_STEREO_SETTINGS_LIST:
 #ifdef HAVE_OPENXR
-         /* A headset gives each eye its own image (Vulkan only). */
+         /* A headset gives each eye its own image. */
+#ifdef ANDROID
+         if (!video_context_driver_headset_inline())
+#else
          if (     !settings->bools.video_openxr_enable
-               || !string_is_equal(settings->arrays.video_driver, "vulkan"))
+               || !video_driver_has_headset_path(
+                  settings->arrays.video_driver))
+#endif
 #endif
          {
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
@@ -12323,16 +12368,23 @@ unsigned menu_displaylist_build_list(
                   PARSE_ONLY_UINT, false) == 0)
             count++;
 #ifdef HAVE_OPENXR
-         /* Headset output is the Vulkan driver's. */
-         if (string_is_equal(settings->arrays.video_driver, "vulkan"))
+         if (video_driver_has_headset_path(settings->arrays.video_driver))
          {
+#ifndef ANDROID
+            /* A headset's own context needs no switch: Android starts
+             * in the headset when there is one. */
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                      MENU_ENUM_LABEL_VIDEO_OPENXR_ENABLE,
                      PARSE_ONLY_BOOL, false) == 0)
                count++;
+#endif
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                      MENU_ENUM_LABEL_VIDEO_OPENXR_REFRESH_RATE,
                      PARSE_ONLY_UINT, false) == 0)
+               count++;
+            if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                     MENU_ENUM_LABEL_VIDEO_OPENXR_PERF_BOOST,
+                     PARSE_ONLY_BOOL, false) == 0)
                count++;
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                      MENU_ENUM_LABEL_VIDEO_OPENXR_DISTANCE,
@@ -12341,6 +12393,10 @@ unsigned menu_displaylist_build_list(
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                      MENU_ENUM_LABEL_VIDEO_OPENXR_WIDTH,
                      PARSE_ONLY_FLOAT, false) == 0)
+               count++;
+            if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                     MENU_ENUM_LABEL_VIDEO_OPENXR_PLACEMENT,
+                     PARSE_ONLY_UINT, false) == 0)
                count++;
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                      MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS,
@@ -12497,21 +12553,37 @@ unsigned menu_displaylist_build_list(
 #endif
 #ifdef HAVE_LAKKA_SWITCH
       case DISPLAYLIST_LAKKA_SWITCH_OPTIONS_LIST:
-         {
-            static const menu_displaylist_build_info_t build_list[] = {
-               {MENU_ENUM_LABEL_SWITCH_OC_ENABLE,                                            PARSE_ONLY_BOOL},
-               {MENU_ENUM_LABEL_SWITCH_CEC_ENABLE,                                           PARSE_ONLY_BOOL},
-               {MENU_ENUM_LABEL_BLUETOOTH_ERTM_DISABLE,                                      PARSE_ONLY_BOOL},
-            };
+         if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                  MENU_ENUM_LABEL_SWITCH_OC_ENABLE,
+                  PARSE_ONLY_BOOL, false) == 0)
+            count++;
 
-            for (i = 0; i < ARRAY_SIZE(build_list); i++)
-            {
-               if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
-                        build_list[i].enum_idx,  build_list[i].parse_type,
-                        false) == 0)
-                  count++;
-            }
+         /* Reboot-to-payload needs the pmc_r2p kernel driver. The
+          * payload selector has no backing rarch_setting_t; its
+          * Left/Right/OK/value callbacks live in menu/cbs. */
+         if (r2p_is_supported())
+         {
+            if (menu_entries_append(list,
+                     msg_hash_to_str(MENU_ENUM_LABEL_VALUE_REBOOT_PAYLOAD),
+                     msg_hash_to_str(MENU_ENUM_LABEL_REBOOT_PAYLOAD),
+                     MENU_ENUM_LABEL_REBOOT_PAYLOAD,
+                     MENU_SETTING_ACTION, 0, 0, NULL))
+               count++;
+
+            if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                     MENU_ENUM_LABEL_REBOOT_FORCE_SELF_ON_UPDATE,
+                     PARSE_ONLY_BOOL, false) == 0)
+               count++;
          }
+
+         if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                  MENU_ENUM_LABEL_SWITCH_CEC_ENABLE,
+                  PARSE_ONLY_BOOL, false) == 0)
+            count++;
+         if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                  MENU_ENUM_LABEL_BLUETOOTH_ERTM_DISABLE,
+                  PARSE_ONLY_BOOL, false) == 0)
+            count++;
          break;
 #endif
       case DISPLAYLIST_MENU_VIEWS_SETTINGS_LIST:
@@ -12828,7 +12900,7 @@ unsigned menu_displaylist_build_list(
                {MENU_ENUM_LABEL_RUN_AHEAD_HIDE_WARNINGS,               PARSE_ONLY_BOOL, false },
 #endif
                {MENU_ENUM_LABEL_AUDIO_LATENCY,                         PARSE_ONLY_UINT, true },
-               {MENU_ENUM_LABEL_AUDIO_LATENCY_FLOOR,                   PARSE_ONLY_UINT, false },
+               {MENU_ENUM_LABEL_AUDIO_LATENCY_FLOOR,                   PARSE_ONLY_UINT, true },
 #ifdef HAVE_MICROPHONE
                {MENU_ENUM_LABEL_MICROPHONE_LATENCY,                    PARSE_ONLY_UINT, true },
 #endif
@@ -14512,7 +14584,7 @@ static unsigned menu_displaylist_build_shader_parameter(
    max                         = param->maximum;
    half_step                   = param->step * 0.5f;
    current_value               = min;
-   original_value              = param->current;
+   original_value              = video_shader_param_get(param);
 
    if (half_step <= 0.0) /* safety check */
    {
@@ -14981,12 +15053,11 @@ static bool menu_displaylist_ctl_internal(
                               0)))
                   {
                      unsigned i;
-                     const cdrom_toc_t *toc    = retro_vfs_file_get_cdrom_toc();
+                     const cdrom_toc_t *toc    = retro_vfs_file_get_cdrom_toc(
+                           filestream_get_vfs_handle(file));
                      unsigned first_data_track = 1;
                      atip                      = cdrom_has_atip(
                            filestream_get_vfs_handle(file));
-
-                     filestream_close(file);
 
                      for (i = 0; i < toc->num_tracks; i++)
                      {
@@ -15093,6 +15164,7 @@ static bool menu_displaylist_ctl_internal(
                      }
                      else
                         RARCH_ERR("[CDROM] Could not detect any disc info.\n");
+                     filestream_close(file);
                   }
                   else
                      RARCH_ERR("[CDROM] Error opening file for reading: %s.\n", file_path);
@@ -17616,10 +17688,14 @@ static bool menu_displaylist_ctl_internal(
 
 #if defined(HAVE_LAKKA)
                if (settings->bools.menu_show_reboot)
+               {
+                  /* What the Reboot entry's value shows. */
+                  lakka_update_check();
                   if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(info->list,
                            MENU_ENUM_LABEL_REBOOT,
                            PARSE_ACTION, false) == 0)
                      count++;
+               }
 
                if (settings->bools.menu_show_shutdown)
                   if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(info->list,
@@ -18103,7 +18179,7 @@ static bool menu_displaylist_ctl_internal(
                               char val_d[16];
                               char val_s[NAME_MAX_LENGTH];
                               char orig_val[NAME_MAX_LENGTH];
-                              const char *values        = setting->values;
+                              const char *values        = setting->aux.values;
                               const char *p             = values;
                               unsigned i                = 0;
                               bool checked_found        = false;
@@ -18532,7 +18608,7 @@ static bool menu_displaylist_ctl_internal(
                      case ST_STRING_OPTIONS:
                         {
                            char val_d[16];
-                           const char *p       = setting->values;
+                           const char *p       = setting->aux.values;
                            unsigned i          = 0;
                            int checked_found   = 0;
                            unsigned checked    = 0;

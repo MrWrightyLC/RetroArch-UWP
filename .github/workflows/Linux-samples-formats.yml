@@ -85,8 +85,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.ccache
           key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
@@ -100,7 +103,7 @@ jobs:
           export CCACHE_DIR="$HOME/.ccache"
           echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
-          ccache -M 500M
+          ccache -M 250M
           ccache -z
 
       - name: Build and run dts_lpcm_test (plain, ASan + UBSan)
@@ -133,10 +136,10 @@ jobs:
           # decoder is for: every frame repacked to the plain core,
           # put in the IEC 61937 burst its sample count calls for, and
           # read back out of that burst byte for byte.
-          make clean all
+          make clean && make -j$(nproc) all
           ./dts_lpcm_test
           echo "[pass] dts_lpcm_test"
-          make clean all SANITIZER=address,undefined
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ./dts_lpcm_test
           echo "[pass] dts_lpcm_test (ASan)"
 
@@ -173,7 +176,7 @@ jobs:
           # paths and report a pass.  That count is kept per format, not
           # just in total, so one decoder quietly ceasing to accept its
           # seed cannot hide behind the other three.
-          make clean all SANITIZER=address,undefined
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
           test -x image_decode_fuzz_test
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
              timeout 120 ./image_decode_fuzz_test
@@ -238,11 +241,33 @@ jobs:
           # begin on, it must accept before the whole file has arrived
           # (or partial decoding is silently off), and it must be
           # monotonic in the prefix length.
-          make clean all SANITIZER=address,undefined
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
           test -x image_avail_test
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
              timeout 120 ./image_avail_test
           echo "[pass] image_avail_test"
+
+      - name: AV1 picture tools, frame prefixes, tiles and container packets (ASan + UBSan)
+        working-directory: libretro-common/samples/formats/av1
+        run: |
+          make check SANITIZER=address,undefined
+          python3 fixtures.py
+          python3 tile_fixtures.py
+          python3 frame_fixtures.py
+          python3 picture_fixtures.py
+          python3 reference_fixtures.py
+          python3 grain_fixtures.py
+          python3 state_fixtures.py
+
+      - name: Vulkan AV1 parameters against real streams (ASan + UBSan)
+        working-directory: samples/gfx/vulkan_video_caps
+        run: |
+          make av1_params_test SANITIZER=address,undefined
+          python3 av1_fixtures.py
+
+      - name: VP9 sessions and WebM GPU dispatch (ASan + UBSan)
+        working-directory: libretro-common/samples/formats/vp9
+        run: make check stream-check SANITIZER=address,undefined
 
       - name: Build and run video_hdr_fp16_test (ASan + UBSan + LSan)
         shell: bash
@@ -255,7 +280,7 @@ jobs:
           # SDR-tagged twins, and any stream decoding into its own
           # canvas, keep the 32-bit paths. Fixtures made with ffmpeg
           # (libx265, libvpx-vp9) from known 10-bit grey.
-          make clean all SANITIZER=address,undefined
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
              timeout 120 ./video_hdr_fp16_test
 
@@ -271,7 +296,21 @@ jobs:
           # 70x44 so widths and heights off a multiple of four - where
           # the source pitch and the tile width part ways - are all
           # covered.
-          make clean all SANITIZER=address,undefined
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
           test -x image_tile_gx_test
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
              timeout 120 ./image_tile_gx_test
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}

@@ -49,6 +49,19 @@
 #include "../drivers_shader/shader_vulkan.h"
 #include "../include/vulkan/vulkan.h"
 
+#ifndef VK_KHR_unified_image_layouts
+#define VK_KHR_unified_image_layouts 1
+#define VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME "VK_KHR_unified_image_layouts"
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR ((VkStructureType)1000527000)
+typedef struct VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR
+{
+   VkStructureType sType;
+   void *pNext;
+   VkBool32 unifiedImageLayouts;
+   VkBool32 unifiedImageLayoutsVideo;
+} VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR;
+#endif
+
 #define VULKAN_IMAGE_LAYOUT_TRANSITION_LEVELS(cmd, img, levels, old_layout, new_layout, src_access, dst_access, src_stages, dst_stages, src_queue_family_idx, dst_queue_family_idx) \
 { \
    VkImageMemoryBarrier barrier; \
@@ -132,10 +145,9 @@ enum vk_flags
     * cached system memory, never video memory, because the core and the
     * frontend may read a lent frame back. */
    VK_FLAG_TEXTURE_FOR_LEND     = (1 << 21),
-   /* frontend uses openxr */
+   /* A headset's own context: the window is images nothing presents,
+    * and the headset's frame is begun and ended around this one. */
    VK_FLAG_OPEN_XR              = (1 << 22),
-   /* core opted into VR via SET_VIDEO_VIEWS */
-   VK_FLAG_XR_STEREO            = (1 << 23),
    /* Held across creating a texture a compute shader writes */
    VK_FLAG_TEXTURE_FOR_STORAGE  = (1 << 24)
 };
@@ -190,7 +202,13 @@ enum vulkan_context_flags
    VK_CTX_FLAG_HDR_SCRGB                    = (1 << 6),
    /* The device was made with timeline semaphores, which imported
     * frames are synchronised with */
-   VK_CTX_FLAG_TIMELINE_SEMAPHORE           = (1 << 7)
+   VK_CTX_FLAG_TIMELINE_SEMAPHORE           = (1 << 7),
+   /* The swapchain was rebuilt because the one before it presented
+    * suboptimal, and has not presented optimally since: a suboptimal
+    * present from it is the surface's standing answer, not a request
+    * to rebuild again. */
+   VK_CTX_FLAG_SUBOPTIMAL_REBUILT           = (1 << 8),
+   VK_CTX_FLAG_VIDEO_GENERAL                = (1 << 9)
 };
 
 enum gfx_ctx_vulkan_data_flags
@@ -319,12 +337,22 @@ typedef struct vulkan_context
     * that would not change the swapchain does not recreate it. */
    VkPresentModeKHR swapchain_present_mode;
 
+   uint16_t flags;
    int8_t swap_interval;
-   uint8_t flags;
 
    bool swapchain_fences_signalled[VULKAN_MAX_SWAPCHAIN_IMAGES];
    /* A present was queued since present_fence was last waited on. */
    bool present_pending;
+   /* Hardware video decode (vulkan_video_decode.c), where the device
+    * was made with it: the family of the video decode queues, and the
+    * family and first index of as many transfer queues beside them,
+    * which decoded pictures are copied out on. One of each per stream
+    * decoding at once; video_lanes 0 when there are none. */
+   uint32_t video_decode_family;
+   uint32_t video_xfer_family;
+   uint32_t video_xfer_first;
+   uint32_t video_lanes;
+   uint32_t video_codec_operations;
 } vulkan_context_t;
 
 /* The acquire thread behind emulated mailbox, and the thread that
@@ -389,6 +417,12 @@ typedef struct gfx_ctx_vulkan_data
    PFN_vkVoidFunction display_timing_query;
    uint32_t present_id;
    bool display_timing_supported;
+#ifdef HAVE_OPENXR
+   /* A headset's own context (the Quest's): OpenXR starts whatever
+    * Headset Output says, and a failure falls through to the flat
+    * context instead of rebuilding video. */
+   bool openxr_headset;
+#endif
 #ifdef VULKAN_HDR_SWAPCHAIN
    /* Loaded from VK_EXT_hdr_metadata when that optional device extension is
     * present; NULL otherwise. Used to signal SMPTE-2086 mastering-display
@@ -494,6 +528,8 @@ bool vulkan_context_init_headless_device(gfx_ctx_vulkan_data_t *vk);
 bool vulkan_context_create_android_surface(gfx_ctx_vulkan_data_t *vk,
    void *window);
 void vulkan_context_advance_frame(gfx_ctx_vulkan_data_t *vk);
+/* Waits on the frame fences, not the device: no queue lock needed. */
+void vulkan_context_finish_frames(gfx_ctx_vulkan_data_t *vk);
 #endif
 
 #ifdef __APPLE__

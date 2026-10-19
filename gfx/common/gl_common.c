@@ -20,6 +20,7 @@
 #endif
 
 #include <stdlib.h>
+#include <string.h>
 
 #include <glsym/glsym.h>
 
@@ -57,7 +58,7 @@ void gl_finish(void)
    glFinish();
 }
 
-#ifdef HAVE_GL_TEXTURE_LEND
+#ifdef HAVE_GL_FRAME_MEM
 #include <gfx/gl_capabilities.h>
 
 #ifndef GL_MAP_PERSISTENT_BIT
@@ -90,7 +91,78 @@ void gl_finish(void)
 #define GL_CONDITION_SATISFIED        0x911C
 #endif
 
+#ifndef GL_MAP_READ_BIT
+#define GL_MAP_READ_BIT               0x0001
+#endif
+#ifndef GL_CLIENT_STORAGE_BIT
+#define GL_CLIENT_STORAGE_BIT         0x0200
+#endif
+
+#ifdef HAVE_OPENGLES
+/* EXT_buffer_storage: the same storage, flags and values under the
+ * extension's name */
+#define gl_buffer_storage glBufferStorageEXT
+
+/* GLES 3.0 for the mapping and the fences, a version a GLES 3 build
+ * can be handed less than; EXT_buffer_storage for the persistence */
+static bool gl_buffer_storage_supported(void)
+{
+   const char *ver = (const char*)glGetString(GL_VERSION);
+   if (     !glBufferStorageEXT || !ver
+         || strncmp(ver, "OpenGL ES ", 10)
+         || ver[10] < '3' || ver[10] > '9')
+      return false;
+   return gl_query_extension("EXT_buffer_storage");
+}
+#else
+#define gl_buffer_storage glBufferStorage
+
+/* Persistent mapping is GL 4.4 or ARB_buffer_storage, fences GL 3.2
+ * or ARB_sync */
+static bool gl_buffer_storage_supported(void)
+{
+   const char *ver = (const char*)glGetString(GL_VERSION);
+   int major       = 0, minor = 0;
+   if (!glBufferStorage || !glMapBufferRange || !glFenceSync
+         || !glClientWaitSync)
+      return false;
+   if (     ver && ver[0] >= '0' && ver[0] <= '9' && ver[1] == '.'
+         && ver[2] >= '0' && ver[2] <= '9')
+   {
+      major = ver[0] - '0';
+      minor = ver[2] - '0';
+   }
+   if (major > 4 || (major == 4 && minor >= 4))
+      return true;
+   return    gl_query_extension("ARB_buffer_storage")
+          && (major > 3 || (major == 3 && minor >= 2)
+             || gl_query_extension("ARB_sync"));
+}
+#endif
+
+#ifdef HAVE_GL_TEXTURE_LEND
 #define GL_LEND_SLOTS 2
+
+#ifndef GL_TEXTURE_WIDTH
+#define GL_TEXTURE_WIDTH 0x1000
+#endif
+#ifndef GL_TEXTURE_HEIGHT
+#define GL_TEXTURE_HEIGHT 0x1001
+#endif
+
+static bool gl_texture_lend_supported(void)
+{
+#ifdef HAVE_OPENGLES
+   const char *ver = (const char*)glGetString(GL_VERSION);
+   if (!glGetTexLevelParameteriv || !ver
+         || strncmp(ver, "OpenGL ES ", 10)
+         || ver[10] < '3' || ver[10] > '9'
+         || (ver[10] == '3' && (ver[11] != '.'
+               || ver[12] < '1' || ver[12] > '9')))
+      return false;
+#endif
+   return gl_buffer_storage_supported();
+}
 
 struct gl_texture_lend
 {
@@ -115,28 +187,6 @@ static gl_texture_lend_t *gl_texture_lend_find(gl_texture_lend_t *list,
    return list;
 }
 
-/* Persistent mapping is GL 4.4 or ARB_buffer_storage, fences GL 3.2
- * or ARB_sync */
-static bool gl_texture_lend_supported(void)
-{
-   const char *ver = (const char*)glGetString(GL_VERSION);
-   int major       = 0, minor = 0;
-   if (!glBufferStorage || !glMapBufferRange || !glFenceSync
-         || !glClientWaitSync)
-      return false;
-   if (     ver && ver[0] >= '0' && ver[0] <= '9' && ver[1] == '.'
-         && ver[2] >= '0' && ver[2] <= '9')
-   {
-      major = ver[0] - '0';
-      minor = ver[2] - '0';
-   }
-   if (major > 4 || (major == 4 && minor >= 4))
-      return true;
-   return    gl_query_extension("ARB_buffer_storage")
-          && (major > 3 || (major == 3 && minor >= 2)
-             || gl_query_extension("ARB_sync"));
-}
-
 static void gl_texture_lend_destroy(gl_texture_lend_t *st)
 {
    unsigned i;
@@ -155,8 +205,8 @@ static gl_texture_lend_t *gl_texture_lend_new(unsigned tex, size_t pitch)
    GLint w = 0, h = 0, ifmt = 0;
    size_t bpp;
    gl_texture_lend_t *st;
-   GLbitfield flags = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT
-      | GL_MAP_COHERENT_BIT;
+   GLbitfield flags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT
+      | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
 
    if (!gl_texture_lend_supported())
       return NULL;
@@ -178,7 +228,7 @@ static gl_texture_lend_t *gl_texture_lend_new(unsigned tex, size_t pitch)
    for (i = 0; i < GL_LEND_SLOTS; i++)
    {
       glBindBuffer(GL_PIXEL_UNPACK_BUFFER, st->pbo[i]);
-      glBufferStorage(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)st->size,
+      gl_buffer_storage(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)st->size,
             NULL, flags);
       st->mapped[i] = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0,
             (GLsizeiptr)st->size, flags);
@@ -296,6 +346,201 @@ void gl_texture_lend_free(gl_texture_lend_t **list)
       *list = st->next;
       gl_texture_lend_destroy(st);
    }
+}
+
+#endif /* HAVE_GL_TEXTURE_LEND */
+
+#define GL_FRAME_MEM_MAX 12
+
+struct gl_frame_mem
+{
+   GLsync   fence[GL_FRAME_MEM_MAX];
+   void    *mapped[GL_FRAME_MEM_MAX];
+   size_t   size[GL_FRAME_MEM_MAX];
+   GLuint   pbo[GL_FRAME_MEM_MAX];
+   /* As a lent slot's: an upload issued and not seen to finish */
+   bool     busy[GL_FRAME_MEM_MAX];
+};
+
+void *gl_frame_mem_alloc(gl_frame_mem_t **fm, size_t size, uintptr_t *id)
+{
+   unsigned i;
+   gl_frame_mem_t *f;
+   /* Readable too: a frame lent and pushed is read back as the cached
+    * frame (a screenshot, a paused redraw elsewhere), which client
+    * storage, a hint, keeps in system memory where the GL can */
+   GLbitfield flags = GL_MAP_WRITE_BIT | GL_MAP_READ_BIT
+      | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+   GLbitfield store = flags | GL_CLIENT_STORAGE_BIT;
+
+   if (!fm || !size || !gl_buffer_storage_supported())
+      return NULL;
+   if (!*fm && !(*fm = (gl_frame_mem_t*)calloc(1, sizeof(**fm))))
+      return NULL;
+   f = *fm;
+   for (i = 0; i < GL_FRAME_MEM_MAX; i++)
+      if (!f->pbo[i])
+         break;
+   if (i == GL_FRAME_MEM_MAX)
+      return NULL;
+   glGenBuffers(1, &f->pbo[i]);
+   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, f->pbo[i]);
+   gl_buffer_storage(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)size, NULL, store);
+   f->mapped[i] = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0,
+         (GLsizeiptr)size, flags);
+   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+   if (!f->mapped[i])
+   {
+      glDeleteBuffers(1, &f->pbo[i]);
+      f->pbo[i] = 0;
+      return NULL;
+   }
+   f->size[i] = size;
+   f->busy[i] = false;
+   *id        = (uintptr_t)i + 1;
+   return f->mapped[i];
+}
+
+static bool gl_frame_mem_slot_ready(gl_frame_mem_t *f, unsigned i)
+{
+   GLenum r;
+   if (!f->busy[i])
+      return true;
+   if (     !f->fence[i]
+         && !(f->fence[i] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0)))
+      return false;
+   r = glClientWaitSync(f->fence[i], 0, 0);
+   if (r != GL_ALREADY_SIGNALED && r != GL_CONDITION_SATISFIED)
+      return false;
+   glDeleteSync(f->fence[i]);
+   f->fence[i] = 0;
+   f->busy[i]  = false;
+   return true;
+}
+
+bool gl_frame_mem_ready(gl_frame_mem_t *fm, uintptr_t id)
+{
+   if (!fm || !id || id > GL_FRAME_MEM_MAX || !fm->pbo[id - 1])
+      return true;
+   return gl_frame_mem_slot_ready(fm, (unsigned)id - 1);
+}
+
+void gl_frame_mem_free(gl_frame_mem_t *fm, uintptr_t id)
+{
+   unsigned i;
+   if (!fm || !id || id > GL_FRAME_MEM_MAX || !fm->pbo[id - 1])
+      return;
+   i = (unsigned)id - 1;
+   if (fm->fence[i])
+      glDeleteSync(fm->fence[i]);
+   /* Deleting a mapped buffer unmaps it */
+   glDeleteBuffers(1, &fm->pbo[i]);
+   fm->fence[i]  = 0;
+   fm->pbo[i]    = 0;
+   fm->mapped[i] = NULL;
+   fm->size[i]   = 0;
+   fm->busy[i]   = false;
+}
+
+int gl_frame_mem_bind(gl_frame_mem_t *fm, const void *pixels,
+      size_t extent, size_t *offset)
+{
+   unsigned i;
+   uintptr_t p = (uintptr_t)pixels;
+   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+   if (!fm || !p)
+      return -1;
+   for (i = 0; i < GL_FRAME_MEM_MAX; i++)
+   {
+      uintptr_t base = (uintptr_t)fm->mapped[i];
+      if (     base && p >= base && p - base < fm->size[i]
+            && extent <= fm->size[i] - (size_t)(p - base))
+      {
+         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, fm->pbo[i]);
+         *offset = (size_t)(p - base);
+         return (int)i;
+      }
+   }
+   return -1;
+}
+
+void gl_frame_mem_unbind(gl_frame_mem_t *fm, int slot)
+{
+   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+   if (!fm || slot < 0 || slot >= GL_FRAME_MEM_MAX)
+      return;
+   if (fm->fence[slot])
+      glDeleteSync(fm->fence[slot]);
+   fm->busy[slot]  = true;
+   fm->fence[slot] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+}
+
+bool gl_sw_fb_fits(const gl_sw_fb_t *sw, unsigned width, unsigned height,
+      unsigned bpp)
+{
+   return sw->dims == ((width << 16) | height) && sw->bpp == bpp;
+}
+
+void gl_sw_fb_free(gl_frame_mem_t *fm, gl_sw_fb_t *sw)
+{
+   unsigned i;
+   for (i = 0; i < GL_SW_FB_SLOTS; i++)
+      gl_frame_mem_free(fm, sw->id[i]);
+   memset(sw, 0, sizeof(*sw));
+}
+
+void *gl_sw_fb_lend(gl_frame_mem_t **fm, gl_sw_fb_t *sw,
+      unsigned width, unsigned height, unsigned bpp)
+{
+   unsigned i, k;
+   if (!fm || !width || !height || width > 0xffff || height > 0xffff)
+      return NULL;
+   if (!gl_sw_fb_fits(sw, width, height, bpp))
+   {
+      size_t size = (size_t)width * bpp * height;
+      gl_sw_fb_free(*fm, sw);
+      sw->dims    = (width << 16) | height;
+      sw->bpp     = bpp;
+      for (i = 0; i < GL_SW_FB_SLOTS; i++)
+         if (!(sw->mapped[i] = gl_frame_mem_alloc(fm, size, &sw->id[i])))
+         {
+            unsigned dims = sw->dims;
+            gl_sw_fb_free(*fm, sw);
+            sw->dims   = dims;
+            sw->bpp    = bpp;
+            sw->failed = true;
+            return NULL;
+         }
+   }
+   if (sw->failed)
+      return NULL;
+   for (k = 0; k < GL_SW_FB_SLOTS; k++)
+   {
+      i = (sw->next + k) % GL_SW_FB_SLOTS;
+      if (     sw->id[i] != sw->last
+            && gl_frame_mem_ready(*fm, sw->id[i]))
+      {
+         sw->next = (i + 1) % GL_SW_FB_SLOTS;
+         return sw->mapped[i];
+      }
+   }
+   return NULL;
+}
+
+void gl_sw_fb_pushed(gl_sw_fb_t *sw, int slot)
+{
+   sw->last = (slot >= 0) ? (uintptr_t)slot + 1 : 0;
+}
+
+void gl_frame_mem_destroy(gl_frame_mem_t **fm)
+{
+   unsigned i;
+   if (!fm || !*fm)
+      return;
+   for (i = 0; i < GL_FRAME_MEM_MAX; i++)
+      gl_frame_mem_free(*fm, (uintptr_t)i + 1);
+   free(*fm);
+   *fm = NULL;
 }
 #endif
 
@@ -416,19 +661,18 @@ static const char gl_planar_legacy_fs[] =
 static GLuint gl_planar_shader(GLenum stage, const char **src,
       GLsizei n)
 {
-   GLint ok  = 0;
    GLuint sh = glCreateShader(stage);
-   if (!sh)
-      return 0;
-   glShaderSource(sh, n, src, NULL);
-   glCompileShader(sh);
-   glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
-   if (!ok)
+   if (sh)
    {
+      GLint ok  = 0;
+      glShaderSource(sh, n, src, NULL);
+      glCompileShader(sh);
+      glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+      if (ok)
+         return sh;
       glDeleteShader(sh);
-      return 0;
    }
-   return sh;
+   return 0;
 }
 
 /* The program and the triangle, made on the first planar texture; a

@@ -26,7 +26,13 @@
 #endif
 
 #include "vulkan_common.h"
+#ifdef HAVE_RMP4
+#include "vulkan_video_decode.h"
+#endif
+#include "vulkan_video_caps.h"
 #include "vulkan_memory_type.h"
+#include "vulkan_surface_format.h"
+#include "vulkan_swapchain_extent.h"
 #include "../include/vulkan/vulkan.h"
 #include "vksym.h"
 #ifdef HAVE_OPENXR
@@ -52,9 +58,6 @@
 
 #ifdef HAVE_OPENXR
 #include <openxr/openxr_platform.h>
-#ifdef ANDROID
-#include "../drivers_context/android_vk_openxr.h"
-#endif
 #endif
 
 #define VENDOR_ID_AMD 0x1002
@@ -94,6 +97,8 @@ static int                           cached_gpu_index_vk;
 static retro_vulkan_destroy_device_t cached_destroy_device_vk;
 static bool                          cached_instance_hdr_vk;
 static bool                          cached_timeline_vk;
+/* The video decode queues a cached device was made with */
+static uint32_t                      cached_video_vk[6];
 #ifdef HAVE_OPENXR
 /* Kept with a cached device: the runtime made it. */
 static vulkan_openxr_t              *cached_xr;
@@ -873,7 +878,8 @@ static const char *vulkan_optional_device_extensions[] = {
     * most Windows drivers, present on Android and Mesa. */
    "VK_GOOGLE_display_timing",
    /* What imported frames (a hardware decoder's) synchronise with */
-   "VK_KHR_timeline_semaphore"
+   "VK_KHR_timeline_semaphore",
+   VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME
 #ifdef VULKAN_HDR_SWAPCHAIN
    /* Lets the app signal SMPTE-2086 mastering-display metadata to the
     * compositor via vkSetHdrMetadataEXT. Optional: if absent (common on
@@ -892,6 +898,167 @@ static const char *vulkan_optional_device_extensions[] = {
 };
 
 
+/* Hardware video decode: codec-aware decode queues, transfer queues to copy
+ * the pictures out on, the extensions and the synchronization2 feature
+ * they need. On a device of our own with timeline semaphores only. */
+#define VULKAN_VIDEO_MAX_LANES 2
+
+/* Copies of any even offset and size: a family that moves whole
+ * blocks only (some DMA queues) cannot copy a cropped picture out. */
+#define VULKAN_VIDEO_GRANULARITY_1(q) \
+   (     (q).queueFamilyProperties.minImageTransferGranularity.width  == 1 \
+      && (q).queueFamilyProperties.minImageTransferGranularity.height == 1 \
+      && (q).queueFamilyProperties.minImageTransferGranularity.depth  == 1)
+
+typedef struct vulkan_video_probe
+{
+   uint32_t decode_family;
+   uint32_t xfer_family;
+   uint32_t xfer_first;
+   uint32_t lanes;
+   uint32_t codecs;
+} vulkan_video_probe_t;
+
+static bool vulkan_video_probe(gfx_ctx_vulkan_data_t *vk,
+      vulkan_video_probe_t *out, uint32_t allowed)
+{
+   PFN_vkGetPhysicalDeviceQueueFamilyProperties2 get_families;
+   PFN_vkGetPhysicalDeviceFeatures2 get_features;
+   VkPhysicalDeviceSynchronization2FeaturesKHR sync2;
+   VkPhysicalDeviceVideoDecodeVP9FeaturesKHR vp9;
+   VkPhysicalDeviceFeatures2 f2;
+   VkQueueFamilyProperties2 *qp         = NULL;
+   VkQueueFamilyVideoPropertiesKHR *vp  = NULL;
+   VkExtensionProperties *props         = NULL;
+   uint32_t inst_version                = VK_API_VERSION_1_0;
+   uint32_t gfx                         = vk->context.graphics_queue_index;
+   uint32_t n                           = 0;
+   uint32_t nprops                      = 0;
+   uint32_t dec_count                   = 0;
+   uint32_t xfer_count                  = 0;
+   uint32_t i;
+   int dec                              = -1;
+   int xfer                             = -1;
+   bool ok                              = false;
+
+   memset(out, 0, sizeof(*out));
+   if (!(vk->context.flags & VK_CTX_FLAG_TIMELINE_SEMAPHORE))
+      return false;
+   if (vkEnumerateInstanceVersion)
+      vkEnumerateInstanceVersion(&inst_version);
+   if (     inst_version < VK_API_VERSION_1_1
+         || vk->context.gpu_properties.apiVersion < VK_API_VERSION_1_1)
+      return false;
+   get_families = (PFN_vkGetPhysicalDeviceQueueFamilyProperties2)
+      vulkan_symbol_wrapper_instance_proc_addr()(vk->context.instance,
+            "vkGetPhysicalDeviceQueueFamilyProperties2");
+   get_features = (PFN_vkGetPhysicalDeviceFeatures2)
+      vulkan_symbol_wrapper_instance_proc_addr()(vk->context.instance,
+            "vkGetPhysicalDeviceFeatures2");
+   if (!get_families || !get_features)
+      return false;
+
+   if (     vkEnumerateDeviceExtensionProperties(vk->context.gpu, NULL,
+               &nprops, NULL) != VK_SUCCESS
+         || !nprops
+         || !(props = (VkExtensionProperties*)malloc(
+               nprops * sizeof(*props)))
+         || vkEnumerateDeviceExtensionProperties(vk->context.gpu, NULL,
+               &nprops, props) != VK_SUCCESS
+         || !(out->codecs = vulkan_video_supported_codecs(props, nprops)))
+      goto end;
+
+   sync2.sType            =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
+   memset(&vp9, 0, sizeof(vp9));
+   vp9.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_DECODE_VP9_FEATURES_KHR;
+   out->codecs &= allowed;
+#ifndef HAVE_RAV1
+   out->codecs &= ~VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR;
+#endif
+#ifndef HAVE_RVP9
+   out->codecs &= ~VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR;
+#endif
+   sync2.pNext            = (out->codecs & VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR) ? &vp9 : NULL;
+   sync2.synchronization2 = VK_FALSE;
+   f2.sType               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+   f2.pNext               = &sync2;
+   get_features(vk->context.gpu, &f2);
+   if (!sync2.synchronization2)
+      goto end;
+   if (!vp9.videoDecodeVP9) out->codecs &= ~VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR;
+
+   get_families(vk->context.gpu, &n, NULL);
+   if (     !n
+         || !(qp = (VkQueueFamilyProperties2*)calloc(n, sizeof(*qp)))
+         || !(vp = (VkQueueFamilyVideoPropertiesKHR*)calloc(n, sizeof(*vp))))
+      goto end;
+   for (i = 0; i < n; i++)
+   {
+      qp[i].sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2;
+      qp[i].pNext = &vp[i];
+      vp[i].sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_VIDEO_PROPERTIES_KHR;
+   }
+   get_families(vk->context.gpu, &n, qp);
+
+   /* a decode family of its own: the driver's queue is not to share */
+   dec = vulkan_video_select_decode_family(qp, vp, n, gfx, out->codecs, &out->codecs);
+   if (dec >= 0) dec_count = qp[dec].queueFamilyProperties.queueCount;
+   if (dec < 0)
+      goto end;
+
+   /* a transfer family of its own, else a compute one, else a second
+    * queue beside the driver's */
+   for (i = 0; i < n && xfer < 0; i++)
+   {
+      VkQueueFlags f = qp[i].queueFamilyProperties.queueFlags;
+      if (     i != (uint32_t)dec && i != gfx
+            && (f & VK_QUEUE_TRANSFER_BIT)
+            && !(f & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
+            && VULKAN_VIDEO_GRANULARITY_1(qp[i])
+            && qp[i].queueFamilyProperties.queueCount)
+      {
+         xfer       = (int)i;
+         xfer_count = qp[i].queueFamilyProperties.queueCount;
+      }
+   }
+   for (i = 0; i < n && xfer < 0; i++)
+   {
+      VkQueueFlags f = qp[i].queueFamilyProperties.queueFlags;
+      if (     i != (uint32_t)dec && i != gfx
+            && (f & VK_QUEUE_COMPUTE_BIT)
+            && VULKAN_VIDEO_GRANULARITY_1(qp[i])
+            && qp[i].queueFamilyProperties.queueCount)
+      {
+         xfer       = (int)i;
+         xfer_count = qp[i].queueFamilyProperties.queueCount;
+      }
+   }
+   if (xfer < 0 && gfx < n && qp[gfx].queueFamilyProperties.queueCount > 1)
+   {
+      xfer             = (int)gfx;
+      xfer_count       = qp[gfx].queueFamilyProperties.queueCount - 1;
+      out->xfer_first  = 1;
+   }
+   if (xfer < 0)
+      goto end;
+
+   out->decode_family = (uint32_t)dec;
+   out->xfer_family   = (uint32_t)xfer;
+   out->lanes         = dec_count < xfer_count ? dec_count : xfer_count;
+   if (out->lanes > VULKAN_VIDEO_MAX_LANES)
+      out->lanes = VULKAN_VIDEO_MAX_LANES;
+   ok = true;
+
+end:
+   free(props);
+   free(qp);
+   free(vp);
+   if (!ok)
+      memset(out, 0, sizeof(*out));
+   return ok;
+}
+
 static unsigned vulkan_optional_device_count(const gfx_ctx_vulkan_data_t *vk)
 {
    unsigned count = ARRAY_SIZE(vulkan_optional_device_extensions);
@@ -904,156 +1071,49 @@ static unsigned vulkan_optional_device_count(const gfx_ctx_vulkan_data_t *vk)
    return count;
 }
 
-#if defined(HAVE_OPENXR) && defined(ANDROID)
-static VkDevice vulkan_create_openxr_vulkan_device(
-      VkInstance vk_instance, VkPhysicalDevice gpu,
-      const VkDeviceCreateInfo *create_info)
-{
-   XrInstance xr_instance = android_vk_openxr_xr_instance();
-   PFN_xrCreateVulkanDeviceKHR create_vulkan_device = NULL;
-   PFN_xrGetVulkanGraphicsDevice2KHR get_vulkan_device = NULL;
-   XrVulkanDeviceCreateInfoKHR xr_device_info =
-      { XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR };
-   XrVulkanGraphicsDeviceGetInfoKHR get_device_info =
-      { XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR };
-   XrResult xr_result;
-   VkResult vulkan_result = VK_ERROR_INITIALIZATION_FAILED;
-   VkPhysicalDevice xr_gpu = VK_NULL_HANDLE;
-   VkDevice device = VK_NULL_HANDLE;
-
-   xr_result = xrGetInstanceProcAddr(
-         xr_instance,
-         "xrGetVulkanGraphicsDevice2KHR",
-         (PFN_xrVoidFunction*)&get_vulkan_device);
-
-   if (xr_result != XR_SUCCESS || !get_vulkan_device)
-   {
-      RARCH_ERR("[Vulkan] Failed to get xrGetVulkanGraphicsDevice2KHR (%d).\n",
-            xr_result);
-      return VK_NULL_HANDLE;
-   }
-
-   get_device_info.systemId = android_vk_openxr_xr_system_id();
-   get_device_info.vulkanInstance = vk_instance;
-
-   xr_result = get_vulkan_device(
-         xr_instance,
-         &get_device_info,
-         &xr_gpu);
-
-   if (xr_result != XR_SUCCESS || xr_gpu == VK_NULL_HANDLE)
-   {
-      char result_str[XR_MAX_RESULT_STRING_SIZE];
-
-      xrResultToString(xr_instance,
-            xr_result, result_str);
-
-      RARCH_ERR("[Vulkan] xrGetVulkanGraphicsDevice2KHR failed: %s (%d).\n",
-            result_str, xr_result);
-      return VK_NULL_HANDLE;
-   }
-
-   if (xr_gpu != gpu)
-   {
-      RARCH_ERR("[XR] OpenXR selected a different VkPhysicalDevice.\n");
-      return VK_NULL_HANDLE;
-   }
-
-   xr_result = xrGetInstanceProcAddr(
-         xr_instance,
-         "xrCreateVulkanDeviceKHR",
-         (PFN_xrVoidFunction*)&create_vulkan_device);
-
-   if (xr_result != XR_SUCCESS || !create_vulkan_device)
-   {
-      RARCH_ERR("[Vulkan] Failed to get xrCreateVulkanDeviceKHR (%d).\n",
-            xr_result);
-      return VK_NULL_HANDLE;
-   }
-
-   xr_device_info.systemId = android_vk_openxr_xr_system_id();
-   xr_device_info.pfnGetInstanceProcAddr =
-      vulkan_symbol_wrapper_instance_proc_addr();
-   xr_device_info.vulkanCreateInfo = create_info;
-   xr_device_info.vulkanPhysicalDevice = xr_gpu;
-   xr_device_info.vulkanAllocator = NULL;
-
-   xr_result = create_vulkan_device(
-         xr_instance,
-         &xr_device_info,
-         &device,
-         &vulkan_result);
-
-   if (xr_result != XR_SUCCESS || vulkan_result != VK_SUCCESS)
-   {
-      char result_str[XR_MAX_RESULT_STRING_SIZE];
-
-      xrResultToString(xr_instance,
-            xr_result, result_str);
-
-      RARCH_ERR("[Vulkan] xrCreateVulkanDeviceKHR failed: %s (%d), Vulkan result=%d.\n",
-            result_str, xr_result, vulkan_result);
-
-      return VK_NULL_HANDLE;
-   }
-
-   return device;
-}
-
-static VkResult vulkan_create_openxr_vulkan_instance(
-      const VkInstanceCreateInfo *info, VkInstance *instance)
-{
-   XrVulkanInstanceCreateInfoKHR xr_create_info =
-      { XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR };
-   VkResult vulkan_result = VK_ERROR_INITIALIZATION_FAILED;
-   PFN_xrCreateVulkanInstanceKHR create_vulkan_instance = NULL;
-   XrInstance xr_instance = android_vk_openxr_xr_instance();
-   XrResult xr_result;
-
-   xr_result = xrGetInstanceProcAddr(
-         xr_instance,
-         "xrCreateVulkanInstanceKHR",
-         (PFN_xrVoidFunction*)&create_vulkan_instance);
-
-   if (xr_result != XR_SUCCESS || !create_vulkan_instance)
-   {
-      RARCH_ERR("[Vulkan] Failed to get xrCreateVulkanInstanceKHR (%d).\n",
-            xr_result);
-      return VK_ERROR_INITIALIZATION_FAILED;
-   }
-
-   xr_create_info.systemId               = android_vk_openxr_xr_system_id();
-   xr_create_info.pfnGetInstanceProcAddr = vulkan_symbol_wrapper_instance_proc_addr();
-   xr_create_info.vulkanCreateInfo       = info;
-   xr_create_info.vulkanAllocator        = NULL;
-
-   xr_result = create_vulkan_instance(
-         xr_instance,
-         &xr_create_info,
-         instance,
-         &vulkan_result);
-
-   if (xr_result != XR_SUCCESS)
-   {
-      char result_str[XR_MAX_RESULT_STRING_SIZE];
-
-      xrResultToString(xr_instance, xr_result, result_str);
-
-      RARCH_ERR("[Vulkan] xrCreateVulkanInstanceKHR failed: %s (%d), Vulkan result=%d.\n",
-            result_str, xr_result, vulkan_result);
-      return VK_ERROR_INITIALIZATION_FAILED;
-   }
-
-   return vulkan_result;
-}
-#endif
-
 /* vkCreateDevice, or the runtime's, which adds what it needs. A device
  * the runtime refuses drops the headset, not the device. */
 static VkResult vulkan_context_create_device(gfx_ctx_vulkan_data_t *vk,
       VkPhysicalDevice gpu, const VkDeviceCreateInfo *info,
       VkDevice *device)
 {
+   VkDeviceCreateInfo local = *info;
+   VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unified;
+   VkPhysicalDeviceFeatures2 features;
+   const VkBaseInStructure *chain;
+   PFN_vkGetPhysicalDeviceFeatures2 get;
+   unsigned i;
+   bool enabled = false;
+   memset(&unified, 0, sizeof(unified));
+   unified.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR;
+   for (chain = (const VkBaseInStructure*)info->pNext; chain; chain = chain->pNext)
+      if (chain->sType == unified.sType)
+      {
+         enabled = ((const VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR*)chain)->unifiedImageLayoutsVideo != 0;
+         break;
+      }
+   if (!chain)
+      for (i = 0; i < info->enabledExtensionCount; i++)
+         if (!strcmp(info->ppEnabledExtensionNames[i], VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME))
+         {
+            get = (PFN_vkGetPhysicalDeviceFeatures2)
+               vulkan_symbol_wrapper_instance_proc_addr()(vk->context.instance,
+                     "vkGetPhysicalDeviceFeatures2");
+            memset(&features, 0, sizeof(features));
+            features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            features.pNext = &unified;
+            if (get) get(gpu, &features);
+            if (unified.unifiedImageLayoutsVideo)
+            {
+               unified.pNext = (void*)local.pNext;
+               local.pNext = &unified;
+               enabled = true;
+            }
+            break;
+         }
+   info = &local;
+   vk->context.flags &= ~VK_CTX_FLAG_VIDEO_GENERAL;
+   if (enabled) vk->context.flags |= VK_CTX_FLAG_VIDEO_GENERAL;
 #ifdef HAVE_OPENXR
    if (vk->context.xr && vulkan_openxr_uses_enable2(vk->context.xr))
    {
@@ -1064,14 +1124,6 @@ static VkResult vulkan_context_create_device(gfx_ctx_vulkan_data_t *vk,
       vulkan_openxr_drop(vk->context.xr);
       vk->context.xr = NULL;
    }
-#ifdef ANDROID
-   if (android_vk_openxr_owns_vk_context(vk))
-   {
-      *device = vulkan_create_openxr_vulkan_device(
-            vk->context.instance, gpu, info);
-      return *device ? VK_SUCCESS : VK_ERROR_INITIALIZATION_FAILED;
-   }
-#endif
 #endif
    return vkCreateDevice(gpu, info, NULL, device);
 }
@@ -1106,7 +1158,8 @@ static VkDevice vulkan_context_create_device_wrapper(
    const char **device_extensions = (const char **)malloc(
          (info.enabledExtensionCount +
                ARRAY_SIZE(vulkan_device_extensions) +
-               ARRAY_SIZE(vulkan_optional_device_extensions)) * sizeof(const char *));
+               ARRAY_SIZE(vulkan_optional_device_extensions) +
+               ARRAY_SIZE(vulkan_video_device_extensions)) * sizeof(const char *));
 
    memcpy((void*)device_extensions, info.ppEnabledExtensionNames, info.enabledExtensionCount * sizeof(const char *));
    info.ppEnabledExtensionNames = device_extensions;
@@ -1122,7 +1175,126 @@ static VkDevice vulkan_context_create_device_wrapper(
       return VK_NULL_HANDLE;
    }
 
-   /* When we get around to using fancier features we can chain in PDF2 stuff. */
+   vk->context.gpu = gpu;
+   vkGetPhysicalDeviceProperties(gpu, &vk->context.gpu_properties);
+   /* Reserve video queues without sharing the core's graphics queue. */
+   if (info.queueCreateInfoCount == 1)
+   {
+      VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timeline;
+      VkPhysicalDeviceSynchronization2FeaturesKHR sync2;
+      VkPhysicalDeviceVideoDecodeVP9FeaturesKHR vp9;
+      VkPhysicalDeviceFeatures2 f2;
+      const VkBaseInStructure *chain;
+      const VkPhysicalDeviceTimelineSemaphoreFeaturesKHR *requested_timeline = NULL;
+      const VkPhysicalDeviceSynchronization2FeaturesKHR *requested_sync2 = NULL;
+      const VkPhysicalDeviceVideoDecodeVP9FeaturesKHR *requested_vp9 = NULL;
+      PFN_vkGetPhysicalDeviceFeatures2 get_features;
+      vulkan_video_probe_t video;
+      VkDeviceCreateInfo vinfo = info;
+      VkDeviceQueueCreateInfo qi[3];
+      float priorities[3] = {1.0f, 1.0f, 1.0f};
+      unsigned j, nq = 1, next = info.enabledExtensionCount;
+      bool timeline_ext = false;
+      for (j = 0; j < next; j++)
+         if (!strcmp(device_extensions[j], VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME))
+            timeline_ext = true;
+      memset(&timeline, 0, sizeof(timeline));
+      timeline.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR;
+      memset(&vp9, 0, sizeof(vp9));
+      vp9.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_DECODE_VP9_FEATURES_KHR;
+      memset(&sync2, 0, sizeof(sync2));
+      sync2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
+      memset(&f2, 0, sizeof(f2));
+      f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+      f2.pNext = &timeline;
+      get_features = (PFN_vkGetPhysicalDeviceFeatures2)
+         vulkan_symbol_wrapper_instance_proc_addr()(vk->context.instance,
+               "vkGetPhysicalDeviceFeatures2");
+      if (get_features && timeline_ext)
+         get_features(gpu, &f2);
+      for (chain = (const VkBaseInStructure*)info.pNext; chain; chain = chain->pNext)
+      {
+         if (chain->sType == timeline.sType)
+            requested_timeline = (const VkPhysicalDeviceTimelineSemaphoreFeaturesKHR*)chain;
+         if (chain->sType == vp9.sType)
+            requested_vp9 = (const VkPhysicalDeviceVideoDecodeVP9FeaturesKHR*)chain;
+         if (chain->sType == sync2.sType)
+            requested_sync2 = (const VkPhysicalDeviceSynchronization2FeaturesKHR*)chain;
+      }
+      if (requested_timeline)
+         timeline.timelineSemaphore = requested_timeline->timelineSemaphore;
+      vk->context.graphics_queue_index = info.pQueueCreateInfos[0].queueFamilyIndex;
+      if (timeline.timelineSemaphore)
+         vk->context.flags |= VK_CTX_FLAG_TIMELINE_SEMAPHORE;
+      if (     (!requested_sync2 || requested_sync2->synchronization2)
+            && vulkan_video_probe(vk, &video, requested_vp9 && !requested_vp9->videoDecodeVP9
+               ? ~(uint32_t)VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR : UINT32_MAX))
+      {
+         qi[0] = info.pQueueCreateInfos[0];
+         if (video.xfer_family == qi[0].queueFamilyIndex)
+         {
+            video.xfer_first = qi[0].queueCount;
+            /* The probe reserves after queue 0; only that core layout fits. */
+            if (qi[0].queueCount != 1)
+               video.lanes = 0;
+            qi[0].queueCount += video.lanes;
+            qi[0].pQueuePriorities = priorities;
+         }
+         qi[nq] = qi[0];
+         qi[nq].queueFamilyIndex = video.decode_family;
+         qi[nq].queueCount = video.lanes;
+         qi[nq++].pQueuePriorities = priorities;
+         if (video.xfer_family != qi[0].queueFamilyIndex)
+         {
+            qi[nq] = qi[0];
+            qi[nq].queueFamilyIndex = video.xfer_family;
+            qi[nq].queueCount = video.lanes;
+            qi[nq++].pQueuePriorities = priorities;
+         }
+         for (j = 0; j < ARRAY_SIZE(vulkan_video_device_extensions); j++)
+         {
+            unsigned k;
+            if (!vulkan_video_extension_enabled(j, video.codecs)) continue;
+            for (k = 0; k < next; k++)
+               if (!strcmp(device_extensions[k], vulkan_video_device_extensions[j]))
+                  break;
+            if (k == next)
+               device_extensions[next++] = vulkan_video_device_extensions[j];
+         }
+         if (!requested_timeline)
+         {
+            timeline.pNext = (void*)vinfo.pNext;
+            vinfo.pNext = &timeline;
+         }
+         if (!requested_sync2)
+         {
+            sync2.synchronization2 = VK_TRUE;
+            sync2.pNext = (void*)vinfo.pNext;
+            vinfo.pNext = &sync2;
+         }
+         if ((video.codecs & VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR) && !requested_vp9)
+         {
+            vp9.videoDecodeVP9 = VK_TRUE;
+            vp9.pNext = (void*)vinfo.pNext;
+            vinfo.pNext = &vp9;
+         }
+         vinfo.pQueueCreateInfos = qi;
+         vinfo.queueCreateInfoCount = nq;
+         vinfo.enabledExtensionCount = next;
+         if (video.lanes && vulkan_context_create_device(vk, gpu, &vinfo, &device) == VK_SUCCESS)
+         {
+            vk->context.video_decode_family = video.decode_family;
+            vk->context.video_xfer_family = video.xfer_family;
+            vk->context.video_xfer_first = video.xfer_first;
+            vk->context.video_lanes = video.lanes;
+            vk->context.video_codec_operations = video.codecs;
+            RARCH_LOG("[Vulkan] Core device: %u hardware video decode lane(s).\n", video.lanes);
+            free((void*)device_extensions);
+            return device;
+         }
+      }
+      vk->context.flags &= ~VK_CTX_FLAG_TIMELINE_SEMAPHORE;
+   }
    if ((res = vulkan_context_create_device(vk, gpu, &info, &device)) != VK_SUCCESS)
    {
       RARCH_ERR("[Vulkan] Failed to create device (%d).\n", res);
@@ -1138,10 +1310,13 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
    uint32_t queue_count;
    unsigned i;
    const char *enabled_device_extensions[ARRAY_SIZE(vulkan_device_extensions)
-      + ARRAY_SIZE(vulkan_optional_device_extensions)];
+      + ARRAY_SIZE(vulkan_optional_device_extensions)
+      + ARRAY_SIZE(vulkan_video_device_extensions)];
    VkDeviceCreateInfo device_info;
    VkDeviceQueueCreateInfo queue_info;
    static const float one                  = 1.0f;
+   static const float prios[VULKAN_VIDEO_MAX_LANES + 1] = { 1.0f, 1.0f, 1.0f };
+   vulkan_video_probe_t video;
    bool found_queue                        = false;
 #ifdef VULKAN_HDR_SWAPCHAIN
    bool hdr_metadata_enabled               = false;
@@ -1191,19 +1366,13 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
          RARCH_LOG("[Vulkan] Got HW context negotiation interface %u.\n", iface->interface_version);
    }
 
-#if defined(HAVE_OPENXR) && defined(ANDROID)
-   if (android_vk_openxr_owns_vk_context(vk) && iface
-         && (iface->interface_version < 2 || !iface->create_device2))
-      RARCH_WARN("[Vulkan] Legacy core device negotiation not compatible with OpenXR: "
-            "iface=%p type=%u version=%u create_device2=%p\n",
-            (void*)iface,
-            iface->interface_type,
-            iface->interface_version,
-            (void*)iface->create_device2);
-#endif
-
    /* Set below for a device made here; a core's has none of ours */
    vk->context.flags &= ~VK_CTX_FLAG_TIMELINE_SEMAPHORE;
+   vk->context.video_lanes         = 0;
+   vk->context.video_codec_operations = 0;
+   vk->context.video_decode_family = 0;
+   vk->context.video_xfer_family   = 0;
+   vk->context.video_xfer_first    = 0;
 
    if (!vulkan_context_init_gpu(vk))
       return false;
@@ -1510,6 +1679,13 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
             vk->context.flags |=  VK_CTX_FLAG_TIMELINE_SEMAPHORE;
          else
             vk->context.flags &= ~VK_CTX_FLAG_TIMELINE_SEMAPHORE;
+         vk->context.video_decode_family = cached_video_vk[0];
+         vk->context.video_xfer_family   = cached_video_vk[1];
+         vk->context.video_xfer_first    = cached_video_vk[2];
+         vk->context.video_lanes         = cached_video_vk[3];
+         vk->context.video_codec_operations = cached_video_vk[4];
+         if (cached_video_vk[5]) vk->context.flags |= VK_CTX_FLAG_VIDEO_GENERAL;
+         else vk->context.flags &= ~VK_CTX_FLAG_VIDEO_GENERAL;
          cached_gpu_vk      = VK_NULL_HANDLE;
 
          if (cached_destroy_device_vk)
@@ -1521,11 +1697,80 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
          video_driver_cache_context_ack_set();
          RARCH_LOG("[Vulkan] Using cached Vulkan context.\n");
       }
-      else if (vulkan_context_create_device(vk, vk->context.gpu,
-               &device_info, &vk->context.device) != VK_SUCCESS)
+      else
       {
-         RARCH_ERR("[Vulkan] Failed to create device.\n");
-         return false;
+         VkDevice dev = VK_NULL_HANDLE;
+         /* With the video decode queues where the GPU has them; a
+          * device that cannot be made so is made without */
+         if (vulkan_video_probe(vk, &video, UINT32_MAX))
+         {
+            VkDeviceQueueCreateInfo qi[3];
+            VkDeviceCreateInfo vinfo = device_info;
+            VkPhysicalDeviceSynchronization2FeaturesKHR sync2;
+            VkPhysicalDeviceVideoDecodeVP9FeaturesKHR vp9;
+            unsigned j, nq = 1, next = enabled_device_extension_count;
+
+            for (j = 0; j < ARRAY_SIZE(vulkan_video_device_extensions); j++)
+               if (vulkan_video_extension_enabled(j, video.codecs))
+                  enabled_device_extensions[next++] = vulkan_video_device_extensions[j];
+            qi[0]               = queue_info;
+            qi[0].pQueuePriorities = prios;
+            if (video.xfer_family == vk->context.graphics_queue_index)
+               qi[0].queueCount = 1 + video.lanes;
+            qi[nq]                  = queue_info;
+            qi[nq].queueFamilyIndex = video.decode_family;
+            qi[nq].queueCount       = video.lanes;
+            qi[nq].pQueuePriorities = prios;
+            nq++;
+            if (video.xfer_family != vk->context.graphics_queue_index)
+            {
+               qi[nq]                  = queue_info;
+               qi[nq].queueFamilyIndex = video.xfer_family;
+               qi[nq].queueCount       = video.lanes;
+               qi[nq].pQueuePriorities = prios;
+               nq++;
+            }
+            sync2.sType            =
+               VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
+            sync2.pNext            = (void*)device_info.pNext;
+            sync2.synchronization2 = VK_TRUE;
+            vinfo.pNext                   = &sync2;
+            if (video.codecs & VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR)
+            {
+               memset(&vp9, 0, sizeof(vp9));
+               vp9.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_DECODE_VP9_FEATURES_KHR;
+               vp9.videoDecodeVP9 = VK_TRUE; vp9.pNext = (void*)vinfo.pNext;
+               vinfo.pNext = &vp9;
+            }
+            vinfo.queueCreateInfoCount    = nq;
+            vinfo.pQueueCreateInfos       = qi;
+            vinfo.enabledExtensionCount   = next;
+            if (vulkan_context_create_device(vk, vk->context.gpu,
+                     &vinfo, &dev) == VK_SUCCESS)
+            {
+               vk->context.video_decode_family = video.decode_family;
+               vk->context.video_xfer_family   = video.xfer_family;
+               vk->context.video_xfer_first    = video.xfer_first;
+               vk->context.video_lanes         = video.lanes;
+               vk->context.video_codec_operations = video.codecs;
+               RARCH_LOG("[Vulkan] Video decode: family %u, copies on family %u from queue %u, %u at once.\n",
+                     video.decode_family, video.xfer_family,
+                     video.xfer_first, video.lanes);
+            }
+            else
+            {
+               dev = VK_NULL_HANDLE;
+               RARCH_WARN("[Vulkan] Device with video decode refused; made without.\n");
+            }
+         }
+         if (     dev == VK_NULL_HANDLE
+               && vulkan_context_create_device(vk, vk->context.gpu,
+                  &device_info, &dev) != VK_SUCCESS)
+         {
+            RARCH_ERR("[Vulkan] Failed to create device.\n");
+            return false;
+         }
+         vk->context.device = dev;
       }
    }
 
@@ -1584,7 +1829,7 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
    {
       /* The device was made for the runtime: rebuild video without it,
        * unless the core keeps its context, which a reinit would reuse. */
-      if (video_st->hw_render.cache_context)
+      if (video_st->hw_render.cache_context || vk->openxr_headset)
          vulkan_openxr_drop(vk->context.xr);
       else
       {
@@ -1690,10 +1935,6 @@ static VkResult vulkan_context_create_instance(gfx_ctx_vulkan_data_t *vk,
       vulkan_openxr_drop(vk->context.xr);
       vk->context.xr = NULL;
    }
-#ifdef ANDROID
-   if (android_vk_openxr_owns_vk_context(vk))
-      return vulkan_create_openxr_vulkan_instance(info, instance);
-#endif
 #endif
    return vkCreateInstance(info, NULL, instance);
 }
@@ -2389,6 +2630,14 @@ void vulkan_context_advance_frame(gfx_ctx_vulkan_data_t *vk)
 }
 #endif
 
+#if defined(HAVE_OPENXR) && defined(ANDROID)
+void vulkan_context_finish_frames(gfx_ctx_vulkan_data_t *vk)
+{
+   if (vk)
+      vulkan_context_wait_frames(vk);
+}
+#endif
+
 unsigned vulkan_context_take_acquire_waits(struct vulkan_context *ctx,
       unsigned frame_index, VkSemaphore *sems,
       VkPipelineStageFlags *stages, VkPipelineStageFlags stage)
@@ -2894,7 +3143,8 @@ retry:
       if (vk->dxgi_presenter)
       {
          err = ra_vulkan_dxgi_acquire((ra_vulkan_dxgi_t *)vk->dxgi_presenter,
-               semaphore, fence, &vk->context.current_swapchain_index);
+               semaphore, fence, &vk->context.current_swapchain_index,
+               vk->context.swap_interval > 0 ? (unsigned)vk->context.swap_interval : 0);
       }
       else
 #endif
@@ -3045,6 +3295,11 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
    bool vsync                              = ss->vsync;
    bool adaptive_vsync                     = ss->adaptive_vsync;
    bool reuse_swapchain;
+#ifdef ANDROID
+   bool use_requested_extent              = vk->wsi_type == VULKAN_WSI_ANDROID;
+#else
+   bool use_requested_extent              = false;
+#endif
 #ifdef VK_USE_PLATFORM_WIN32_KHR
    bool video_windowed_fullscreen          = ss->windowed_fullscreen;
    /* Relaxed: ALLOWED is a hint and the driver may decline - and on
@@ -3254,6 +3509,14 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
       else
       {
          vk->flags &= ~VK_DATA_FLAG_CREATED_NEW_SWAPCHAIN;
+#ifdef VULKAN_HDR_SWAPCHAIN
+         video_driver_set_hdr_output_mode(
+               vk->context.swapchain_colour_space == VK_COLOR_SPACE_HDR10_ST2084_EXT
+               ? 1 : (vk->context.swapchain_colour_space == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
+               ? 2 : 0));
+#else
+         video_driver_set_hdr_output_mode(0);
+#endif
          return true;
       }
    }
@@ -3536,31 +3799,15 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
 
          if (format.format == VK_FORMAT_UNDEFINED)
          {
-            for (i = 0; i < format_count; i++)
-            {
-               if (
-                        formats[i].format == VK_FORMAT_R8G8B8A8_UNORM
-                     || formats[i].format == VK_FORMAT_B8G8R8A8_UNORM
-                     || formats[i].format == VK_FORMAT_A8B8G8R8_UNORM_PACK32)
-               {
-                  format = formats[i];
-                  break;
-               }
-            }
+            int sdr8 = vulkan_sdr8_surface_format(formats, format_count);
+            if (sdr8 >= 0)
+               format = formats[sdr8];
          }
       }
 
       if (format.format == VK_FORMAT_UNDEFINED)
          format = formats[0];
    }
-
-   if (surface_properties.currentExtent.width == UINT32_MAX)
-   {
-      swapchain_size.width     = VIDEO_SCALE_W(dims);
-      swapchain_size.height    = VIDEO_SCALE_H(dims);
-   }
-   else
-      swapchain_size           = surface_properties.currentExtent;
 
 #ifdef WSI_HARDENING_TEST
    if (trigger_spurious_error())
@@ -3572,15 +3819,9 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
    }
 #endif
 
-   /* Clamp swapchain size to boundaries. */
-   if (swapchain_size.width > surface_properties.maxImageExtent.width)
-      swapchain_size.width = surface_properties.maxImageExtent.width;
-   if (swapchain_size.width < surface_properties.minImageExtent.width)
-      swapchain_size.width = surface_properties.minImageExtent.width;
-   if (swapchain_size.height > surface_properties.maxImageExtent.height)
-      swapchain_size.height = surface_properties.maxImageExtent.height;
-   if (swapchain_size.height < surface_properties.minImageExtent.height)
-      swapchain_size.height = surface_properties.minImageExtent.height;
+   swapchain_size = vulkan_swapchain_extent(&surface_properties,
+         VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims),
+         use_requested_extent);
 
    if (     (swapchain_size.width  == 0)
          && (swapchain_size.height == 0))
@@ -3741,6 +3982,14 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
          vk->context.current_swapchain_index = 0;
          vulkan_create_wait_fences(vk);
          vk->flags &= ~VK_DATA_FLAG_CREATED_NEW_SWAPCHAIN;
+#ifdef VULKAN_HDR_SWAPCHAIN
+         video_driver_set_hdr_output_mode(
+               vk->context.swapchain_colour_space == VK_COLOR_SPACE_HDR10_ST2084_EXT
+               ? 1 : (vk->context.swapchain_colour_space == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
+               ? 2 : 0));
+#else
+         video_driver_set_hdr_output_mode(0);
+#endif
          return true;
       }
 dxgi_unavailable:
@@ -4013,6 +4262,14 @@ dxgi_unavailable:
    }
 #endif
 
+#ifdef VULKAN_HDR_SWAPCHAIN
+   video_driver_set_hdr_output_mode(
+         vk->context.swapchain_colour_space == VK_COLOR_SPACE_HDR10_ST2084_EXT
+         ? 1 : (vk->context.swapchain_colour_space == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
+         ? 2 : 0));
+#else
+   video_driver_set_hdr_output_mode(0);
+#endif
    return true;
 }
 
@@ -4072,6 +4329,12 @@ static void vulkan_context_openxr_init(gfx_ctx_vulkan_data_t *vk,
    bool enable1         = iface && iface->create_device
       && !(iface->interface_version >= 2 && iface->create_device2);
 
+#ifdef ANDROID
+   /* Only a headset's own context starts the runtime, and it needs no
+    * setting to. */
+   enable = vk->openxr_headset;
+#endif
+
    /* A kept device keeps the runtime it was made for, while the runtime
     * keeps the instance. */
    if (cached_instance_vk)
@@ -4094,10 +4357,6 @@ static void vulkan_context_openxr_init(gfx_ctx_vulkan_data_t *vk,
    }
    if (!enable)
       return;
-#ifdef ANDROID
-   /* The headset is the projection context's. */
-   return;
-#endif
    vk->context.xr = vulkan_openxr_new(enable1, api_version);
    if (     vk->context.xr && enable1
          && !vulkan_context_openxr_instance_exts_ok(vk->context.xr))
@@ -4248,6 +4507,11 @@ bool vulkan_context_init(gfx_ctx_vulkan_data_t *vk,
 
 #ifdef HAVE_OPENXR
    vulkan_context_openxr_init(vk, iface, app.apiVersion);
+   /* A headset's own context without its runtime makes no instance
+    * and takes no kept one: the flat context follows in the list, and
+    * what is kept is that one's. */
+   if (vk->openxr_headset && !vk->context.xr)
+      return false;
 #endif
 
    if (cached_instance_vk)
@@ -4383,6 +4647,12 @@ void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
          (vk->context.flags & VK_CTX_FLAG_HDR_SUPPORT) ? true : false;
       cached_timeline_vk       =
          (vk->context.flags & VK_CTX_FLAG_TIMELINE_SEMAPHORE) ? true : false;
+      cached_video_vk[0]       = vk->context.video_decode_family;
+      cached_video_vk[1]       = vk->context.video_xfer_family;
+      cached_video_vk[2]       = vk->context.video_xfer_first;
+      cached_video_vk[3]       = vk->context.video_lanes;
+      cached_video_vk[4]       = vk->context.video_codec_operations;
+      cached_video_vk[5]       = vk->context.flags & VK_CTX_FLAG_VIDEO_GENERAL;
 #ifdef HAVE_OPENXR
       cached_xr                = vk->context.xr;
       vk->context.xr           = NULL;
@@ -4397,6 +4667,9 @@ void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
 #endif
       if (vk->context.device)
       {
+#ifdef HAVE_RMP4
+         vulkan_video_decode_deinit();
+#endif
          /* Call the frontend's destroy_device callback BEFORE
           * vkDestroyDevice, so the frontend can clean up its
           * per-device resources while the device handle is still
@@ -4528,14 +4801,28 @@ void vulkan_present(gfx_ctx_vulkan_data_t *vk, unsigned index)
     * before the next rebuild covers either. */
    vk->context.present_pending = true;
 
-   /* VK_SUBOPTIMAL_KHR can be returned on
-    * Android 10 when prerotate is not dealt with.
-    * It can also be returned by WSI when the surface
-    * is _temporarily_ suboptimal.
-    * This is not an error we need to care about,
-    * and we'll treat it as SUCCESS. */
+   /* The frame was shown, but the swapchain no longer matches the
+    * surface: a Wayland WSI says this when the compositor's dma-buf
+    * feedback changes under it - a window gone fullscreen is offered
+    * the scanout tranche, and the images it made before, for being
+    * composited, are not in it. Rebuilding is what lets the WSI
+    * allocate from the new tranche, and so what gets the window onto
+    * the display plane. One rebuild per answer: where the surface
+    * stays suboptimal (Android without prerotate) the rebuilt swapchain
+    * is kept until a present reports otherwise. */
+   if (     (result == VK_SUBOPTIMAL_KHR || err == VK_SUBOPTIMAL_KHR)
+         && !(vk->context.flags & VK_CTX_FLAG_SUBOPTIMAL_REBUILT))
+   {
+      RARCH_LOG("[Vulkan] Swapchain is suboptimal for the surface, rebuilding.\n");
+      vk->context.flags                   |= VK_CTX_FLAG_SUBOPTIMAL_REBUILT;
+      vk->context.swapchain_never_presented = 0;
+      vulkan_destroy_swapchain(vk);
+      return;
+   }
    if (result == VK_SUBOPTIMAL_KHR)
       result = VK_SUCCESS;
+   else if (err == VK_SUCCESS && result == VK_SUCCESS)
+      vk->context.flags &= ~VK_CTX_FLAG_SUBOPTIMAL_REBUILT;
    if (err == VK_SUBOPTIMAL_KHR)
       err = VK_SUCCESS;
 

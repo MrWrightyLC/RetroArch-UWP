@@ -214,6 +214,7 @@
 #define DEFAULT_SWITCH_OC false
 #define DEFAULT_SWITCH_CEC true
 #define DEFAULT_BLUETOOTH_ERTM false
+#define DEFAULT_REBOOT_FORCE_SELF_ON_UPDATE true
 #endif
 
 #if (defined(_WIN32) && !defined(_XBOX)) || (defined(__linux) && !defined(ANDROID) && !defined(HAVE_LAKKA)) || (defined(__MACH__) && !TARGET_OS_IPHONE) || defined(__EMSCRIPTEN__)
@@ -286,6 +287,9 @@
 /* Not platform-specific: how hard to push for exclusive fullscreen
  * where the platform lets the application decide. */
 #define DEFAULT_VIDEO_FSE_NEGOTIATION VIDEO_FSE_RELAXED
+
+/* Previews decoded on the GPU where the video driver can */
+#define DEFAULT_VIDEO_HW_DECODE VIDEO_HW_DECODE_AUTO
 
 /* Enable automatic switching of the screen refresh rate when using the specified screen mode(s),
  * based on running core/content */
@@ -561,6 +565,11 @@
  * as late as the next refresh allows given measured core and render
  * times. Off: the fixed-timer pacing threaded video always had. */
 #define DEFAULT_VIDEO_THREADED_DISPLAY_PACING false
+
+/* The Direct3D 9 drivers on a Direct3D9Ex device: a window presented
+ * through the flip model, and the frame latency settings honoured.
+ * Off: the discard swap effect and the runtime's own queue, as before. */
+#define DEFAULT_VIDEO_D3D9EX_PRESENT false
 
 
 

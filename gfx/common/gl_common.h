@@ -27,12 +27,26 @@ void gl_finish(void);
 
 void gl_flush(void);
 
+/* Upload memory mapped for good: GL 4.4 or ARB_buffer_storage on the
+ * desktop, GLES 3.0 with EXT_buffer_storage (checked at run time).
+ * Texture lending additionally requires GLES 3.1 level queries. */
 #if (defined(HAVE_OPENGL) || defined(HAVE_OPENGL_CORE)) \
       && !defined(HAVE_OPENGLES) && !defined(HAVE_PSGL)
-#include <stddef.h>
-#include <boolean.h>
-
+#define HAVE_GL_FRAME_MEM
 #define HAVE_GL_TEXTURE_LEND
+#elif defined(HAVE_OPENGLES3) && !defined(HAVE_OPENGLES2) \
+      && !defined(HAVE_PSGL)
+#define HAVE_GL_FRAME_MEM
+#define HAVE_GL_TEXTURE_LEND
+#endif
+
+#ifdef HAVE_GL_FRAME_MEM
+#include <stddef.h>
+#include <stdint.h>
+#include <boolean.h>
+#endif
+
+#ifdef HAVE_GL_TEXTURE_LEND
 
 /* A streamed texture's upload memory, lent (video_poke_interface_t
  * texture_lend): two pixel unpack buffers per texture, mapped for good,
@@ -62,6 +76,58 @@ void gl_texture_lend_unbind(gl_texture_lend_t *list, unsigned tex,
 /* With the texture, or with every texture */
 void gl_texture_lend_forget(gl_texture_lend_t **list, unsigned tex);
 void gl_texture_lend_free(gl_texture_lend_t **list);
+#endif
+
+#ifdef HAVE_GL_FRAME_MEM
+/* The threaded wrapper's frame buffers (video_poke_interface_t
+ * frame_mem_alloc): pixel unpack buffers mapped for good, each with
+ * the fence of the last upload from it. Made on first use; used on the
+ * thread that owns the context. */
+typedef struct gl_frame_mem gl_frame_mem_t;
+
+void *gl_frame_mem_alloc(gl_frame_mem_t **fm, size_t size, uintptr_t *id);
+bool gl_frame_mem_ready(gl_frame_mem_t *fm, uintptr_t id);
+/* GL keeps a buffer a queued upload reads until the upload has run */
+void gl_frame_mem_free(gl_frame_mem_t *fm, uintptr_t id);
+
+/* For an upload reading @extent bytes from @pixels: when they lie in a
+ * frame buffer, binds it as the unpack source, sets *offset to where
+ * they start in it and returns its slot, which
+ * gl_frame_mem_unbind() fences; -1, with the unpack buffer unbound,
+ * otherwise */
+int gl_frame_mem_bind(gl_frame_mem_t *fm, const void *pixels,
+      size_t extent, size_t *offset);
+void gl_frame_mem_unbind(gl_frame_mem_t *fm, int slot);
+void gl_frame_mem_destroy(gl_frame_mem_t **fm);
+
+/* The software framebuffer lent to a core (get_current_software_framebuffer):
+ * three frame buffers at the frame's size and tight pitch, one never
+ * the buffer the last frame was pushed from, which the cached frame
+ * names, nor one an upload still reads */
+#define GL_SW_FB_SLOTS 3
+typedef struct gl_sw_fb
+{
+   void     *mapped[GL_SW_FB_SLOTS];
+   uintptr_t id[GL_SW_FB_SLOTS];
+   uintptr_t last;   /* the frame buffer the last frame came from */
+   unsigned  dims;   /* VIDEO_SCALE_PACK'd size they were made for */
+   unsigned  bpp;
+   unsigned  next;
+   bool      failed; /* none could be made at this size */
+} gl_sw_fb_t;
+
+/* Whether the buffers are already made for @width x @height at @bpp:
+ * when not, a lend makes them anew and the caller retires the cached
+ * frame first */
+bool gl_sw_fb_fits(const gl_sw_fb_t *sw, unsigned width, unsigned height,
+      unsigned bpp);
+/* A buffer to lend, never waited for; NULL when none is free */
+void *gl_sw_fb_lend(gl_frame_mem_t **fm, gl_sw_fb_t *sw,
+      unsigned width, unsigned height, unsigned bpp);
+/* The upload of a frame pushed from frame buffer slot @slot
+ * (gl_frame_mem_bind), or -1 */
+void gl_sw_fb_pushed(gl_sw_fb_t *sw, int slot);
+void gl_sw_fb_free(gl_frame_mem_t *fm, gl_sw_fb_t *sw);
 #endif
 
 #if defined(__APPLE__) && !defined(HAVE_OPENGLES)

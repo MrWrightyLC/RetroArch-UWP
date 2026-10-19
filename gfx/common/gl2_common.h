@@ -30,13 +30,50 @@
 #include <gfx/scaler/scaler.h>
 #include <glsym/glsym.h>
 #include <formats/image.h>
+#include <retro_atomic.h>
 
 #include "../video_driver.h"
 #include "gl_common.h"
 
+/* The hardware ring's per-slot sync, handed from the core's thread to
+ * the video thread by exchange so that one thread waits and deletes
+ * each. A backend without pointer atomics only serves single-core
+ * targets, where a plain swap is the same. */
+#ifndef GL_HW_RING_SYNC_T
+#if defined(RETRO_ATOMIC_HAS_PTR)
+#define GL_HW_RING_SYNC_T retro_atomic_ptr_t
+#define GL_HW_RING_SYNC_SWAP(p, v, out) \
+   ((out) = retro_atomic_exchange_ptr((p), (v)))
+#else
+#define GL_HW_RING_SYNC_T void *
+#define GL_HW_RING_SYNC_SWAP(p, v, out) ((out) = *(p), *(p) = (v))
+#endif
+#endif
+
 RETRO_BEGIN_DECLS
 
 typedef struct gl2 gl2_t;
+
+/* How many of each view's copies a preset can read: the newest and
+ * up to seven before it */
+#define GL2_VIEWS_HISTORY 8
+
+/* A render target views draw into: a texture and its framebuffer */
+struct gl2_views_fbo
+{
+   GLuint fbo;
+   GLuint tex;
+};
+
+/* A program views draw with, and where its uniforms are */
+struct gl2_views_prog
+{
+   GLuint prog;
+   GLint  loc_mvp;
+   GLint  loc_tex;
+   GLint  loc_clamp;
+   GLint  loc_height;
+};
 
 enum gl2_flags
 {
@@ -88,7 +125,12 @@ enum gl2_flags
     * set_texture_frame() is applied by the video thread in
     * thread_update_driver_state(), and reading the setting there races
     * the menu writing it. */
-   GL2_FLAG_MENU_LINEAR_FILTER     = (1 << 26)
+   GL2_FLAG_MENU_LINEAR_FILTER     = (1 << 26),
+   /* How the passes' textures were last made, by init or set_shader:
+    * a frame past the textures makes them again on the video thread,
+    * and reading the settings there races the menu writing them. */
+   GL2_FLAG_FBO_SMOOTH             = (1 << 29),
+   GL2_FLAG_FBO_SRGB_DISABLE       = (1 << 30)
 };
 
 struct gl2
@@ -146,9 +188,12 @@ struct gl2
    /* The threaded wrapper's hardware ring: the fence the core's thread
     * placed after rendering into each slot's texture, for the frame on
     * this thread to wait before reading it. Sync objects are shared
-    * between the two contexts. */
-   void *hw_ring_sync[3];
+    * between the two contexts (GL_HW_RING_SYNC_SWAP). */
+   GL_HW_RING_SYNC_T hw_ring_sync[3];
    void *hw_ring_done_sync; /* taken ahead of the swap */
+   /* Placed after each PBO readback: a slot is read only once its
+    * fence has signalled, so mapping it never waits on the GPU. */
+   void *pbo_readback_sync[4];
 
    uint32_t flags;
 
@@ -189,6 +234,10 @@ struct gl2
    char device_str[128];
 #ifdef HAVE_GL_TEXTURE_LEND
    gl_texture_lend_t *lend;
+#endif
+#ifdef HAVE_GL_FRAME_MEM
+   gl_frame_mem_t *frame_mem;
+   gl_sw_fb_t sw_fb;
 #endif
 #ifdef HAVE_GL_PLANAR
    gl_planar_t planar;
@@ -242,6 +291,69 @@ struct gl2
       unsigned expand_gamut;
    } scrgb;
 
+   /* Views, drawn straight from the frame as the stock shader draws
+    * it, or with a preset through its passes, one view after another.
+    * A view's chain is the driver itself. The canvas holds both eyes
+    * for anaglyph and interlaced, the UI layer the UI drawn once for
+    * both eyes. */
+   struct
+   {
+      video_views_chains_t  chains;
+      struct gl2_views_fbo  canvas;
+      struct gl2_views_fbo  ui;
+      video_views_target_t  canvas_target;
+      video_views_target_t  ui_target;
+      video_views_ui_dims_t saved;
+      struct gl2_views_prog rect;
+      struct gl2_views_prog layer;
+      struct gl2_views_prog anaglyph;
+      struct gl2_views_prog interlaced;
+      /* With a preset each view is drawn from a copy of its own, the
+       * last few kept for a preset that reads earlier frames: head is
+       * the newest, prev what the preset reads as earlier ones. */
+      GLuint                tex[RETRO_VIDEO_VIEWS_MAX][GL2_VIEWS_HISTORY];
+      unsigned              tex_dims[RETRO_VIDEO_VIEWS_MAX][GL2_VIEWS_HISTORY];
+      /* Made for a software frame's view written straight in, as the
+       * frame's textures are, not for a copy drawn into it */
+      bool                  tex_written[RETRO_VIDEO_VIEWS_MAX][GL2_VIEWS_HISTORY];
+      unsigned              head[RETRO_VIDEO_VIEWS_MAX];
+      struct video_tex_info prev[RETRO_VIDEO_VIEWS_MAX][GL2_VIEWS_HISTORY];
+      /* What a feedback pass drew for each view the frame before */
+      struct gl2_views_fbo  feedback[RETRO_VIDEO_VIEWS_MAX];
+      unsigned              feedback_dims[RETRO_VIDEO_VIEWS_MAX];
+      /* For the view being drawn: its earlier frames and feedback */
+      const struct video_tex_info *prev_cur;
+      struct video_tex_info feedback_cur;
+      GLuint                copy_fbo;
+      GLuint                vbo;
+      /* For get_flags on the main thread: whether views may be drawn,
+       * and whether the last frame with a map was drawn whole. */
+      retro_atomic_int_t    allowed;
+      retro_atomic_int_t    fallback;
+      /* A shader preset is loaded */
+      bool                  preset;
+      bool                  preset_seen;
+      bool                  tried;
+      bool                  failed;
+      bool                  active;
+      /* Drawing into the UI layer */
+      bool                  ui_pass;
+      bool                  direct_seen;
+      bool                  written_seen;
+      /* Some copy or feedback target is held */
+      bool                  copies;
+      /* Each view's prev is filled */
+      bool                  prev_live[RETRO_VIDEO_VIEWS_MAX];
+   } views;
+
+#if defined(HAVE_OPENXR) && defined(ANDROID) && defined(HAVE_OPENGLES3)
+   /* The framebuffer the headset's tracked eyes are drawn through. */
+   GLuint xr_fbo;
+#endif
+#if defined(HAVE_OPENXR_GL) && !defined(ANDROID)
+   /* Desktop headset output, while its host runs; gl2.c's own. */
+   struct gl2_desktop_xr *desktop_xr;
+#endif
 };
 
 bool gl2_load_luts(

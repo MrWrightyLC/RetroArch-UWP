@@ -3080,9 +3080,8 @@ int menu_shader_manager_clear_parameter(struct video_shader *shader,
 
    if (param)
    {
-      param->current = param->initial;
-      param->current = MIN(MAX(param->minimum,
-               param->current), param->maximum);
+      video_shader_param_set(param, MIN(MAX(param->minimum,
+               param->initial), param->maximum));
 
       shader->flags |= SHDR_FLAG_MODIFIED;
    }
@@ -7541,8 +7540,14 @@ bool menu_driver_ctl(enum rarch_menu_ctl_state state, void *data)
                && menu_st->driver_ctx->context_destroy)
             menu_st->driver_ctx->context_destroy(menu_st->userdata);
 
+         /* Retired previews must finish before the video device goes,
+          * including when the menu itself is being reused. */
+         gfx_thumbnail_anim_worker_deinit();
+
          if (menu_st->flags & MENU_ST_FLAG_DATA_OWN)
             return true;
+
+         gfx_thumbnail_parked_free();
 
          /* Abandon a pending deferred playlist parse before the
           * cache it would install goes away. */
@@ -7646,12 +7651,6 @@ bool menu_driver_ctl(enum rarch_menu_ctl_state state, void *data)
             if (menu_st->thumbnail_path_data)
                free(menu_st->thumbnail_path_data);
             menu_st->thumbnail_path_data    = NULL;
-
-            /* The menu driver's free() above has reset every
-             * gfx_thumbnail_t, so the animated-thumbnail decode
-             * worker is idle and can be torn down (it is recreated
-             * lazily if the menu comes back). */
-            gfx_thumbnail_anim_worker_deinit();
 
             if (menu_st->driver_data->core_buf)
                free(menu_st->driver_data->core_buf);
@@ -9119,7 +9118,7 @@ bool menu_input_dialog_start_search(void)
       input_driver_text_entry_open(menu,
             menu_input_search_cb,
             msg_hash_to_str(MENU_ENUM_LABEL_VALUE_SEARCH),
-            INPUT_TEXT_TYPE_TEXT);
+            INPUT_TEXT_TYPE_TEXT, NULL);
 
 
    return true;
@@ -9200,7 +9199,9 @@ bool menu_input_dialog_start(menu_input_ctx_line_t *line)
       input_driver_text_entry_open(menu,
             line->cb,
             line->label,
-            (enum input_text_type)line->text_type);
+            (enum input_text_type)line->text_type,
+            line->dialog_type == MENU_INPUT_DIALOG_TYPE_EDIT
+            ? line->initial_text : NULL);
 
 
    return true;

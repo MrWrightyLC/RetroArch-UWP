@@ -110,7 +110,6 @@
 
 #if defined(ANDROID)
 #include <android/api-level.h>
-#include "play_feature_delivery/play_feature_delivery.h"
 #endif
 
 #ifdef HAVE_PRESENCE
@@ -136,6 +135,7 @@
 #include "camera/camera_driver.h"
 #include "location_driver.h"
 #include "record/record_driver.h"
+#include "record/drivers/record_nvenc.h"
 
 #ifdef HAVE_MICROPHONE
 #include "audio/microphone_driver.h"
@@ -192,6 +192,9 @@
 #ifdef HAVE_CLOUDSYNC
 #include "network/cloud_sync_driver.h"
 #endif
+#endif
+#ifdef HAVE_MCP
+#include "network/mcp_server.h"
 #endif
 
 #ifdef HAVE_THREADS
@@ -272,11 +275,49 @@
 #endif
 
 #ifdef HAVE_LAKKA
+#include <retro_dirent.h>
 #include "lakka.h"
+#ifdef HAVE_LAKKA_SWITCH
+#include "misc/reboot2payload/reboot2payload.h"
+#endif
 #include <systemd/sd-daemon.h>
 #endif
 
 #define _PSUPP(var, name, desc) printf("  %s:\n\t\t%s: %s\n", name, desc, var ? "yes" : "no")
+
+#ifdef HAVE_LAKKA
+static bool lakka_update_staged = false;
+
+bool lakka_update_pending(void)
+{
+   return lakka_update_staged;
+}
+
+void lakka_update_check(void)
+{
+   bool         found = false;
+   struct RDIR *dir   = retro_opendir(LAKKA_UPDATE_DIR);
+
+   lakka_update_staged = false;
+   if (!dir)
+      return;
+
+   while (!found && retro_readdir(dir))
+   {
+      const char *name = retro_dirent_get_name(dir);
+
+      if (retro_dirent_is_dir(dir, NULL))
+         continue;
+
+      found =    string_ends_with(name, ".tar")
+              || string_ends_with(name, ".img.gz")
+              || string_ends_with(name, ".img");
+   }
+
+   retro_closedir(dir);
+   lakka_update_staged = found;
+}
+#endif
 
 #define FAIL_CPU(simd_type) do { \
    RARCH_ERR(simd_type " code is compiled in, but CPU does not support this feature. Cannot continue.\n"); \
@@ -350,7 +391,8 @@ enum
    RA_OPT_DATABASE_SCAN,
    RA_OPT_ACCESSIBILITY,
    RA_OPT_LOAD_MENU_ON_ERROR,
-   RA_OPT_CLOUDSYNC
+   RA_OPT_CLOUDSYNC,
+   RA_OPT_MCP_STDIO
 };
 
 /* DRIVERS */
@@ -1547,6 +1589,14 @@ static void driver_adjust_system_rates(
    video_st->headset_vsync    = settings->bools.video_vsync;
    video_st->headset_interval = (video_st->headset_vsync
          && !video_driver_thread_wrapper_active()) ? headset_fit : 0;
+   /* A headset's own context begins and ends its frame in every core
+    * frame, so with no fit the core runs at the headset's rate; with a
+    * window, the window's vsync paces, and the wrapper holds the core
+    * at its own rate. */
+   video_st->headset_runloop_hz = (     !video_st->headset_interval
+         && !video_driver_thread_wrapper_active()
+         && video_context_driver_headset_inline())
+      ? video_st->headset_hz : 0.0f;
    if (video_st->headset_interval)
    {
       video_refresh_rate    = video_st->headset_hz;
@@ -1934,6 +1984,13 @@ void drivers_init(
       }
    }
 
+#ifdef HAVE_LAKKA_SWITCH
+   /* Parse the Hekate boot entries and restore the saved reboot
+    * payload before the menu driver is initialised, so the first
+    * menu build already shows the right destination. */
+   r2p_load_selection(settings);
+#endif
+
 #ifdef HAVE_MENU
    if (flags & DRIVER_VIDEO_MASK)
    {
@@ -2032,9 +2089,11 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
     * the in-flight frame still references, producing
     * use-after-free crashes on D3D12/Vulkan under threaded video.
     *
+    * The wrapper decides, not the setting: turning threaded video
+    * off clears the setting before this runs.
+    *
     * No-op when threaded video is not active. */
    if (     (flags & (DRIVER_VIDEO_AND_INPUT_MASK | DRIVER_MENU_MASK))
-         && VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st)
          && video_st->thread_wrapper_active)
       video_thread_wait_idle();
 #endif
@@ -2173,6 +2232,9 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
 #ifdef HAVE_LAKKA
    cpu_scaling_driver_free();
 #endif
+#ifdef HAVE_LAKKA_SWITCH
+   r2p_deinit();
+#endif
 }
 
 static void retroarch_deinit_drivers(struct retro_callbacks *cbs)
@@ -2191,6 +2253,10 @@ static void retroarch_deinit_drivers(struct retro_callbacks *cbs)
    dispgfx_widget_t *p_dispwidget  = dispwidget_get_ptr();
    if (p_dispwidget->flags & DISPGFX_WIDGET_FLAG_INITED)
    {
+#ifdef HAVE_THREADS
+      /* Same barrier as driver_uninit(): no frame still drawing them */
+      video_thread_wait_idle();
+#endif
       gfx_widgets_deinit(p_dispwidget->persisting);
       p_dispwidget->active         = false;
    }
@@ -2355,6 +2421,43 @@ uint32_t retroarch_get_flags(void)
 {
    struct rarch_state *p_rarch = &rarch_st;
    return p_rarch->flags;
+}
+
+void retroarch_user_dirs_hold(void)
+{
+   rarch_st.flags |= RARCH_FLAGS_USER_DIRS_HELD;
+}
+
+void retroarch_user_dirs_release(void)
+{
+   settings_t *settings = config_get_ptr();
+
+   if (!(rarch_st.flags & RARCH_FLAGS_USER_DIRS_HELD))
+      return;
+   rarch_st.flags &= ~RARCH_FLAGS_USER_DIRS_HELD;
+   if (!settings)
+      return;
+
+   {
+      char new_path[PATH_MAX_LENGTH];
+      fill_pathname_join_special(new_path,
+            settings->paths.directory_playlist,
+            FILE_PATH_BUILTIN, sizeof(new_path));
+      if (!path_is_directory(new_path))
+         path_mkdir(new_path);
+   }
+
+#ifdef HAVE_MENU
+   retroarch_favorites_init();
+   command_event(CMD_EVENT_HISTORY_INIT, NULL);
+   {
+      struct menu_state *menu_st = menu_state_get_ptr();
+      if (menu_st->driver_ctx && menu_st->driver_ctx->environ_cb)
+         menu_st->driver_ctx->environ_cb(MENU_ENVIRON_RESET_HORIZONTAL_LIST,
+               NULL, menu_st->userdata);
+      menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+   }
+#endif
 }
 
 struct retro_perf_counter **retro_get_perf_counter_rarch(void)
@@ -4096,6 +4199,11 @@ bool command_event(enum event_command cmd, void *data)
       case CMD_EVENT_RESET:
          {
             const char *_msg = msg_hash_to_str(MSG_RESET);
+#ifdef HAVE_COMMAND
+            /* steps queued for the game before the reset, however it
+             * came - hotkey, menu, command - would play on from it */
+            command_run_frames_forget();
+#endif
             RARCH_LOG("[Core] %s.\n", _msg);
             runloop_msg_queue_push(_msg, strlen(_msg), 1, 120, true, NULL,
                   MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
@@ -4521,16 +4629,15 @@ bool command_event(enum event_command cmd, void *data)
             }
             else if (!want_widgets && widgets_active)
             {
-#ifdef HAVE_THREADS
-               /* Same barrier as driver_uninit(): never free widget GPU
-                * resources while the video thread may still reference them. */
-               if (     VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st)
-                     && video_st->thread_wrapper_active)
-                  video_thread_wait_idle();
-#endif
                /* Full teardown (not persisting): a real user toggle-off
-                * must clear INITED so a later toggle-on re-inits cleanly. */
+                * must clear INITED so a later toggle-on re-inits cleanly.
+                * Under the wrapper it runs once the video thread is past
+                * the frame in flight, not waiting for it. */
+#ifdef HAVE_THREADS
+               gfx_widgets_deinit_async();
+#else
                gfx_widgets_deinit(false);
+#endif
                p_dispwidget->active = false;
             }
          }
@@ -4887,7 +4994,9 @@ bool command_event(enum event_command cmd, void *data)
 
             command_event(CMD_EVENT_HISTORY_DEINIT, NULL);
 
-            if (!history_list_enable || !playlist_config.capacity)
+            if (     !history_list_enable
+                  || !playlist_config.capacity
+                  || (rarch_st.flags & RARCH_FLAGS_USER_DIRS_HELD))
                return false;
 
             _msg = msg_hash_to_str(MSG_LOADING_HISTORY_FILE);
@@ -5194,6 +5303,21 @@ bool command_event(enum event_command cmd, void *data)
          {
 #if defined(__linux__) && !defined(ANDROID)
             const char *_msg = msg_hash_to_str(MSG_VALUE_REBOOTING);
+#ifdef HAVE_LAKKA_SWITCH
+            /* Tell Hekate what to boot next via pmc_r2p. A staged
+             * update reboots back into the running Lakka entry
+             * (unless the user opted out) so the initramfs installs
+             * it. If arming fails this is a plain reboot. */
+            if (r2p_is_supported())
+            {
+               lakka_update_check();
+               if (     settings->bools.reboot_force_self_on_update
+                     && lakka_update_pending())
+                  r2p_arm_self();
+               else
+                  r2p_arm_selected();
+            }
+#endif
             if (settings->bools.config_save_on_exit)
                command_event(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG, NULL);
             runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, true, NULL,
@@ -6309,6 +6433,33 @@ bool command_event(enum event_command cmd, void *data)
       case CMD_EVENT_HEADSET_RECENTER:
          video_driver_headset_recenter();
          break;
+      case CMD_EVENT_HEADSET_VIEW_TOGGLE:
+         {
+            char msg[256];
+            size_t _len;
+            enum msg_hash_enums value;
+            switch (video_driver_headset_view_toggle())
+            {
+               case VIDEO_HEADSET_VIEW_LAST:
+                  return false;
+               case VIDEO_HEADSET_VIEW_STEREOSCOPIC:
+                  value = MSG_OPENXR_HEADSET_VIEW_STEREOSCOPIC;
+                  break;
+               case VIDEO_HEADSET_VIEW_FLAT:
+                  value = MSG_OPENXR_HEADSET_VIEW_FLAT;
+                  break;
+               default:
+                  value = MSG_OPENXR_HEADSET_VIEW_IMMERSIVE;
+                  break;
+            }
+            _len = snprintf(msg, sizeof(msg),
+                  msg_hash_to_str(MSG_OPENXR_HEADSET_VIEW),
+                  msg_hash_to_str(value));
+            RARCH_LOG("[OpenXR] %s\n", msg);
+            runloop_msg_queue_push(msg, _len, 1, 180, true, NULL,
+                  MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+         }
+         break;
       case CMD_EVENT_LASER_POINTER_TOGGLE:
          {
             char msg[256];
@@ -6728,21 +6879,8 @@ void main_exit(void *args)
    video_driver_restore_cached(settings);
 
 #if defined(HAVE_GFX_WIDGETS)
-   /* Do not want display widgets to live any more.
-    *
-    * The widget flags are read by gfx_widgets_frame(), which runs on
-    * the video thread under threaded video, so the thread is brought
-    * to a stop first - clearing the bit under it is a write racing
-    * those reads, which ThreadSanitizer catches on the exit path about
-    * one run in three. No-op when the wrapper is not active. */
-#ifdef HAVE_THREADS
-   {
-      video_driver_state_t *video_st_exit = video_state_get_ptr();
-      if (     VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st_exit)
-            && video_st_exit->thread_wrapper_active)
-         video_thread_wait_idle();
-   }
-#endif
+   /* Do not want display widgets to live any more. Only this thread
+    * reads the flag. */
    dispwidget_get_ptr()->persisting = false;
 #endif
 #ifdef HAVE_MENU
@@ -6814,10 +6952,6 @@ void main_exit(void *args)
    frontend_driver_free();
 
    rtime_deinit();
-
-#if defined(ANDROID)
-   play_feature_delivery_deinit();
-#endif
 
 #if defined(HAVE_MIST)
    steam_deinit();
@@ -6945,10 +7079,6 @@ int rarch_main(int argc, char *argv[], void *data)
 #endif
 
    rtime_init();
-
-#if defined(ANDROID)
-   play_feature_delivery_init();
-#endif
 
 #if defined(HAVE_MIST)
    steam_init();
@@ -7725,6 +7855,11 @@ static void retroarch_print_help(const char *arg0)
          "Detach program from the running console. Not relevant for all platforms.\n"
          "      --max-frames=NUMBER        "
          "Runs for the specified number of frames, then exits.\n");
+#ifdef HAVE_MCP
+   strlcpy_append(buf, sizeof(buf), &_len,
+         "      --mcp-stdio                "
+         "Serves MCP on stdin and stdout, for a client that starts RetroArch.\n");
+#endif
 
 #ifdef HAVE_PATCH
    strlcpy_append(buf, sizeof(buf), &_len,
@@ -8077,6 +8212,9 @@ static bool retroarch_parse_input_and_config(
 #ifdef HAVE_CLOUDSYNC
       { "cloudsync",          0, NULL, RA_OPT_CLOUDSYNC },
 #endif
+#ifdef HAVE_MCP
+      { "mcp-stdio",          0, NULL, RA_OPT_MCP_STDIO },
+#endif
       { NULL, 0, NULL, 0 }
    };
 
@@ -8276,6 +8414,13 @@ static bool retroarch_parse_input_and_config(
                retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_VERBOSITY, NULL);
 #endif
                break;
+#ifdef HAVE_MCP
+            case RA_OPT_MCP_STDIO:
+               /* before anything else writes to stdout */
+               if (!command_mcp_stdio_claim())
+                  RARCH_ERR("[MCP] Could not take stdin and stdout.\n");
+               break;
+#endif
 
             /* Must handle '?' otherwise you get an infinite loop */
             case '?':
@@ -8679,6 +8824,9 @@ static bool retroarch_parse_input_and_config(
             case 'S':
             case 'v':
             case RA_OPT_LOG_FILE:
+#ifdef HAVE_MCP
+            case RA_OPT_MCP_STDIO:
+#endif
                break; /* Handled in the first pass */
 
             case '?':
@@ -8992,10 +9140,7 @@ static void retroarch_find_drivers(settings_t *settings,
           * and fonts an in-flight threaded frame is still drawing with.
           *
           * No-op when threaded video is not active. */
-         video_driver_state_t *video_st = video_state_get_ptr();
-         if (     VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st)
-               && video_st->thread_wrapper_active)
-            video_thread_wait_idle();
+         video_thread_wait_idle();
 #endif
          menu_st->flags        &= ~MENU_ST_FLAG_DATA_OWN;
          menu_driver_ctl(RARCH_MENU_CTL_DEINIT, NULL);
@@ -10275,6 +10420,7 @@ static bool retroarch_main_quit_begin(void)
 
    if (runloop_st->flags & RUNLOOP_FLAG_SHUTDOWN_INITIATED)
       return false;
+   record_nvenc_stop();
    if (   settings->bools.savestate_auto_save
        && runloop_st->current_core_type != CORE_TYPE_DUMMY)
       command_event_save_auto_state();
@@ -10417,14 +10563,15 @@ bool retroarch_main_quit_staged(void)
 #if defined(HAVE_LIBNX) || defined(_3DS)
    return retroarch_main_quit();
 #else
-   if (     !video_st->current_video
+   if (    (!video_st->current_video
          || !video_st->data
          || !video_st->current_video->alive
          || !video_st->current_video->alive(video_st->data))
+         && !record_nvenc_pending())
       return retroarch_main_quit();
 
    first = retroarch_main_quit_begin();
-   if (!first || !retroarch_quit_state_task_pending(NULL))
+   if (!first || (!retroarch_quit_state_task_pending(NULL) && !record_nvenc_pending()))
    {
       retroarch_main_quit_finish(first);
       return true;
@@ -10434,6 +10581,7 @@ bool retroarch_main_quit_staged(void)
     * be serializing it, and the session ends with this quit. */
    runloop_st->quit_pending    = true;
    runloop_st->content_closing = true;
+   if (retroarch_quit_state_task_pending(NULL))
    {
       const char *_msg = msg_hash_to_str(MSG_SAVING_STATE);
       runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, true,
@@ -10452,7 +10600,8 @@ bool retroarch_main_quit_poll(void)
 
    if (!runloop_st->quit_pending)
       return false;
-   if (retroarch_quit_state_task_pending(NULL))
+   record_nvenc_poll();
+   if (retroarch_quit_state_task_pending(NULL) || record_nvenc_pending())
       return false;
    runloop_st->quit_pending = false;
    retroarch_main_quit_finish(true);
@@ -10546,7 +10695,7 @@ void retroarch_favorites_init(void)
    playlist_config.fuzzy_archive_match = settings ? settings->bools.playlist_fuzzy_archive_match : false;
    playlist_config_set_base_content_directory(&playlist_config, NULL);
 
-   if (!settings)
+   if (!settings || (rarch_st.flags & RARCH_FLAGS_USER_DIRS_HELD))
       return;
 
    if (content_favorites_size >= 0)

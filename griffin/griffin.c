@@ -326,8 +326,9 @@ VIDEO CONTEXT
 #if defined(ANDROID)
 #include "../gfx/drivers_context/android_ctx.c"
 #if defined(HAVE_OPENXR)
-#include "../input/drivers/openxr_input.c"
+#if defined(HAVE_OPENGLES3)
 #include "../gfx/drivers_context/gl_android_openxr_ctx.c"
+#endif
 #include "../deps/openxr/src/xr_generated_dispatch_table_core.c"
 #endif
 #if defined(HAVE_VULKAN)
@@ -370,13 +371,29 @@ VIDEO CONTEXT
 #ifdef HAVE_VULKAN
 #include "../gfx/common/vulkan_common.c"
 #include "../libretro-common/vulkan/vulkan_symbol_wrapper.c"
+#ifdef HAVE_RMP4
+#include "../gfx/common/vulkan_video_decode.c"
+#endif
 #ifdef HAVE_OPENXR
-#include "../gfx/video_xr.c"
 #include "../gfx/common/vulkan_openxr.c"
-#include "../input/common/input_openxr.c"
 #endif
 #ifdef HAVE_VULKAN_DISPLAY
 #include "../gfx/drivers_context/khr_display_ctx.c"
+#endif
+#endif
+
+#ifdef HAVE_OPENXR
+/* The headset's units that name no graphics API. */
+#include "../gfx/video_xr.c"
+#include "../gfx/common/openxr_runtime.c"
+#include "../gfx/common/openxr_session.c"
+#include "../gfx/common/openxr_tracking.c"
+#include "../gfx/common/openxr_host.c"
+#include "../gfx/common/openxr_swapchain.c"
+#include "../gfx/common/openxr_frame.c"
+#include "../input/common/input_openxr.c"
+#if defined(ANDROID) && defined(HAVE_OPENGLES3)
+#include "../gfx/common/openxr_binding_gles.c"
 #endif
 #endif
 
@@ -625,7 +642,26 @@ VIDEO DRIVER
 #include "../gfx/common/d3d11_deferred_proxy.c"
 #endif
 
+#if (defined(HAVE_D3D11) || defined(HAVE_D3D12)) && defined(HAVE_RMP4) \
+ && !defined(__WINRT__)
+#include "../gfx/common/d3d11_video_decode.c"
+#endif
+
 #if defined(HAVE_D3D12)
+#include "../gfx/common/nvenc_d3d12.c"
+#include "../record/record_gpu_queue.c"
+#include "../record/record_gpu_capture_d3d12.c"
+#include "../record/record_gpu_worker_d3d12.c"
+#ifndef HAVE_RAC3
+#include "../libretro-common/formats/ac3/rac3_frame.c"
+#endif
+#include "../record/record_mux_mp4.c"
+#include "../record/record_file_win32.c"
+#ifdef HAVE_RAC3
+#include "../record/record_gpu_output_d3d12.c"
+#include "../record/record_gpu_session_d3d12.c"
+#include "../record/record_gpu_dispatch_d3d12.c"
+#endif
 #include "../gfx/drivers/d3d12.c"
 #endif
 
@@ -1333,7 +1369,7 @@ CORES
 #endif
 
 #ifdef HAVE_WEBMPLAYER
-#include "../cores/libretro-webm/webm_core.c"
+#include "../cores/libretro-media/media_core.c"
 #endif
 
 #if defined(HAVE_MPV)
@@ -1434,7 +1470,7 @@ FRONTEND
 #include "../frontend/drivers/platform_psp.c"
 #elif defined(_3DS)
 #include "../frontend/drivers/platform_ctr.c"
-#elif defined(SWITCH) && defined(HAVE_LIBNX)
+#elif defined(SWITCH)
 #include "../frontend/drivers/platform_switch.c"
 #elif defined(XENON)
 #include "../frontend/drivers/platform_xenon.c"
@@ -1530,6 +1566,7 @@ RECORDING
 ============================================================ */
 #include "../record/record_driver.c"
 #include "../record/drivers/record_wav.c"
+#include "../record/drivers/record_nvenc.c"
 #ifdef HAVE_FFMPEG
 #include "../record/drivers/record_ffmpeg.c"
 #endif

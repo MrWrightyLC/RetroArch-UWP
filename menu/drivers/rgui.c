@@ -1682,8 +1682,7 @@ static const rgui_pixel_format_entry rgui_pixel_format_map[] =
    { "d3d12",      argb32_to_bgra4444, argb32_to_bgra4444_dither, true  },
    { "metal",      argb32_to_bgra4444, argb32_to_bgra4444_dither, true  }, /* Metal */
    { "sdl_dingux", argb32_to_rgb565,   argb32_to_rgb565_dither,   false }, /* DINGUX SDL */
-   { "sdl_rs90",   argb32_to_rgb565,   argb32_to_rgb565_dither,   false },
-   { "xvideo",     argb32_to_rgb565,   argb32_to_rgb565_dither,   false }
+   { "sdl_rs90",   argb32_to_rgb565,   argb32_to_rgb565_dither,   false }
 };
 
 /* Returns true if current pixel format supports
@@ -5509,9 +5508,17 @@ RGUI_NOINLINE static void rgui_render_osk(
       input_str_y                    = osk_y + input_offset_y + rgui->font_height_stride;
       input_str_visible              = utf8skip(input_str, input_str_char_offset);
 
+      if (input_driver_keyboard_line_selected())
+         rgui_color_rect(frame_buf_data, fb_dims,
+               input_str_x, input_str_y,
+               input_str_length * rgui->font_width_stride,
+               VIDEO_SCALE_H(rgui->font_dims), rgui->colors.hover_color);
+
       if (input_str_visible && *input_str_visible)
          rgui_blit_line(rgui, fb_width, input_str_x, input_str_y, input_str_visible,
-               rgui->colors.hover_color, rgui->colors.shadow_color);
+               input_driver_keyboard_line_selected()
+               ? rgui->colors.bg_dark_color : rgui->colors.hover_color,
+               rgui->colors.shadow_color);
 
       /* Draw text cursor */
       text_cursor_x                  = osk_x + input_offset_x
@@ -5561,7 +5568,8 @@ RGUI_NOINLINE static void rgui_render_osk(
          }
       }
 
-      if (!(((current_time - last_cursor_time) / 500000) & 1))
+      if (!input_driver_keyboard_line_selected()
+            && !(((current_time - last_cursor_time) / 500000) & 1))
          rgui_blit_symbol(rgui, fb_width, text_cursor_x, input_str_y, RGUI_SYMBOL_TEXT_CURSOR,
                rgui->colors.normal_color, rgui->colors.shadow_color);
    }
@@ -7556,6 +7564,8 @@ static void rgui_set_texture(void *data)
          uint32_t x_ratio, y_ratio;
          unsigned x_src, y_src;
          unsigned x_dst, y_dst;
+         size_t out_pitch;
+         uint16_t *out_frame      = NULL;
          frame_buf_t *frame_buf   = &rgui->frame_buf;
          frame_buf_t *upscale_buf = &rgui->upscale_buf;
 
@@ -7571,10 +7581,15 @@ static void rgui_set_texture(void *data)
             out_height = internal_upscale_level * fb_height;
          }
 
+         out_pitch = (size_t)out_width * sizeof(uint16_t);
+         /* Render into the unpublished upload slot when available. */
+         if (VIDEO_SCALE_FITS(out_width, out_height))
+            out_frame = (uint16_t*)video_driver_get_menu_framebuffer(
+                  VIDEO_SCALE_PACK(out_width, out_height), false, &out_pitch);
          /* Allocate upscaling buffer, if required */
-         if (     (upscale_buf->width  != out_width)
+         if (!out_frame && ((upscale_buf->width  != out_width)
                || (upscale_buf->height != out_height)
-               || !upscale_buf->data)
+               || !upscale_buf->data))
          {
             upscale_buf->width  = out_width;
             upscale_buf->height = out_height;
@@ -7600,6 +7615,12 @@ static void rgui_set_texture(void *data)
             }
          }
 
+         if (!out_frame)
+         {
+            out_frame = upscale_buf->data;
+            out_pitch = (size_t)out_width * sizeof(uint16_t);
+         }
+
          /* Perform nearest neighbour upscaling
           * NB: We're duplicating code here, but trying to handle
           * this with a polymorphic function is too much of a drag... */
@@ -7608,16 +7629,17 @@ static void rgui_set_texture(void *data)
 
          for (y_dst = 0; y_dst < out_height; y_dst++)
          {
+            uint16_t *row = (uint16_t*)((uint8_t*)out_frame + y_dst * out_pitch);
             y_src = (y_dst * y_ratio) >> 16;
             for (x_dst = 0; x_dst < out_width; x_dst++)
             {
                x_src = (x_dst * x_ratio) >> 16;
-               upscale_buf->data[(y_dst * out_width) + x_dst] = frame_buf->data[(y_src * fb_width) + x_src];
+               row[x_dst] = frame_buf->data[(y_src * fb_width) + x_src];
             }
          }
 
          /* Draw upscaled texture */
-         rgui_set_texture_frame(video_st, upscale_buf->data,
+         rgui_set_texture_frame(video_st, out_frame,
             false, VIDEO_SCALE_PACK(out_width, out_height), 1.0f);
       }
    }

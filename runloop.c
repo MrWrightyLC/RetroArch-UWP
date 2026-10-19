@@ -21,6 +21,9 @@
 
 #include <memory/mem_stats.h>
 #include "input/input_driver.h"
+#ifdef HAVE_OPENXR
+#include "input/common/input_openxr.h"
+#endif
 #ifdef _WIN32
 #ifdef _XBOX
 #include <xtl.h>
@@ -68,6 +71,9 @@
 #include <encodings/utf.h>
 
 #include <libretro.h>
+#ifdef HAVE_RMP4
+#include <formats/rh264.h>
+#endif
 #ifdef HAVE_VULKAN
 #include <libretro_vulkan.h>
 #endif
@@ -125,6 +131,7 @@ bool android_get_vfs_authorized_locations(
 #include "camera/camera_driver.h"
 #include "location_driver.h"
 #include "record/record_driver.h"
+#include "record/drivers/record_nvenc.h"
 #include "msg_hash_lbl_str.h"
 
 #ifdef HAVE_CONFIG_H
@@ -364,7 +371,7 @@ static void runloop_game_ai_think_cb(void *userdata,
 #endif
 
 #ifdef HAVE_WEBMPLAYER
-#define SYMBOL_WEBM(x) current_core->x = libretro_webm_##x
+#define SYMBOL_MEDIA(x) current_core->x = libretro_media_##x
 #endif
 
 #ifdef HAVE_IMAGEVIEWER
@@ -1035,12 +1042,18 @@ static dylib_t load_dynamic_core(const char *path, char *s,
    return dylib_load(path);
 }
 
+/* @live is set when @path opened the library already loaded as the
+ * current core: its retro_set_environment has been called and is not
+ * called again mid-session, so what it declared is taken from the
+ * running state instead. */
 static dylib_t libretro_get_system_info_lib(const char *path,
-      struct retro_system_info *sysinfo, bool *load_no_content)
+      struct retro_system_info *sysinfo, bool *load_no_content,
+      bool *live)
 {
    dylib_t lib = dylib_load(path);
    void (*proc)(struct retro_system_info*);
 
+   *live = false;
    if (!lib)
       return NULL;
 
@@ -1055,7 +1068,13 @@ static dylib_t libretro_get_system_info_lib(const char *path,
 
    proc(sysinfo);
 
-   if (load_no_content)
+   if (lib == runloop_state.lib_handle)
+   {
+      *live = true;
+      if (load_no_content)
+         *load_no_content = runloop_state.system.load_no_content;
+   }
+   else if (load_no_content)
    {
       void (*set_environ)(retro_environment_t);
       *load_no_content = false;
@@ -1223,6 +1242,10 @@ static bool dynamic_verify_hw_context(
             if (!(len == 5 && memcmp(video_ident, "d3d12", 5) == 0))
                return false;
             break;
+         case RETRO_HW_CONTEXT_D3D9:
+            if (!(len == 9 && memcmp(video_ident, "d3d9_hlsl", 9) == 0))
+               return false;
+            break;
          default:
             break;
       }
@@ -1328,7 +1351,7 @@ static bool dynamic_request_hw_context(enum retro_hw_context_type type,
          RARCH_LOG("[HW] Requesting D3D12 context.\n");
          break;
 #endif
-#if defined(HAVE_D3D9)
+#if defined(HAVE_D3D9) && defined(HAVE_HLSL)
       case RETRO_HW_CONTEXT_D3D9:
          RARCH_LOG("[HW] Requesting D3D9 context.\n");
          break;
@@ -1809,6 +1832,164 @@ static void core_performance_counter_stop(struct retro_perf_counter *perf)
       perf->total += cpu_features_get_perf_counter() - perf->start;
 }
 
+
+#ifdef HAVE_OPENXR
+/* The pose calls answer while the headset tracks. A core asking before
+ * a sampled frame is sampled now, and before each run from then on. */
+static bool runloop_vr_poses(runloop_state_t *runloop_st)
+{
+   if (!(video_driver_xr_headset() & VIDEO_XR_HEADSET_TRACKING))
+      return false;
+   if (!runloop_st->core_vr_content)
+   {
+      runloop_st->core_vr_content = true;
+      video_driver_vr_sample_tracking();
+   }
+   return true;
+}
+#endif
+
+#ifdef HAVE_RMP4
+static void *runloop_video_decode_open(void)
+{
+   rh264_video *v = rh264_video_open();
+   rh264_video_set_hw_readback(v, 1);
+   return v;
+}
+
+static int runloop_video_decode_frame(rh264_video *v,
+      struct retro_video_decode_frame *frame)
+{
+   int i, stride, w, h;
+   if (!frame || rh264_video_bit_depth(v) != 8)
+      return -1;
+   memset(frame, 0, sizeof(*frame));
+   for (i = 0; i < 3; i++)
+   {
+      frame->planes[i] = rh264_video_plane(v, i, &stride, &w, &h);
+      if (!frame->planes[i] || stride <= 0 || w <= 0 || h <= 0)
+         return -1;
+      frame->strides[i] = (unsigned)stride;
+      if (!i)
+      {
+         frame->width = (unsigned)w;
+         frame->height = (unsigned)h;
+      }
+      else if ((unsigned)w != (frame->width + 1) / 2
+            || (unsigned)h != (frame->height + 1) / 2)
+         return -1;
+   }
+   frame->hardware = rh264_video_is_hw(v) != 0;
+   return 1;
+}
+
+static int runloop_video_decode(void *decoder, const uint8_t *data,
+      size_t size, struct retro_video_decode_frame *frame)
+{
+   rh264_video *v = (rh264_video*)decoder;
+   int result;
+   rh264_video_set_deferred_readback(v, 0);
+   result = rh264_video_decode(v, data, size);
+   return result == 1 ? runloop_video_decode_frame(v, frame) : result;
+}
+
+static int runloop_video_decode_drain(void *decoder,
+      struct retro_video_decode_frame *frame)
+{
+   rh264_video *v = (rh264_video*)decoder;
+   rh264_video_set_deferred_readback(v, 0);
+   return rh264_video_drain(v) == 0 ? runloop_video_decode_frame(v, frame) : 0;
+}
+
+static int runloop_video_decode_metadata(rh264_video *v,
+      struct retro_video_decode_frame *frame)
+{
+   int width, height;
+   if (!frame || rh264_video_bit_depth(v) != 8
+         || rh264_video_frame_size(v, &width, &height) != 0)
+      return -1;
+   memset(frame, 0, sizeof(*frame));
+   frame->width    = (unsigned)width;
+   frame->height   = (unsigned)height;
+   frame->hardware = rh264_video_is_hw(v) != 0;
+   return 1;
+}
+
+static int runloop_video_decode_ex(void *decoder, const uint8_t *data,
+      size_t size, struct retro_video_decode_frame *frame, unsigned flags)
+{
+   rh264_video *v = (rh264_video*)decoder;
+   int result;
+   if (!v || !frame || (flags & ~RETRO_VIDEO_DECODE_DEFER_PLANES))
+      return -1;
+   rh264_video_set_deferred_readback(v, flags & RETRO_VIDEO_DECODE_DEFER_PLANES);
+   result = rh264_video_decode(v, data, size);
+   if (result != 1)
+      return result;
+   return flags ? runloop_video_decode_metadata(v, frame)
+      : runloop_video_decode_frame(v, frame);
+}
+
+static int runloop_video_decode_drain_ex(void *decoder,
+      struct retro_video_decode_frame *frame, unsigned flags)
+{
+   rh264_video *v = (rh264_video*)decoder;
+   int result;
+   if (!v || !frame || (flags & ~RETRO_VIDEO_DECODE_DEFER_PLANES))
+      return -1;
+   rh264_video_set_deferred_readback(v, flags & RETRO_VIDEO_DECODE_DEFER_PLANES);
+   result = rh264_video_drain(v);
+   if (result != 0)
+      return result == 2 ? 2 : 0;
+   return flags ? runloop_video_decode_metadata(v, frame)
+      : runloop_video_decode_frame(v, frame);
+}
+
+static int runloop_video_decode_get_frame(void *decoder,
+      struct retro_video_decode_frame *frame)
+{
+   rh264_video *v = (rh264_video*)decoder;
+   return rh264_video_readback(v) == 0
+      ? runloop_video_decode_frame(v, frame) : -1;
+}
+
+static int runloop_video_decode_get_gpu_frame(void *decoder,
+      struct retro_video_decode_gpu_frame *frame)
+{
+   video_hw_frame_t source;
+   int result;
+   if (!frame)
+      return -1;
+   result = rh264_video_export_frame((rh264_video*)decoder, &source);
+   if (result != 0)
+      return result == 2 ? 2 : -1;
+   memset(frame, 0, sizeof(*frame));
+   frame->image = source.image;
+   frame->plane_views[0] = source.plane_views[0];
+   frame->plane_views[1] = source.plane_views[1];
+   frame->wait = source.wait;
+   frame->wait_value = source.wait_value;
+   frame->done = source.done;
+   frame->done_value = source.done_value;
+   frame->abandon = source.abandon;
+   frame->owner = source.owner;
+   frame->width = source.width;
+   frame->height = source.height;
+   frame->layout = source.layout;
+   frame->yuv = source.yuv;
+   frame->pixfmt = source.pixfmt;
+   frame->array_slice = source.array_slice;
+   frame->crop_x = source.crop_x;
+   frame->crop_y = source.crop_y;
+   frame->api = source.api;
+   return 1;
+}
+
+static void runloop_video_decode_close(void *decoder)
+{
+   rh264_video_close((rh264_video*)decoder);
+}
+#endif
 
 bool runloop_environment_cb(unsigned cmd, void *data)
 {
@@ -2518,6 +2699,11 @@ bool runloop_environment_cb(unsigned cmd, void *data)
             case RETRO_PIXEL_FORMAT_XRGB8888:
                RARCH_LOG("[Environ] SET_PIXEL_FORMAT: XRGB8888.\n");
                break;
+            case RETRO_PIXEL_FORMAT_SCRGB_RGBA16F:
+               if (!video_driver_supports_fp16_source())
+                  return false;
+               RARCH_LOG("[Environ] SET_PIXEL_FORMAT: SCRGB_RGBA16F.\n");
+               break;
             case RETRO_PIXEL_FORMAT_XRGB2101010:
                /* Always accepted: if the active video driver cannot present a
                 * 10-bit source surface, the frame path transparently
@@ -2566,6 +2752,10 @@ bool runloop_environment_cb(unsigned cmd, void *data)
                return false;
          }
 
+         /* A cached frame in the old format cannot be drawn again
+          * in the new one: its rows are the old format's size. */
+         if (video_st->pix_fmt != pix_fmt)
+            video_driver_cached_frame_invalidate();
          video_st->pix_fmt = pix_fmt;
          break;
       }
@@ -2802,6 +2992,11 @@ bool runloop_environment_cb(unsigned cmd, void *data)
             {
                *cb = RETRO_HW_CONTEXT_D3D12;
                RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER: RETRO_HW_CONTEXT_D3D12.\n");
+            }
+            else if (memcmp(video_driver_name, "d3d9_hlsl", sizeof("d3d9_hlsl")) == 0)
+            {
+               *cb = RETRO_HW_CONTEXT_D3D9;
+               RARCH_LOG("[Environ] GET_PREFERRED_HW_RENDER: RETRO_HW_CONTEXT_D3D9.\n");
             }
             else
             {
@@ -3108,6 +3303,32 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          break;
       }
 
+      case RETRO_ENVIRONMENT_GET_VIDEO_DECODE_INTERFACE:
+#ifdef HAVE_RMP4
+         {
+            struct retro_video_decode_interface *iface =
+               (struct retro_video_decode_interface*)data;
+            if (!iface || (iface->interface_version < 1
+                  || iface->interface_version > RETRO_VIDEO_DECODE_INTERFACE_VERSION))
+               return false;
+            RARCH_LOG("[Environ] GET_VIDEO_DECODE_INTERFACE: H.264 with CPU planes.\n");
+            iface->open = runloop_video_decode_open;
+            iface->decode = runloop_video_decode;
+            iface->drain = runloop_video_decode_drain;
+            iface->close = runloop_video_decode_close;
+            if (iface->interface_version >= 2)
+            {
+               iface->decode_ex = runloop_video_decode_ex;
+               iface->drain_ex  = runloop_video_decode_drain_ex;
+               iface->get_frame = runloop_video_decode_get_frame;
+            }
+            if (iface->interface_version >= 3)
+               iface->get_gpu_frame = runloop_video_decode_get_gpu_frame;
+            return true;
+         }
+#else
+         return false;
+#endif
       case RETRO_ENVIRONMENT_GET_LOG_INTERFACE:
       {
          struct retro_log_callback *cb = (struct retro_log_callback*)data;
@@ -3941,6 +4162,18 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          if (target_refresh_rate <= 0.0f)
             target_refresh_rate    = video_driver_get_refresh_rate();
 
+#ifdef HAVE_OPENXR
+         /* The headset's rate only while the runloop iterates at it:
+          * a headset that paces the core at its own rate, or a window
+          * that does, targets the configured one. */
+         {
+            video_driver_state_t *video_st = video_state_get_ptr();
+            if (     (video_driver_xr_headset() & VIDEO_XR_HEADSET_PRESENTING)
+                  && video_st->headset_runloop_hz > 0.0f)
+               target_refresh_rate = video_st->headset_runloop_hz;
+         }
+#endif
+
          *(float *)data = target_refresh_rate;
          break;
       }
@@ -4172,7 +4405,8 @@ bool runloop_environment_cb(unsigned cmd, void *data)
           * yet initialised (queried before drivers_init, e.g. a direct CLI
           * load) we cannot read its real format, so fall back to the
           * format-negotiation hint, which is what it will request. */
-         if (AUDIO_FLAGS_GET(audio_state_get_ptr()) & AUDIO_FLAG_ACTIVE)
+         if (audio_state_get_ptr()->context_audio_data
+               && (AUDIO_FLAGS_GET(audio_state_get_ptr()) & AUDIO_FLAG_ACTIVE))
          {
             if (!(AUDIO_FLAGS_GET(audio_state_get_ptr()) & AUDIO_FLAG_USE_FLOAT))
                return false;
@@ -4218,7 +4452,13 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          if (!video_driver_set_views((struct retro_video_views*)data))
             return false;
 #ifdef HAVE_OPENXR
-         runloop_st->core_vr_content = video_driver_vr_content_active();
+         if (     video_driver_vr_content_active()
+               && !runloop_st->core_vr_content)
+         {
+            runloop_st->core_vr_content = true;
+            /* A core reading poses later in this run needs a sample */
+            video_driver_vr_sample_tracking();
+         }
 #endif
          break;
 
@@ -4283,103 +4523,9 @@ bool runloop_environment_cb(unsigned cmd, void *data)
 #endif
          }
 
-      case RETRO_ENVIRONMENT_GET_HDR_OUTPUT_MODE:
-         /* Which HDR swapchain is presenting.  A core encoding its own gamut
-          * needs this because the scRGB path rotates Rec.2020 -> Rec.709 on
-          * the way to the display and the HDR10 path does not, so the same
-          * frame lands differently on the two.
-          *
-          * The user setting is the request, not always what is presenting:
-          * the GL drivers can only build scRGB backbuffers regardless of
-          * the requested mode (WGL has no HDR10/metadata path), and the
-          * setting survives switches to drivers with no HDR path at all --
-          * only the D3D/Vulkan display checks force it back to 0.  Derive
-          * the answer from the swapchain that actually exists.  Before the
-          * video driver is up (a core querying from retro_load_game, the
-          * same window documented at SET_PIXEL_FORMAT's HDR10 gate) the
-          * capability flags are legitimately clear, so fall back to the
-          * setting rather than reporting HDR off on machines that will
-          * have it. */
-         {
-            settings_t *settings = config_get_ptr();
-            unsigned mode        = settings->uints.video_hdr_mode;
-            if (mode > 0 && video_driver_get_ptr())
-            {
-               if (video_driver_test_all_flags(
-                        GFX_CTX_FLAGS_SCRGB_FRAMEBUFFER))
-                  mode = 2;
-               else if (!(video_driver_get_disp_flags()
-                        & VIDEO_FLAG_HDR_SUPPORT))
-                  mode = 0;
-            }
-            *(unsigned*)data     = mode;
-         }
-         break;
-
-      case RETRO_ENVIRONMENT_GET_HDR_EXPAND_GAMUT:
-         /* Which gamut treatment SDR content receives.  A core encoding
-          * Rec.2020 itself has to match it, otherwise switching that core
-          * between an SDR format and HDR10 visibly changes saturation --
-          * "Super" in particular applies no rotation at all, so a core that
-          * dutifully rotates 709 -> 2020 comes out looking desaturated
-          * beside the SDR path. */
-         {
-            settings_t *settings = config_get_ptr();
-            *(unsigned*)data = settings->uints.video_hdr_expand_gamut;
-         }
-         break;
-
-      case RETRO_ENVIRONMENT_GET_HDR_PAPER_WHITE_NITS:
-         /* Where the user puts SDR white.  A core emitting
-          * RETRO_PIXEL_FORMAT_HDR10_2101010 encodes absolute luminance
-          * itself, so it has to map ordinary content here; anything it
-          * places above this value is what produces the HDR effect. */
-         {
-            settings_t *settings = config_get_ptr();
-            *(float*)data = settings->floats.video_hdr_paper_white_nits;
-         }
-         break;
-
-      case RETRO_ENVIRONMENT_GET_HDR_MAX_NITS:
-         /* How bright the display can go.  Together with paper white this
-          * gives a core the headroom it has for highlights; without it a core
-          * has to guess, and the guess is too dark on a bright panel and clips
-          * on a dim one.  The user's setting, or with Use Display Peak the
-          * display's own where its context learned one. */
-         *(float*)data = video_driver_get_hdr_max_nits();
-         break;
-
-      case RETRO_ENVIRONMENT_GET_SCREEN_10BPC_CAPABLE:
-         /* True only when the active video driver presents a 10-bit source
-          * surface natively; when false, XRGB2101010 frames are narrowed to
-          * 8-bit by video_driver_frame, so a core with an 8-bit path should
-          * prefer it and skip the wasted 10-bit work.
-          *
-          * A live instance answers from its flags.  When none exists the
-          * question still has to be answered: cores issue this query from
-          * retro_load_game while choosing their pixel format, i.e. during
-          * CMD_EVENT_CORE_INIT, which on a cold start into content runs
-          * before any video driver exists for the session being started
-          * (and on an in-process core switch the outgoing instance has been
-          * torn down, which clears ctx->get_flags and video_st->poke).  The
-          * flag test alone then reports "no" on every machine, purely
-          * because of when the core happens to ask, and a core that trusts
-          * the answer commits to an 8-bit format before anything better is
-          * known -- refusal is final, since SET_PIXEL_FORMAT follows
-          * immediately.  Fall back to the configured driver ident, exactly
-          * as SET_PIXEL_FORMAT's HDR10_2101010 gate already does (see
-          * video_driver_supports_10bit_source for why the ident is the only
-          * stable answer in that window). */
-         {
-            gfx_ctx_flags_t flags;
-            flags.flags = 0;
-            if (video_context_driver_get_flags(&flags))
-               *(bool*)data = BIT32_GET(flags.flags,
-                     GFX_CTX_FLAGS_SCREEN_10BPC_SOURCE) ? true : false;
-            else
-               *(bool*)data = video_driver_supports_10bit_source();
-         }
-         break;
+      case RETRO_ENVIRONMENT_GET_HDR_METADATA:
+      case RETRO_ENVIRONMENT_GET_DISPLAY_METADATA:
+         return video_driver_get_display_metadata(cmd, data);
 
       case RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE:
 #ifdef HAVE_NETWORKING
@@ -4444,15 +4590,27 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          break;
 #ifdef HAVE_OPENXR
       case RETRO_ENVIRONMENT_GET_VR_HEAD_POSE:
-         if (!data || !runloop_st->core_vr_content)
+         if (!data || !runloop_vr_poses(runloop_st))
             return false;
          return video_driver_get_vr_head_pose((struct retro_vr_head_pose*)data);
 
       case RETRO_ENVIRONMENT_GET_VR_FRAME_STATE:
-         if (!data || !runloop_st->core_vr_content)
+         if (!data || !runloop_vr_poses(runloop_st))
             return false;
          return video_driver_get_vr_frame_state(
                (struct retro_vr_frame_state*)data);
+
+      case RETRO_ENVIRONMENT_GET_VR_CONTROLLER_POSES:
+         {
+            struct retro_vr_controller_poses *poses =
+               (struct retro_vr_controller_poses*)data;
+            if (     !poses
+                  || !runloop_vr_poses(runloop_st)
+                  || !video_driver_get_vr_controller_poses(poses))
+               return false;
+            input_openxr_controller_poses(poses);
+         }
+         break;
 #endif
       default:
          RARCH_LOG("[Environ] UNSUPPORTED (#%u).\n", cmd);
@@ -4750,6 +4908,8 @@ bool libretro_get_system_info(
    core_probe_t probe;
    const core_probe_t *cached = NULL;
    dylib_t lib;
+   bool no_game                 = false;
+   bool live                    = false;
 #endif
    runloop_state_t *runloop_st  = &runloop_state;
 
@@ -4779,10 +4939,10 @@ bool libretro_get_system_info(
    }
    else
    {
-      bool no_game = false;
       memset(&probe, 0, sizeof(probe));
       core_probe_capture = &probe;
-      lib = libretro_get_system_info_lib(path, &dummy_info, &no_game);
+      lib = libretro_get_system_info_lib(path, &dummy_info, &no_game,
+            &live);
       core_probe_capture = NULL;
       if (!lib)
       {
@@ -4794,7 +4954,9 @@ bool libretro_get_system_info(
       }
       if (load_no_content)
          *load_no_content = no_game;
-
+   }
+   if (lib && !live)
+   {
       /* Kept for the session, and on disk once its file is stamped */
       probe.path = (char*)path;
       if (dummy_info.library_name)
@@ -4820,7 +4982,12 @@ bool libretro_get_system_info(
          core_probe_write_file();
    }
 #else
-   if (load_no_content)
+   /* the linked core is the running one once initialised: what it
+    * declared is taken from the running state */
+   if (load_no_content
+         && (runloop_st->current_core.flags & RETRO_CORE_FLAG_INITED))
+      *load_no_content = runloop_st->system.load_no_content;
+   else if (load_no_content)
    {
       runloop_st->load_no_content_hook = load_no_content;
 
@@ -4956,7 +5123,7 @@ bool runloop_init_libretro_symbols(
          break;
       case CORE_TYPE_WEBM:
 #ifdef HAVE_WEBMPLAYER
-         CORE_SYMBOLS(SYMBOL_WEBM);
+         CORE_SYMBOLS(SYMBOL_MEDIA);
 #endif
          break;
       case CORE_TYPE_IMAGEVIEWER:
@@ -5224,6 +5391,13 @@ static bool core_unload_game(void)
    {
       RARCH_LOG("[Core] Unloading game...\n");
       runloop_st->current_core.retro_unload_game();
+#ifdef HAVE_WEBMPLAYER
+      if (runloop_st->current_core_type == CORE_TYPE_WEBM)
+      {
+         libretro_media_set_video_hw_refresh(NULL, NULL);
+         video_driver_movie_clear();
+      }
+#endif
       runloop_st->core_poll_type_override  = POLL_TYPE_OVERRIDE_DONTCARE;
       runloop_st->current_core.flags      &= ~RETRO_CORE_FLAG_GAME_LOADED;
    }
@@ -5401,6 +5575,18 @@ void runloop_event_deinit_core(void)
       *video_st                = video_state_get_ptr();
    runloop_state_t *runloop_st = &runloop_state;
    settings_t        *settings = config_get_ptr();
+
+#ifdef HAVE_COMMAND
+   if (runloop_st->frame_work & RUNLOOP_WORK_RUN_FRAMES)
+      command_run_frames_cancel("the content was closed");
+   runloop_frame_work_set(RUNLOOP_WORK_PAUSE_LOADED, false);
+   /* the next content's addresses mean something else, and its first
+    * frame is not to find buttons held for this one */
+   command_watch_clear();
+   command_checkpoint_clear();
+   command_run_frames_forget();
+   input_driver_command_release(MAX_USERS);
+#endif
 
    audio_driver_set_core_float(false);
    audio_driver_set_core_multi(false);
@@ -7922,23 +8108,16 @@ static enum runloop_state_enum runloop_check_state(
                                  || rarch_force_fullscreen;
 
 #ifdef HAVE_THREADS
-      /* Under the threaded video wrapper the worker animates and
-       * iterates the widgets (gfx_widgets_worker_step()); the layout,
-       * which owns fonts, stays here - and so do the badge loads
-       * the achievement widgets ask for from over there */
-      if (p_dispwidget->worker)
+      /* Under the threaded video wrapper the worker lays out,
+       * animates and iterates the widgets (gfx_widgets_worker_step());
+       * what that asks of this thread is done here - and so are the
+       * badge loads the achievement widgets ask for from over there */
+      if (retro_atomic_load_relaxed_int(&p_dispwidget->worker))
       {
 #ifdef HAVE_CHEEVOS
          rcheevos_badge_cache_service();
 #endif
-         gfx_widgets_iterate_layout(
-               p_disp,
-               settings,
-               output_dims,
-               video_is_fullscreen,
-               settings->paths.directory_assets,
-               settings->paths.path_font,
-               true);
+         gfx_widgets_iterate_main();
       }
       else
 #endif
@@ -7951,6 +8130,11 @@ static enum runloop_state_enum runloop_check_state(
                settings->paths.path_font,
                VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st));
    }
+#ifdef HAVE_THREADS
+   /* A teardown handed off when they went, and an init put off by it */
+   else if (gfx_widgets_poll_teardown())
+      command_event(CMD_EVENT_OSD_NOTIFICATION_TOGGLE, NULL);
+#endif
 #endif
 
 #ifdef HAVE_MENU
@@ -8457,6 +8641,9 @@ static enum runloop_state_enum runloop_check_state(
    /* Check laser pointer hotkey: here, so it works in the menu too */
    HOTKEY_CHECK(RARCH_LASER_POINTER_TOGGLE, CMD_EVENT_LASER_POINTER_TOGGLE, true, NULL);
 
+   /* Check headset view hotkey */
+   HOTKEY_CHECK(RARCH_HEADSET_VIEW_TOGGLE, CMD_EVENT_HEADSET_VIEW_TOGGLE, true, NULL);
+
    /* Check netplay host hotkey */
    HOTKEY_CHECK(RARCH_NETPLAY_HOST_TOGGLE, CMD_EVENT_NETPLAY_HOST_TOGGLE, true, NULL);
 
@@ -8501,6 +8688,9 @@ static enum runloop_state_enum runloop_check_state(
    /* Check screenshot hotkey */
    HOTKEY_CHECK(RARCH_SCREENSHOT, CMD_EVENT_TAKE_SCREENSHOT, true, NULL);
 #endif
+
+   /* Check headset recenter hotkey: here, so it works in the menu too */
+   HOTKEY_CHECK(RARCH_HEADSET_RECENTER, CMD_EVENT_HEADSET_RECENTER, true, NULL);
 
 #ifdef HAVE_CHEEVOS
    /* Make sure not to evaluate this before calling menu_driver_iterate
@@ -8677,7 +8867,9 @@ static enum runloop_state_enum runloop_check_state(
 #endif
       {
          frameadvance_pressed = BIT256_GET(current_bits, RARCH_FRAMEADVANCE);
-         frameadvance_trigger = frameadvance_pressed && !old_frameadvance;
+         /* RUN_FRAMES advances one frame each iteration until through */
+         frameadvance_trigger = (frameadvance_pressed && !old_frameadvance)
+            || (runloop_st->frame_work & RUNLOOP_WORK_RUN_FRAMES);
 
          /* FRAMEADVANCE will set us into special pause mode. */
          if (frameadvance_trigger)
@@ -9087,9 +9279,6 @@ static enum runloop_state_enum runloop_check_state(
    /* Check VRR runloop hotkey */
    HOTKEY_CHECK(RARCH_VRR_RUNLOOP_TOGGLE, CMD_EVENT_VRR_RUNLOOP_TOGGLE, true, NULL);
 
-   /* Check headset recenter hotkey */
-   HOTKEY_CHECK(RARCH_HEADSET_RECENTER, CMD_EVENT_HEADSET_RECENTER, true, NULL);
-
    /* Check bsv movie hotkeys */
    HOTKEY_CHECK(RARCH_PLAY_REPLAY_KEY, CMD_EVENT_PLAY_REPLAY, true, NULL);
    HOTKEY_CHECK(RARCH_RECORD_REPLAY_KEY, CMD_EVENT_RECORD_REPLAY, true, NULL);
@@ -9335,8 +9524,10 @@ int runloop_iterate(void)
 #endif
    float slowmotion_ratio                 = settings->floats.slowmotion_ratio;
    bool audio_sync                        = settings->bools.audio_sync;
+   bool frame_advanced;
    bool savestate_automatic_enable        = settings->uints.savestate_automatic_interval > 0;
 
+   record_nvenc_poll();
    runloop_msg_queue_drain_deferred();
 
    /* A quit waiting for its state to be written: the core is not run
@@ -9489,6 +9680,13 @@ int runloop_iterate(void)
 #ifdef HAVE_THREADS
    if (runloop_st->flags & RUNLOOP_FLAG_AUTOSAVE)
       autosave_check();
+#endif
+
+#ifdef HAVE_COMMAND
+   /* before the frame is decided: a STEPS checkpoint with the core off
+    * the stack, and a list it ends runs no frame past it */
+   if (runloop_st->frame_work & RUNLOOP_WORK_RUN_FRAMES)
+      command_run_frames_between();
 #endif
 
    switch ((enum runloop_state_enum)runloop_check_state(
@@ -9699,19 +9897,36 @@ int runloop_iterate(void)
 #endif
 
       if (want_runahead)
-         runahead_run(
+         frame_advanced = runahead_run(
                runloop_st,
                run_ahead_num_frames,
                run_ahead_hide_warnings,
                run_ahead_secondary_instance);
       else if (runloop_st->preempt_data)
-         preempt_run(runloop_st->preempt_data, runloop_st);
+         frame_advanced = preempt_run(runloop_st->preempt_data, runloop_st);
       else
 #endif
-         core_run();
+         frame_advanced = core_run();
    }
 
    runloop_load_deferred_auto_state();
+
+#ifdef HAVE_COMMAND
+   if (frame_advanced && (runloop_st->frame_work & RUNLOOP_WORK_RUN_FRAMES))
+      command_run_frames_tick();
+   else if (frame_advanced
+         && (runloop_st->frame_work & RUNLOOP_WORK_FREE_FRAME))
+      command_run_frames_free_frame();
+   /* LOAD_CONTENT ... paused, from no running core: pausing waits for
+    * the first frame, which is what marks a core running */
+   if (frame_advanced && (runloop_st->frame_work & RUNLOOP_WORK_PAUSE_LOADED))
+   {
+      runloop_frame_work_set(RUNLOOP_WORK_PAUSE_LOADED, false);
+      command_event(CMD_EVENT_PAUSE, NULL);
+   }
+#else
+   (void)frame_advanced;
+#endif
 
    /* Increment runtime tick counter after each call to
     * core_run() or run_ahead() */
@@ -10406,6 +10621,10 @@ bool core_load_game(retro_ctx_load_content_info_t *load_info)
    runloop_state_t *runloop_st    = &runloop_state;
 
    video_driver_cached_frame_invalidate();
+#ifdef HAVE_WEBMPLAYER
+   if (runloop_st->current_core_type == CORE_TYPE_WEBM)
+      libretro_media_set_video_hw_refresh(video_driver_movie_refresh, NULL);
+#endif
 
 #ifdef HAVE_RUNAHEAD
    runahead_set_load_content_info(runloop_st, load_info);
@@ -10597,7 +10816,7 @@ static void runloop_load_deferred_auto_state(void)
    runloop_st->auto_state_load_core_ran  = false;
 }
 
-void core_run(void)
+bool core_run(void)
 {
    runloop_state_t *runloop_st = &runloop_state;
    struct retro_core_t *
@@ -10609,6 +10828,7 @@ void core_run(void)
       : (enum poll_type)(current_core->poll_type);
    bool early_polling          = (new_poll_type == POLL_TYPE_EARLY);
    bool late_polling           = (new_poll_type == POLL_TYPE_LATE);
+   bool ran                    = false;
 #ifdef HAVE_NETWORKING
    /* Declared with the other locals and assigned below, so the
     * closing guard can return before netplay's pre-frame call
@@ -10633,7 +10853,7 @@ void core_run(void)
    {
       input_driver_poll_between_frames(input_driver_poll);
       video_driver_cached_frame();
-      return;
+      return false;
    }
 
 #ifdef HAVE_NETWORKING
@@ -10646,7 +10866,7 @@ void core_run(void)
        * netplay peer pausing doesn't just hang. */
       input_driver_poll_between_frames(input_driver_poll);
       video_driver_cached_frame();
-      return;
+      return false;
    }
 #endif
 
@@ -10670,6 +10890,7 @@ void core_run(void)
        * all, reach the frame's own audio rather than the next frame's. */
       audio_driver_publish_runloop();
       current_core->retro_run();
+      ran = true;
       if (runloop_st->auto_state_load_pending)
          runloop_st->auto_state_load_core_ran = true;
       audio_driver_frame_end();
@@ -10709,6 +10930,7 @@ void core_run(void)
 #ifdef HAVE_NETWORKING
    netplay_driver_ctl(RARCH_NETPLAY_CTL_POST_FRAME, NULL);
 #endif
+   return ran;
 }
 
 bool core_has_set_input_descriptor(void)

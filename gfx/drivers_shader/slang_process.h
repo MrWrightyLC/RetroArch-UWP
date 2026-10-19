@@ -85,10 +85,25 @@ enum slang_semantic
    SLANG_SEMANTIC_ORIGINAL_RECT         = 23,
    SLANG_SEMANTIC_ORIGINAL_CLAMP        = 24,
    SLANG_SEMANTIC_ORIGINAL_TEXELS       = 25,
-   SLANG_NUM_BASE_SEMANTICS        = 26,
+   /* float, PaperWhiteNits alias of BrightnessNits */
+   SLANG_SEMANTIC_PAPER_WHITE_ALIAS    = 26,
+   /* float, effective HDR target luminance in nits */
+   SLANG_SEMANTIC_PEAK_NITS            = 27,
+   SLANG_SEMANTIC_MAX_NITS_ALIAS       = 28,
+   /* float, active HDR output as 0 or 1 */
+   SLANG_SEMANTIC_ENABLE_HDR          = 29,
+   /* float, minimum luminance in nits; zero when unknown */
+   SLANG_SEMANTIC_MIN_NITS            = 30,
+   /* uint, HDR curve: 0=rational */
+   SLANG_SEMANTIC_TONEMAP_OPERATOR    = 31,
+   /* uint, Original is native PQ Rec.2020 */
+   SLANG_SEMANTIC_SOURCE_HDR          = 32,
+   /* uint, native HDR ownership without creative curves or white scaling */
+   SLANG_SEMANTIC_PASSTHROUGH         = 33,
+   SLANG_NUM_BASE_SEMANTICS        = 34,
 
    /* float, user defined parameter, arrayed */
-   SLANG_SEMANTIC_FLOAT_PARAMETER  = 27,
+   SLANG_SEMANTIC_FLOAT_PARAMETER  = 34,
 
    SLANG_NUM_SEMANTICS,
    SLANG_INVALID_SEMANTIC          = -1
@@ -124,16 +139,21 @@ typedef struct
 /* A driver that sets uniforms[SLANG_SEMANTIC_ORIGINAL_RECT] (and the
  * clamp's and texels') may bind the frame inside a larger texture:
  * slang_process() rewrites each pass to read it through them where it
- * can, as slang_rect.h describes. */
+ * can, as slang_rect.h describes. A first pass whose filter the preset
+ * leaves unspecified is read as frame_smooth says. */
 typedef struct
 {
    texture_map_t textures[SLANG_NUM_TEXTURE_SEMANTICS];
    void*         uniforms[SLANG_NUM_BASE_SEMANTICS];
+   bool          frame_smooth;
 } semantics_map_t;
 
 typedef struct
 {
    void*    data;
+   /* Or a shader parameter, whose value is read through
+    * video_shader_param_get() at the upload */
+   const struct video_shader_parameter *param;
    unsigned size;
    unsigned offset;
    char     id[64];
@@ -171,6 +191,10 @@ typedef struct
    /* The pass reads the frame wherever it lies in its texture, through
     * the rect semantics, or does not read it: see semantics_map_t. */
    bool                frame_in_place;
+   /* It was rewritten for an unspecified filter, as frame_smooth was
+    * then: built again when that changes. */
+   bool                frame_unspec;
+   bool                frame_smooth;
 } pass_semantics_t;
 
 

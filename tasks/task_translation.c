@@ -213,6 +213,9 @@ bool is_narrator_running(bool accessibility_enable)
 }
 #endif
 
+/* Between looks at whether the speech or the narration has ended. */
+#define AUTO_TRANSLATE_PARK_USEC 50000
+
 static void task_auto_translate_handler(retro_task_t *task)
 {
    int               *mode_ptr = (int*)task->user_data;
@@ -244,6 +247,9 @@ static void task_auto_translate_handler(retro_task_t *task)
          break;
    }
 
+   /* Nothing signals the end of the speech or the narration, so look
+    * again shortly. */
+   task_queue_park(task, AUTO_TRANSLATE_PARK_USEC);
    return;
 
 task_finished:
@@ -274,22 +280,22 @@ static void ai_service_call_auto_translate_task(access_state_t *access_st,
    }
    else /* Speech or Narrator Mode */
    {
-      int* mode          = NULL;
+      int* mode          = (int*)malloc(sizeof(int));
       retro_task_t  *t   = task_init();
-      if (!t)
-         return;
-
-      mode               = (int*)malloc(sizeof(int));
-
-      t->user_data       = NULL;
-      t->handler         = task_auto_translate_handler;
-      t->flags          |= RETRO_TASK_FLG_MUTE;
-
-      if (mode)
+      if (!t || !mode)
       {
-         *mode           = ai_service_mode;
-         t->user_data    = mode;
+         free(t);
+         free(mode);
+         return;
       }
+
+      *mode              = ai_service_mode;
+      t->user_data       = mode;
+      t->handler         = task_auto_translate_handler;
+      /* It waits on the mixer and the narrator, then sets the next
+       * request off: the frontend's state, read and written where the
+       * frontend runs. */
+      t->flags          |= RETRO_TASK_FLG_MUTE | RETRO_TASK_FLG_MAIN_THREAD;
 
       task_queue_push(t);
    }
@@ -368,7 +374,8 @@ static void handle_translation_response(
       unsigned dims   = 0;
       bool     is_hw_fb;
       video_driver_cached_frame_info(&dims, NULL, NULL);
-      is_hw_fb = video_driver_cached_frame_is_hw_render();
+      is_hw_fb = video_driver_cached_frame_is_hw_render()
+         || video_driver_pix_fmt == RETRO_PIXEL_FORMAT_SCRGB_RGBA16F;
 
       /* try two different modes for text display *
        * In the first mode, we use display widget overlays, but they require
@@ -992,8 +999,8 @@ bool run_translation_service_notify(settings_t *settings, bool paused,
    char *sys_lbl                     = NULL;
    core_info_t *core_info            = NULL;
    video_driver_state_t *video_st    = video_state_get_ptr();
-   access_state_t *access_st         = access_state_get_ptr();
 #ifdef HAVE_GFX_WIDGETS
+   access_state_t *access_st         = access_state_get_ptr();
    /* For the case when ai service pause is disabled. */
    if (     (gfx_widgets_ai_service_overlay_get_state() != 0)
          && (access_st->ai_service_auto == 1))
@@ -1048,7 +1055,8 @@ bool run_translation_service_notify(settings_t *settings, bool paused,
                &has_cpu_pixels))
          goto finish;
 
-      if (!has_cpu_pixels)
+      if (!has_cpu_pixels
+            || video_st->pix_fmt == RETRO_PIXEL_FORMAT_SCRGB_RGBA16F)
       {
          /* HW render core, or no cached frame yet.  Fall back to
           * read_viewport for OCR -- not ideal (the viewport may
@@ -1384,8 +1392,8 @@ static bool http_translate(
    int bmp64_len                     = 0;
    bool success                      = false;
    settings_t *settings              = config_get_ptr();
+#ifdef HAVE_GFX_WIDGETS
    video_driver_state_t *video_st    = video_state_get_ptr();
-#ifdef HAVE_ACCESSIBILITY
 #endif
 #ifdef DEBUG
    access_state_t *access_st         = access_state_get_ptr();

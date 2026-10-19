@@ -29,6 +29,7 @@
 #include <retro_common_api.h>
 
 #include <boolean.h>
+#include <formats/video_hw_frame.h>
 
 RETRO_BEGIN_DECLS
 
@@ -552,6 +553,13 @@ void *image_transfer_anim_stream_new_avail(void *buf, size_t len,
       size_t avail, enum image_type_enum type, int *need_more,
       size_t *need_lo, size_t *need_hi);
 
+/* Hardware-capable open: software preference is unchanged. Hardware-only
+ * candidates require an available backend and a GPU sink; no CPU canvas
+ * is supplied. The caller must retain the borrowed buffer as above. */
+void *image_transfer_anim_stream_new_hw_avail(void *buf, size_t len,
+      size_t avail, enum image_type_enum type, int *need_more,
+      size_t *need_lo, size_t *need_hi);
+
 void image_transfer_anim_stream_free(void *stream,
       enum image_type_enum type);
 
@@ -610,6 +618,25 @@ bool image_transfer_anim_stream_is_fp16(const void *stream,
 
 bool image_transfer_anim_stream_set_output(void *stream,
       enum image_type_enum type, uint32_t *out);
+
+/* Caller output with rows @stride pixels apart (0: width). The stride
+ * counts pixels for both 32-bit and FP16 output. False leaves the
+ * output unchanged for an unsupported stream or invalid stride. */
+bool image_transfer_anim_stream_set_output_stride(void *stream,
+      enum image_type_enum type, uint32_t *out, unsigned stride);
+
+/* Frames decoded on the GPU (formats/video_hw_frame.h) rather than
+ * into pixels, where the stream's decoder has a hardware backend that
+ * takes it (MP4 H.264, rmp4_video_stream_set_hw); true when they will
+ * be. A stream under way starts over. The frame of each shown frame is
+ * then taken with _hw_frame after _next - whose pointer only says a
+ * frame came - and read or abandoned by the caller. */
+bool image_transfer_anim_stream_set_hw(void *stream,
+      enum image_type_enum type, bool enable);
+bool image_transfer_anim_stream_waiting(const void *stream,
+      enum image_type_enum type);
+bool image_transfer_anim_stream_hw_frame(void *stream,
+      enum image_type_enum type, struct video_hw_frame *out);
 
 /* Have the stream convert each decoded frame to pixels in @bands row
  * bands on @pool (an rthreads tpool_t with at least bands - 1 threads;

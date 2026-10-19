@@ -24,6 +24,10 @@
  *    with the drivers rebuilt and the menu up;
  *  - not a core: a library that opens but lacks retro_init does the
  *    same, and the failure is said;
+ *  - user dirs held: the frontend boots with the user directories
+ *    held - nothing is made or read under the playlist directory,
+ *    the playlists tab lists nothing - and the release makes the
+ *    builtin folder, loads favorites and history, and lists the tab;
  *  - quit waits for a save: a quit from the frame loop while a state
  *    is being written returns to the loop at once, which presents
  *    frames - the core not run - until the state is written, and only
@@ -36,6 +40,7 @@
  */
 
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,6 +75,7 @@
 #include "../../../playlist.h"
 #include "../../../paths.h"
 #include "../../../content.h"
+#include "../../../defaults.h"
 #include "../../../input/input_driver.h"
 #include "../../../runahead.h"
 #include "../../../state_manager.h"
@@ -244,6 +250,66 @@ static void open_menu(void)
 /* Lane: staged                                                        */
 /* ------------------------------------------------------------------ */
 
+#ifdef HAVE_MENU
+static unsigned playlists_tab_size(const char *dir_playlist)
+{
+   menu_displaylist_info_t info;
+   file_list_t list = {0};
+   unsigned size;
+   menu_displaylist_info_init(&info);
+   info.list         = &list;
+   info.path         = strdup(dir_playlist);
+   info.label        = strdup(MENU_ENUM_LABEL_PLAYLISTS_TAB_STR);
+   info.exts         = strdup("lpl");
+   info.type_default = FILE_TYPE_PLAIN;
+   info.enum_idx     = MENU_ENUM_LABEL_PLAYLISTS_TAB;
+   menu_displaylist_ctl(DISPLAYLIST_DATABASE_PLAYLISTS_HORIZONTAL,
+         &info, config_get_ptr());
+   size = (unsigned)list.size;
+   menu_displaylist_info_free(&info);
+   file_list_deinitialize(&list);
+   return size;
+}
+#endif
+
+/* Runs first: main() boots the frontend held. */
+static void lane_user_dirs_held(const char *dir)
+{
+   char dir_playlist[600];
+   char builtin[640];
+   snprintf(dir_playlist, sizeof(dir_playlist), "%s/playlists", dir);
+   snprintf(builtin, sizeof(builtin), "%s/builtin", dir_playlist);
+
+   CHECK(retroarch_get_flags() & RARCH_FLAGS_USER_DIRS_HELD,
+         "held: the boot dropped the hold");
+   CHECK(!path_is_directory(builtin),
+         "held: the builtin playlist folder was made");
+#ifdef HAVE_MENU
+   CHECK(!g_defaults.content_favorites, "held: favorites were loaded");
+   CHECK(!g_defaults.content_history, "held: history was loaded");
+   retroarch_favorites_init();
+   command_event(CMD_EVENT_HISTORY_INIT, NULL);
+   CHECK(!g_defaults.content_favorites && !g_defaults.content_history,
+         "held: a playlist init read the playlist directory");
+   CHECK(playlists_tab_size(dir_playlist) == 0,
+         "held: the playlists tab listed the playlist directory");
+#endif
+
+   retroarch_user_dirs_release();
+
+   CHECK(!(retroarch_get_flags() & RARCH_FLAGS_USER_DIRS_HELD),
+         "release: the hold is still set");
+   CHECK(path_is_directory(builtin),
+         "release: the builtin playlist folder was not made");
+#ifdef HAVE_MENU
+   CHECK(g_defaults.content_favorites, "release: favorites not loaded");
+   CHECK(g_defaults.content_history, "release: history not loaded");
+   CHECK(playlists_tab_size(dir_playlist) == 1,
+         "release: the playlists tab does not list the playlist");
+#endif
+   fprintf(stderr, "user dirs held: ok\n");
+}
+
 static void lane_staged(void)
 {
    struct load_frame log[LOAD_FRAMES];
@@ -363,58 +429,116 @@ static void harness_sibling(char *s, size_t len, const char *name)
 
 /* What LOAD_CORE asks of a core before loading it is kept, keyed by
  * its file's size and modification time: a core already asked is not
- * opened again at push - the core running here would see its
- * retro_set_environment called if it were - a changed file is, and the
- * record outlives the session. */
+ * opened again, a changed file is, and the record outlives the
+ * session. The running core is never asked: what it declared comes
+ * from the running state, and nothing is kept for it. */
+static unsigned sibling_env_sets(dylib_t lib)
+{
+   unsigned (*fn)(void) = lib
+      ? (unsigned (*)(void))dylib_proc(lib, "harness_core_env_sets") : NULL;
+   return fn ? fn() : 0;
+}
+
+static bool cache_names(const char *cache_file, const char *needle)
+{
+   void   *buf = NULL;
+   int64_t len = 0;
+   bool    hit;
+   if (!filestream_read_file(cache_file, &buf, &len) || !buf)
+      return false;
+   hit = strstr((const char*)buf, needle) != NULL;
+   free(buf);
+   return hit;
+}
+
 static void lane_probe_cached(void)
 {
+   struct retro_system_info info;
    char cache_file[600];
+   char sibling[600];
+   char stamp[600];
    int64_t mtime = 0;
+   bool no_game  = false;
    unsigned before;
    unsigned had = failures;
+   dylib_t lib;
 
    snprintf(cache_file, sizeof(cache_file), "%s/core_probe.cache", harness_dir);
+   harness_sibling(sibling, sizeof(sibling), "harness_core_nohw.so");
    open_menu();
    CHECK(task_push_load_contentless_core_from_menu(core_path),
          "the load was not started");
    pump(LOAD_FRAMES);
    CHECK(core_is_up(), "the core did not come up");
 
+   /* The running core is not asked again, and not kept */
    before = core_export("harness_core_env_sets");
    CHECK(task_push_load_contentless_core_from_menu(core_path),
          "the reload was not started");
    CHECK(core_export("harness_core_env_sets") == before,
-         "the push opened a core it had asked before (%u calls on the "
-         "running core, not %u)", core_export("harness_core_env_sets"),
-         before);
+         "the push asked the running core (%u calls, not %u)",
+         core_export("harness_core_env_sets"), before);
    pump(LOAD_FRAMES);
    CHECK(core_is_up(), "the reload did not go through");
-   CHECK(path_is_valid(cache_file), "no %s was written", cache_file);
 
-   /* A changed file is asked again */
-   CHECK(path_get_mtime(core_path, &mtime), "no mtime for the core");
-   CHECK(path_set_mtime(core_path, mtime + 10), "could not touch the core");
-   before = core_export("harness_core_env_sets");
-   CHECK(task_push_load_contentless_core_from_menu(core_path),
-         "the load of the changed core was not started");
-   CHECK(core_export("harness_core_env_sets") == before + 2,
-         "the changed core was not asked again (%u calls, expected %u)",
-         core_export("harness_core_env_sets"), before + 2);
-   pump(LOAD_FRAMES);
-   CHECK(core_is_up(), "the load of the changed core did not go through");
-
-   /* The record of the changed file comes back from disk */
    runloop_core_probe_cache_free();
+   remove(cache_file);
    before = core_export("harness_core_env_sets");
-   CHECK(task_push_load_contentless_core_from_menu(core_path),
-         "the load after the records were dropped was not started");
+   CHECK(libretro_get_system_info(core_path, &info, &no_game),
+         "the running core was not probed");
    CHECK(core_export("harness_core_env_sets") == before,
-         "the record was not read back from %s", cache_file);
-   pump(LOAD_FRAMES);
-   CHECK(core_is_up(), "the load after the records were dropped did not "
-         "go through");
+         "the probe asked the running core (%u calls, not %u)",
+         core_export("harness_core_env_sets"), before);
+   CHECK(!cache_names(cache_file, core_path),
+         "a record was kept for the running core");
 
-   path_set_mtime(core_path, mtime);
+   /* A core that is not running, held open here so its count lasts
+    * across the probe's own open and close */
+   CHECK((lib = dylib_load(sibling)) != NULL, "could not open %s", sibling);
+   before = sibling_env_sets(lib);
+   CHECK(libretro_get_system_info(sibling, &info, &no_game),
+         "%s was not probed", sibling);
+   CHECK(sibling_env_sets(lib) > before,
+         "the probe did not ask %s", sibling);
+   CHECK(cache_names(cache_file, sibling), "no record of %s in %s",
+         sibling, cache_file);
+
+   before = sibling_env_sets(lib);
+   CHECK(libretro_get_system_info(sibling, &info, &no_game),
+         "%s was not probed again", sibling);
+   CHECK(sibling_env_sets(lib) == before,
+         "a core already asked was asked again (%u calls, not %u)",
+         sibling_env_sets(lib), before);
+
+   /* A changed file is asked again, and its record rewritten */
+   CHECK(path_get_mtime(sibling, &mtime), "no mtime for %s", sibling);
+   CHECK(path_set_mtime(sibling, mtime + 10), "could not touch %s", sibling);
+   snprintf(stamp, sizeof(stamp), "\t%" PRId64 "\t", mtime + 10);
+   before = sibling_env_sets(lib);
+   CHECK(libretro_get_system_info(sibling, &info, &no_game),
+         "the changed %s was not probed", sibling);
+   CHECK(sibling_env_sets(lib) > before,
+         "the changed core was not asked again");
+   CHECK(cache_names(cache_file, stamp),
+         "the record in %s does not hold the new mtime", cache_file);
+
+   /* The record comes back from disk */
+   runloop_core_probe_cache_free();
+   before = sibling_env_sets(lib);
+   CHECK(libretro_get_system_info(sibling, &info, &no_game),
+         "%s was not probed after the records were dropped", sibling);
+   CHECK(sibling_env_sets(lib) == before,
+         "the record was not read back from %s", cache_file);
+
+   path_set_mtime(sibling, mtime);
+   dylib_close(lib);
+
+   /* The probes named the sibling: the running core's names again */
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the load after the probes was not started");
+   pump(LOAD_FRAMES);
+   CHECK(core_is_up(), "the load after the probes did not go through");
+
    if (failures == had)
       fprintf(stderr, "[pass] probe-cached lane\n");
 }
@@ -2020,6 +2144,24 @@ static void probe_main_handler(retro_task_t *task)
  * the queue again from within it, running the main-thread tasks a
  * second time in the same check. */
 #if defined(HAVE_RUNAHEAD) && defined(HAVE_DYNAMIC) && defined(HAVE_THREADS)
+/* Until the copy task has an answer: it reads and writes the whole
+ * core file, which a loaded runner takes seconds over */
+static enum runahead_copy_status secondary_wait(runloop_state_t *runloop_st,
+      settings_t *settings)
+{
+   retro_time_t deadline = cpu_features_get_time_usec() + 10000000;
+   for (;;)
+   {
+      enum runahead_copy_status st =
+         secondary_core_ensure_exists(runloop_st, settings);
+      if (     st != RUNAHEAD_COPY_PENDING
+            || cpu_features_get_time_usec() > deadline)
+         return st;
+      task_queue_check();
+      retro_sleep(1);
+   }
+}
+
 /* Run-ahead's second instance on the threaded queue: the task copies
  * the core and opens the copy on the worker, and the main thread
  * takes the open handle.  The instance is the copy's own - its
@@ -2036,7 +2178,7 @@ static void lane_secondary_threaded(void)
    const char *slash            = strrchr(core_path, '/');
    char nohw[600];
    unsigned primary_inits;
-   unsigned had = failures, n;
+   unsigned had = failures;
 
    snprintf(nohw, sizeof(nohw), "%.*s/harness_core_nohw.so",
          slash ? (int)(slash - core_path) : 1, slash ? core_path : ".");
@@ -2050,12 +2192,7 @@ static void lane_secondary_threaded(void)
    CHECK(core_is_up(), "the core did not come up");
    primary_inits = core_inits();
 
-   for (n = 0; n < LOAD_FRAMES * 4 && st == RUNAHEAD_COPY_PENDING; n++)
-   {
-      st = secondary_core_ensure_exists(runloop_st, settings);
-      task_queue_check();
-      retro_sleep(1);
-   }
+   st = secondary_wait(runloop_st, settings);
    CHECK(st == RUNAHEAD_COPY_READY, "the second instance was not created (%d)",
          (int)st);
    CHECK(runloop_st->secondary_lib_handle != NULL,
@@ -2092,7 +2229,7 @@ static void lane_secondary_threaded(void)
    pump(2);
 
    if (failures == had)
-      fprintf(stderr, "[pass] secondary-threaded lane (%u polls)\n", n);
+      fprintf(stderr, "[pass] secondary-threaded lane\n");
 }
 #endif
 
@@ -2112,7 +2249,7 @@ static void lane_secondary_keeps_callbacks(void)
    struct retro_hw_render_callback *hwr;
    hw_fn_t    primary_hw    = NULL;
    types_fn_t primary_types = NULL;
-   unsigned had = failures, n;
+   unsigned had = failures;
 
    configuration_set_bool(settings, settings->bools.threaded_data_runloop_enable, true);
    task_queue_set_threaded();
@@ -2130,12 +2267,7 @@ static void lane_secondary_keeps_callbacks(void)
    }
    CHECK(primary_hw && primary_types, "the harness core exports are missing");
 
-   for (n = 0; n < LOAD_FRAMES * 4 && st == RUNAHEAD_COPY_PENDING; n++)
-   {
-      st = secondary_core_ensure_exists(runloop_st, settings);
-      task_queue_check();
-      retro_sleep(1);
-   }
+   st = secondary_wait(runloop_st, settings);
    CHECK(st == RUNAHEAD_COPY_READY, "the second instance was not created (%d)",
          (int)st);
 
@@ -2531,7 +2663,20 @@ int main(int argc, char *argv[])
        * the close-waits-for-save lane needs a save that can be
        * written, on every load */
       fprintf(cfg, "savestate_directory = \"%s\"\n", dir);
+      fprintf(cfg, "playlist_directory = \"%s/playlists\"\n", dir);
       fclose(cfg);
+   }
+   {
+      char playlist[600];
+      FILE *lpl;
+      snprintf(playlist, sizeof(playlist), "%s/playlists", dir);
+      path_mkdir(playlist);
+      snprintf(playlist, sizeof(playlist), "%s/playlists/harness.lpl", dir);
+      if ((lpl = fopen(playlist, "wb")))
+      {
+         fprintf(lpl, "{\"version\": \"1.5\", \"items\": []}\n");
+         fclose(lpl);
+      }
    }
 
    if (getenv("HARNESS_VERBOSE"))
@@ -2568,6 +2713,7 @@ int main(int argc, char *argv[])
    if (getenv("HARNESS_VERBOSE"))
       rarch_argv[rarch_argc++] = (char*)"-v";
 
+   retroarch_user_dirs_hold();
    if (!retroarch_main_init(rarch_argc, rarch_argv))
    {
       fprintf(stderr, "FAIL: retroarch_main_init failed\n");
@@ -2581,6 +2727,7 @@ int main(int argc, char *argv[])
    CHECK(runloop_state_get_ptr()->current_core_type != CORE_TYPE_DUMMY,
          "harness core did not start (dummy core running)");
 
+   lane_user_dirs_held(dir);
    lane_staged();
    lane_core_opened_once();
 #if defined(HAVE_DYNAMIC)
@@ -2653,6 +2800,26 @@ int main(int argc, char *argv[])
       snprintf(leftover, sizeof(leftover),
             "%s/content_load_harness/content_load_harness.state.png", dir);
       remove(leftover);
+      {
+         static const char *const lpls[] = {
+            "content_favorites.lpl", "content_history.lpl",
+            "content_music_history.lpl", "content_image_history.lpl",
+            "content_video_history.lpl"
+         };
+         unsigned i;
+         for (i = 0; i < sizeof(lpls) / sizeof(lpls[0]); i++)
+         {
+            snprintf(leftover, sizeof(leftover), "%s/playlists/builtin/%s",
+                  dir, lpls[i]);
+            remove(leftover);
+         }
+         snprintf(leftover, sizeof(leftover), "%s/playlists/builtin", dir);
+         rmdir(leftover);
+         snprintf(leftover, sizeof(leftover), "%s/playlists/harness.lpl", dir);
+         remove(leftover);
+         snprintf(leftover, sizeof(leftover), "%s/playlists", dir);
+         rmdir(leftover);
+      }
       /* the per-core save folder a content load makes */
       snprintf(leftover, sizeof(leftover), "%s/content_load_harness", dir);
       rmdir(leftover);

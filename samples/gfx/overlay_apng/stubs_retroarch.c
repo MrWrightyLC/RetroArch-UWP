@@ -56,8 +56,10 @@ enum texture_filter_type gfx_display_texture_filter(void)
 }
 
 /* No driver lends upload memory here: every slot stays the surface's. */
-void *video_driver_texture_lend(uintptr_t id, unsigned slot, size_t pitch)
+void *video_driver_texture_lend(uintptr_t id, unsigned slot, size_t pitch, size_t *out_pitch)
 {
+   if (out_pitch)
+      *out_pitch = pitch;
    (void)id; (void)slot; (void)pitch;
    return NULL;
 }
@@ -75,3 +77,14 @@ bool video_driver_texture_lend_ready(uintptr_t id, unsigned slot)
    (void)id; (void)slot;
    return true;
 }
+
+bool video_driver_texture_lend_needs_refresh(void) { return false; }
+bool video_thread_lend_get(int idx, void **mem, size_t *pitch)
+{
+   (void)idx;
+   (void)mem;
+   (void)pitch;
+   return false;
+}
+
+bool video_thread_lend_ready(int idx) { (void)idx; return true; }

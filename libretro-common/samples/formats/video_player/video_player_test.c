@@ -25,7 +25,9 @@
  * the decode falls behind and off again, the canvas and slot paths and
  * their byte order, half floats refused, a queued present holding its
  * slot until released, and - with HAVE_THREADS - the worker's two jobs
- * keeping the order while players are freed with decodes in flight. */
+ * keeping the order while players are freed with decodes in flight.
+ * Frames decoded on the GPU go to a sink that takes them, in order, and
+ * every one the sink does not take is given back to the decoder. */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,8 +65,12 @@ typedef struct
 {
    uint32_t canvas[N];
    uint32_t *out;
+   unsigned out_stride;
    int frames;
    int pos;
+   int wait_left;
+   int wait_at;
+   bool waiting;
    int duration_ms;
    int catchup;        /* last value set */
    int catchup_sets;
@@ -72,6 +78,14 @@ typedef struct
    bool direct;        /* decodes into the output when given one */
    bool honours_order;
    bool fp16;
+   /* GPU frames: whether the stream can, whether asked, how many were
+    * handed out and given back, and from which frame on one fails */
+   bool hw_can;
+   bool hw_on;
+   int hw_made;
+   int hw_abandoned;
+   int hw_fail_from;   /* 0 never */
+   bool hw_pending;
 } fake_t;
 
 static uint32_t frame_px(int k, bool argb)
@@ -101,15 +115,71 @@ const uint32_t *image_transfer_anim_stream_next(void *stream,
    uint32_t *dst;
    unsigned i;
    (void)type;
+   f->waiting = f->wait_left > 0 && f->pos == f->wait_at;
+   if (f->waiting)
+   {
+      f->wait_left--;
+      return NULL;
+   }
    if (f->pos >= f->frames)
       return NULL;
+   if (f->hw_on)
+   {
+      f->hw_pending = true;
+      f->pos++;
+      *duration_ms = f->duration_ms;
+      return f->canvas;
+   }
    dst = (f->direct && f->out) ? f->out : f->canvas;
    for (i = 0; i < N; i++)
-      dst[i] = frame_px(f->pos,
-            f->honours_order ? f->argb : 0);
+      dst[(f->direct && f->out) ? (i / W) * f->out_stride + i % W : i]
+         = frame_px(f->pos, f->honours_order ? f->argb : 0);
    f->pos++;
    *duration_ms = f->duration_ms;
    return dst;
+}
+
+static void fake_abandon(void *owner, uint64_t done, uint64_t value)
+{
+   fake_t *f = (fake_t*)owner;
+   (void)done;
+   (void)value;
+   f->hw_abandoned++;
+}
+
+bool image_transfer_anim_stream_waiting(const void *stream,
+      enum image_type_enum type)
+{
+   (void)type;
+   return ((const fake_t*)stream)->waiting;
+}
+
+bool image_transfer_anim_stream_set_hw(void *stream,
+      enum image_type_enum type, bool enable)
+{
+   fake_t *f = (fake_t*)stream;
+   (void)type;
+   if (enable && f->hw_can)
+      f->hw_on = true;
+   return f->hw_on;
+}
+
+bool image_transfer_anim_stream_hw_frame(void *stream,
+      enum image_type_enum type, video_hw_frame_t *out)
+{
+   fake_t *f = (fake_t*)stream;
+   (void)type;
+   if (!f->hw_pending || (f->hw_fail_from && f->pos >= f->hw_fail_from))
+      return false;
+   f->hw_pending = false;
+   memset(out, 0, sizeof(*out));
+   out->image      = (uint64_t)f->pos;   /* frame k is image k + 1 */
+   out->done_value = (uint64_t)++f->hw_made;
+   out->abandon    = fake_abandon;
+   out->owner      = f;
+   out->width      = W;
+   out->height     = H;
+   return true;
 }
 
 void image_transfer_anim_stream_rewind(void *stream,
@@ -128,12 +198,13 @@ bool image_transfer_anim_stream_set_argb(void *stream,
    return f->honours_order;
 }
 
-bool image_transfer_anim_stream_set_output(void *stream,
-      enum image_type_enum type, uint32_t *out)
+bool image_transfer_anim_stream_set_output_stride(void *stream,
+      enum image_type_enum type, uint32_t *out, unsigned stride)
 {
    fake_t *f = (fake_t*)stream;
    (void)type;
    f->out = out;
+   f->out_stride = stride ? stride : W;
    return f->direct;
 }
 
@@ -177,7 +248,8 @@ bool image_transfer_anim_stream_set_blit_pool(void *stream,
 
 typedef struct
 {
-   uint32_t slots[2][N];
+   uint32_t slots[2][(W + 3) * H];
+   unsigned stride[2];
    int seen[MAX_SEEN];
    int nseen;
    int bad_px;
@@ -186,6 +258,12 @@ typedef struct
    int queue_every;      /* present QUEUED every n-th frame, 0 never */
    int start_flags;
    bool slots_on;
+   /* GPU frames: taken (DONE or QUEUED), BUSY every n-th offer */
+   int hw_taken;
+   int hw_busy_every;
+   int hw_offers;
+   int hw_started;
+   bool hw_twice;        /* the same frame offered after it was taken */
 } sink_t;
 
 static int sink_start(void *user, unsigned width, unsigned height,
@@ -223,13 +301,16 @@ static enum video_player_present sink_present(void *user,
    unsigned i;
 
    CHECK(fr->width == W && fr->height == H, "present: dims");
+   CHECK(!k->begun[fr->slot], "present: slot still being written");
    idx = (int)(px[0] & 0xFF) - 1;
    if (!fr->native)
       idx = (int)((px[0] >> 16) & 0xFF) - 1;
    want_argb = frame_px(idx, true);
    for (i = 0; i < N; i++)
    {
-      uint32_t p = px[i];
+      unsigned stride = !fr->pixels && k->stride[fr->slot]
+         ? k->stride[fr->slot] : W;
+      uint32_t p = px[(i / W) * stride + i % W];
       if (!fr->native)
          p = (p & 0xFF00FF00u) | ((p & 0xFF) << 16) | ((p >> 16) & 0xFF);
       if (p != want_argb)
@@ -239,6 +320,47 @@ static enum video_player_present sink_present(void *user,
       k->seen[k->nseen] = idx;
    k->nseen++;
    if (k->queue_every && !fr->pixels && (k->nseen % k->queue_every) == 0)
+   {
+      k->held = (int)fr->slot;
+      return VIDEO_PLAYER_PRESENT_QUEUED;
+   }
+   return VIDEO_PLAYER_PRESENT_DONE;
+}
+
+static int sink_start_hw(void *user, unsigned width, unsigned height,
+      unsigned jobs)
+{
+   sink_t *k = (sink_t*)user;
+   CHECK(jobs == 1 || jobs == 2, "start_hw: %u jobs", jobs);
+   CHECK(width == W && height == H, "start_hw: %ux%u", width, height);
+   k->hw_started++;
+   return 0;
+}
+
+static enum video_player_present sink_present_hw(void *user,
+      const video_player_frame_t *fr)
+{
+   sink_t *k = (sink_t*)user;
+   int idx;
+   if (!fr->hw)
+   {
+      CHECK(0, "present_hw: a frame without its GPU frame");
+      return VIDEO_PLAYER_PRESENT_FAILED;
+   }
+   CHECK(fr->width == W && fr->height == H && fr->hw->width == W,
+         "present_hw: dims");
+   k->hw_offers++;
+   if (k->hw_busy_every && (k->hw_offers % k->hw_busy_every) == 0)
+      return VIDEO_PLAYER_PRESENT_BUSY;
+   idx = (int)fr->hw->image - 1;
+   if (k->nseen && k->nseen <= MAX_SEEN && k->seen[k->nseen - 1] == idx
+         && k->held < 0)
+      k->hw_twice = true;
+   if (k->nseen < MAX_SEEN)
+      k->seen[k->nseen] = idx;
+   k->nseen++;
+   k->hw_taken++;
+   if (k->queue_every && (k->nseen % k->queue_every) == 0)
    {
       k->held = (int)fr->slot;
       return VIDEO_PLAYER_PRESENT_QUEUED;
@@ -258,6 +380,16 @@ static void sink_init(sink_t *k, video_player_sink_t *s, bool slots)
    s->present    = sink_present;
    s->feed       = NULL;
    s->decoded    = NULL;
+   s->start_hw   = NULL;
+   s->slot_stride = NULL;
+}
+
+/* A sink that takes GPU frames, and slots for any other. */
+static void sink_init_hw(sink_t *k, video_player_sink_t *s)
+{
+   sink_init(k, s, true);
+   s->start_hw = sink_start_hw;
+   s->present  = sink_present_hw;
 }
 
 static void fake_init(fake_t *f, int frames, int duration_ms)
@@ -388,6 +520,7 @@ static void lane_fp16(void)
    p = video_player_new(&f, IMAGE_TYPE_MP4, 0, &s, VIDEO_PLAYER_INLINE);
    CHECK(video_player_poll(p, 0) == VIDEO_PLAYER_ENDED && k.nseen == 0,
          "fp16: a canvas frame was shown");
+   CHECK(!k.begun[0], "fp16: refused frame holds its slot");
    video_player_free(p);
 
    fake_init(&f, 3, 10);
@@ -401,7 +534,136 @@ static void lane_fp16(void)
    video_player_free(p);
 }
 
+/* GPU frames in line: in order on time, a frame not taken (BUSY) given
+ * back, the loop count kept; a sink without start_hw decodes into its
+ * slots; a frame that comes without its GPU frame ends the playback. */
+static void lane_hw_inline(void)
+{
+   fake_t f;
+   sink_t k;
+   video_player_sink_t s;
+   video_player_t *p;
+   int64_t now = 0;
+   int polls   = 0;
+   enum video_player_state st;
+
+   fake_init(&f, 6, 10);
+   f.hw_can = true;
+   f.wait_left = 3;
+   f.wait_at = 2;
+   sink_init_hw(&k, &s);
+   k.hw_busy_every = 4;
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 2, &s, VIDEO_PLAYER_INLINE);
+   do
+   {
+      st  = video_player_poll(p, now);
+      now = video_player_due(p) > now ? video_player_due(p) : now + 1000;
+   } while (st == VIDEO_PLAYER_PLAYING && ++polls < 200);
+   video_player_free(p);
+   CHECK(k.hw_started == 1, "hw inline: started %d times", k.hw_started);
+   CHECK(f.hw_made == k.hw_taken + f.hw_abandoned,
+         "hw inline: %d made, %d taken, %d given back", f.hw_made,
+         k.hw_taken, f.hw_abandoned);
+   CHECK(f.hw_abandoned > 0, "hw inline: a BUSY frame was kept");
+   CHECK(f.hw_made == 12, "hw inline: %d made for two loops of 6",
+         f.hw_made);
+
+   /* the same stream to a sink that takes no GPU frames */
+   fake_init(&f, 3, 10);
+   f.hw_can = true;
+   f.direct = true;
+   sink_init(&k, &s, true);
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &s, VIDEO_PLAYER_INLINE);
+   video_player_poll(p, 0);
+   CHECK(!f.hw_on && k.nseen == 1 && k.bad_px == 0,
+         "hw inline: a sink without start_hw got no software frame");
+   video_player_free(p);
+
+   /* the GPU frame fails at the third: the playback ends there */
+   fake_init(&f, 6, 10);
+   f.hw_can       = true;
+   f.hw_fail_from = 3;
+   sink_init_hw(&k, &s);
+   p     = video_player_new(&f, IMAGE_TYPE_MP4, 0, &s, VIDEO_PLAYER_INLINE);
+   now   = 0;
+   polls = 0;
+   do
+   {
+      st  = video_player_poll(p, now);
+      now = video_player_due(p) > now ? video_player_due(p) : now + 1000;
+   } while (st == VIDEO_PLAYER_PLAYING && ++polls < 50);
+   CHECK(st == VIDEO_PLAYER_ENDED && k.nseen == 2,
+         "hw inline: %d frames before the failing one", k.nseen);
+   video_player_free(p);
+}
+
 #ifdef HAVE_THREADS
+/* GPU frames on the worker: in order across loops, a QUEUED frame
+ * holding its job until released, a BUSY one offered again, and every
+ * frame made either taken or given back - also when players are freed
+ * with frames decoded and not shown. */
+static void lane_hw_threaded(void)
+{
+   int i;
+   fake_t f;
+   sink_t k;
+   video_player_sink_t s;
+   video_player_t *p;
+   int64_t now = 0;
+   int polls   = 0;
+   enum video_player_state st;
+
+   fake_init(&f, 7, 5);
+   f.hw_can = true;
+   f.wait_left = 3;
+   f.wait_at = 2;
+   sink_init_hw(&k, &s);
+   k.queue_every   = 3;
+   k.hw_busy_every = 5;
+   p = video_player_new(&f, IMAGE_TYPE_MP4, 3, &s, 0);
+   do
+   {
+      st = video_player_poll(p, now);
+      if (k.held >= 0)
+      {
+         video_player_slot_released(p, (unsigned)k.held);
+         k.held = -1;
+      }
+      now += 6000;
+      retro_sleep(1);
+   } while (st == VIDEO_PLAYER_PLAYING && ++polls < 5000);
+   video_player_free(p);
+   CHECK(st == VIDEO_PLAYER_ENDED, "hw threaded: never ended");
+   CHECK(k.nseen == 21 && seen_in_order(&k, 7),
+         "hw threaded: %d frames for three loops of 7, or out of order",
+         k.nseen);
+   CHECK(f.hw_made == k.hw_taken + f.hw_abandoned && !f.hw_abandoned,
+         "hw threaded: %d made, %d taken, %d given back", f.hw_made,
+         k.hw_taken, f.hw_abandoned);
+
+   for (i = 0; i < 300; i++)
+   {
+      int j;
+      fake_init(&f, 40, 1);
+      f.hw_can = true;
+      sink_init_hw(&k, &s);
+      p = video_player_new(&f, IMAGE_TYPE_MP4, 0, &s, 0);
+      for (j = 0; j < (i % 5); j++)
+      {
+         video_player_poll(p, (int64_t)j * 3000);
+         if (i & 1)
+            retro_sleep(1);
+      }
+      video_player_free(p);
+      if (f.hw_made != k.hw_taken + f.hw_abandoned)
+      {
+         CHECK(0, "hw churn: %d made, %d taken, %d given back", f.hw_made,
+               k.hw_taken, f.hw_abandoned);
+         break;
+      }
+   }
+}
+
 /* On the worker: the frames in order across loops, a QUEUED present
  * holding its slot until released, every slot ended at the free. */
 static void lane_threaded(bool direct)
@@ -471,14 +733,105 @@ static void lane_churn(void)
 }
 #endif
 
+static unsigned sink_slot_stride(void *user, unsigned slot)
+{
+   return ((sink_t*)user)->stride[slot];
+}
+
+static bool sink_feed_stop(void *user)
+{
+   (void)user;
+   return false;
+}
+
+static void lane_inline_release(void)
+{
+   unsigned mode;
+   for (mode = 0; mode < 3; mode++)
+   {
+      fake_t f;
+      sink_t k;
+      video_player_sink_t s;
+      video_player_t *p;
+      fake_init(&f, 1, 10);
+      f.direct = true;
+      sink_init(&k, &s, true);
+      if (mode == 0)
+         s.feed = sink_feed_stop;
+      else if (mode == 1)
+         f.pos = f.frames;
+      else
+         s.slot_stride = sink_slot_stride;
+      p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &s,
+            VIDEO_PLAYER_INLINE);
+      CHECK(p != NULL, "inline release: allocation");
+      if (!p)
+         continue;
+      CHECK(video_player_poll(p, 0) == VIDEO_PLAYER_ENDED,
+            "inline release: mode %u did not end", mode);
+      CHECK(!k.begun[0] && !k.nseen,
+            "inline release: mode %u holds or presents its slot", mode);
+      video_player_free(p);
+   }
+}
+
+static void lane_padded(void)
+{
+   unsigned threaded, direct, order;
+   for (threaded = 0; threaded < 2; threaded++)
+   for (direct = 0; direct < 2; direct++)
+   for (order = 0; order < 2; order++)
+   {
+      fake_t f;
+      sink_t k;
+      video_player_sink_t s;
+      video_player_t *p;
+      unsigned tick, slot, y, x;
+      int state = VIDEO_PLAYER_PLAYING;
+      fake_init(&f, 6, 10);
+      f.direct = direct != 0;
+      f.honours_order = order != 0;
+      sink_init(&k, &s, true);
+      k.stride[0] = W + 1;
+      k.stride[1] = W + 3;
+      s.slot_stride = sink_slot_stride;
+      for (slot = 0; slot < 2; slot++)
+         for (x = 0; x < (W + 3) * H; x++)
+            k.slots[slot][x] = 0xdeadbeef;
+      p = video_player_new(&f, IMAGE_TYPE_MP4, 1, &s,
+            threaded ? 0 : VIDEO_PLAYER_INLINE);
+      CHECK(p != NULL, "padded: allocation");
+      if (!p) continue;
+      for (tick = 0; tick < 1000 && state != VIDEO_PLAYER_ENDED; tick++)
+      {
+         state = video_player_poll(p, (int64_t)tick * 1000);
+         retro_sleep(1);
+      }
+      video_player_free(p);
+      CHECK(state == VIDEO_PLAYER_ENDED && k.nseen == 6 && !k.bad_px,
+            "padded: mode %u/%u/%u showed %d frames, %d wrong pixels",
+            threaded, direct, order, k.nseen, k.bad_px);
+      CHECK(!k.begun[0] && !k.begun[1], "padded: unreleased slot");
+      for (slot = 0; slot < 2; slot++)
+         for (y = 0; y < H; y++)
+            for (x = W; x < k.stride[slot]; x++)
+               CHECK(k.slots[slot][y * k.stride[slot] + x] == 0xdeadbeef,
+                     "padded: slot %u row %u guard", slot, y);
+   }
+}
+
 int main(void)
 {
+   lane_inline_release();
+   lane_padded();
    lane_inline_pacing(false);
    lane_inline_pacing(true);
    lane_catchup();
    lane_order_and_default();
    lane_fp16();
+   lane_hw_inline();
 #ifdef HAVE_THREADS
+   lane_hw_threaded();
    lane_threaded(true);
    lane_threaded(false);
    lane_churn();

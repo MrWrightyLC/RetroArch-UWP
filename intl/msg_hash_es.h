@@ -1594,7 +1594,6 @@ static const struct
    char s_d6198fde[22];
    char s_9e5d0200[14];
    char s_9fd6f744[15];
-   char s_46f82582[6];
    char s_bf5e903e[9];
    char s_a2bb0576[12];
    char s_fab0ac6c[11];
@@ -2585,7 +2584,6 @@ static const struct
    char s_c017f975[12];
    char s_730df420[16];
    char s_bcddf275[8];
-   char s_258060bf[17];
    char s_3bbc8b05[48];
    char s_e595f6df[50];
    char s_2a5f7cd7[38];
@@ -3990,7 +3988,6 @@ static const struct
    char s_4a09218b[31];
    char s_dea334de[235];
    char s_cacc1492[91];
-   char s_c0c6924e[216];
    char s_c83fcc7e[260];
    char s_7efaf561[259];
    char s_c90aff27[117];
@@ -6530,7 +6527,6 @@ static const struct
    "Ocultar barra lateral",
    "Negro b\303\241sico",
    "Blanco b\303\241sico",
-   "Claro",
    "Dr\303\241cula",
    "Gris oscuro",
    "Gris claro",
@@ -7531,7 +7527,6 @@ static const struct
    "Autom\303\241tico",
    "Sincronizaci\303\263n",
    "V\303\255deos",
-   "V\303\255deo multihilo",
    "Ritmo de visualizaci\303\263n con el v\303\255deo multihilo",
    "Repetici\303\263n de fotogramas con el v\303\255deo multihilo",
    "Aumentar prioridad del hilo de v\303\255deo",
@@ -9891,9 +9886,6 @@ static const struct
    "dor 1 y el mando derecho el del jugador 2.",
    "Indica la distancia respecto a tu posici\303\263n con la que las gafas mostrar\303\241n las pant"
    "allas.",
-   "Muestra tambi\303\251n los contenidos en un casco OpenXR: cada pantalla flotando por separado, e"
-   "n ambos ojos de la estereoscopia 3D y con el men\303\272 delante. Solo para Vulkan. La ventana s"
-   "eguir\303\241 mostrando su imagen normal.",
    "Indica a qu\303\251 se\303\261alar\303\241 y tocar\303\241 el gatillo de un mando en vez de puls"
    "ar L2 o R2. Valor autom\303\241tico: al men\303\272 cuando est\303\251 abierto y a las pantallas"
    " secundarias, como si fuesen t\303\241ctiles. Siempre: a todas las pantallas, a usar con \302"
@@ -10809,7 +10801,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_es_blob_check[
-      (sizeof(msg_hash_es_blob) == (249863u
+      (sizeof(msg_hash_es_blob) == (249624u
 #ifdef ANDROID
        + 329u
 #endif
@@ -12948,7 +12940,6 @@ static const uint32_t msg_hash_es_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_OZONE_COLLAPSE_SIDEBAR,
    (uint32_t)MENU_ENUM_LABEL_VALUE_OZONE_COLOR_THEME_BASIC_BLACK,
    (uint32_t)MENU_ENUM_LABEL_VALUE_OZONE_COLOR_THEME_BASIC_WHITE,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_OZONE_COLOR_THEME_BRIGHT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_OZONE_COLOR_THEME_DRACULA,
    (uint32_t)MENU_ENUM_LABEL_VALUE_OZONE_COLOR_THEME_GRAY_DARK,
    (uint32_t)MENU_ENUM_LABEL_VALUE_OZONE_COLOR_THEME_GRAY_LIGHT,
@@ -13938,7 +13929,6 @@ static const uint32_t msg_hash_es_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SWAP_INTERVAL_AUTO,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SYNCHRONIZATION_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_TAB,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_THREADED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_THREADED_DISPLAY_PACING,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_THREADED_PRESENT_REPEAT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_THREAD_PRIORITY,
@@ -15334,7 +15324,6 @@ static const uint32_t msg_hash_es_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_MONITOR_INDEX,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_OPENXR_CONTROLLERS,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_OPENXR_DISTANCE,
-   (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_OPENXR_ENABLE,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_OPENXR_LASER,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_OPENXR_REFRESH_RATE,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_OPENXR_WIDTH,

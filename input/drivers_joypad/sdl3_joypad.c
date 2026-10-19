@@ -211,15 +211,17 @@ static void sdl3_joypad_connect(SDL_JoystickID jid)
       product = SDL_GetGamepadProduct(gamepad);
 
 #ifdef WEBOS
-   if (vendor == 0x9999 && product == 0x9999)
-   {
-      RARCH_WARN("[SDL] Ignoring pad #%d (vendor: %d; product: %d).\n", jid, vendor, product);
-      if (pad->joypad)
-         SDL_CloseJoystick(pad->joypad);
-
-      pad->joypad = NULL;
-      return;
-   }
+      /* The slot keeps its sensor state, as on a disconnect. */
+      if (vendor == 0x9999 && product == 0x9999)
+      {
+         RARCH_WARN("[SDL3] Ignoring pad #%" SDL_PRIu32 " (vendor: %d; product: %d).\n",
+               jid, vendor, product);
+         SDL_CloseGamepad(gamepad);
+         pad->jid     = 0;
+         pad->gamepad = NULL;
+         pad->joypad  = NULL;
+         return;
+      }
 #endif
 
       /* Ensure the player index matches the slot. */
@@ -318,7 +320,9 @@ static void sdl3_joypad_connect(SDL_JoystickID jid)
 
 static void sdl3_joypad_disconnect(SDL_JoystickID jid)
 {
-   for (int i = 0; i < MAX_USERS; i++)
+   int i;
+
+   for (i = 0; i < MAX_USERS; i++)
    {
       if (sdl3_joypads[i].jid != jid)
          continue;
@@ -346,8 +350,9 @@ static void sdl3_joypad_disconnect(SDL_JoystickID jid)
 
 static void sdl3_joypad_destroy(void)
 {
+   int i;
 
-   for (int i = 0; i < MAX_USERS; i++)
+   for (i = 0; i < MAX_USERS; i++)
    {
       if (sdl3_joypads[i].gamepad)
          SDL_CloseGamepad(sdl3_joypads[i].gamepad);
@@ -399,12 +404,14 @@ static int sdl3_joypad_load_gamecontrollerdb(void)
  */
 static void *sdl3_joypad_init(void *data)
 {
+   SDL_InitFlags sdl_subsystem_flags;
+
 #if SDL_VERSION_ATLEAST(3, 2, 0)
    /* Gamepad driver hints. */
    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_WII, "1");
 #endif
 
-   SDL_InitFlags sdl_subsystem_flags = SDL_WasInit(0);
+   sdl_subsystem_flags = SDL_WasInit(0);
 
    if (sdl_subsystem_flags == 0)
    {

@@ -103,6 +103,12 @@ void gl3_filter_chain_set_pass_info(
 
 bool gl3_filter_chain_init(gl3_filter_chain_t *chain);
 
+void gl3_filter_chain_set_passthrough(
+      gl3_filter_chain_t *chain, unsigned passthrough);
+
+void gl3_filter_chain_set_source_hdr(
+      gl3_filter_chain_t *chain, unsigned source_hdr);
+
 void gl3_filter_chain_set_input_texture(
       gl3_filter_chain_t *chain,
       const struct gl3_filter_chain_texture *texture);
@@ -131,6 +137,10 @@ void gl3_filter_chain_set_frame_direction(
 void gl3_filter_chain_set_frame_time_delta(
       gl3_filter_chain_t *chain,
       uint32_t time_delta);
+
+void gl3_filter_chain_set_hdr_parameters(
+      gl3_filter_chain_t *chain, unsigned mode,
+      float paper_white_nits, unsigned expand_gamut, float peak_nits);
 
 void gl3_filter_chain_set_original_fps(
       gl3_filter_chain_t *chain,
@@ -191,6 +201,8 @@ void gl3_filter_chain_build_viewport_pass_again(
 
 gl3_filter_chain_t *gl3_filter_chain_create_default(
       enum glslang_filter_chain_filter filter);
+
+gl3_filter_chain_t *gl3_filter_chain_create_shrink(void);
 
 /* @frame_rect: frames may come inside a larger texture (padded_dims);
  * the passes are built to read them there where the preset allows,

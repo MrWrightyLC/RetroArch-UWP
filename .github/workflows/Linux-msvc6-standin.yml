@@ -38,6 +38,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
       - name: Compile and link what pkg/msvc/msvc-6 builds
         shell: bash
         run: |
@@ -49,6 +52,14 @@ jobs:
           # links it. See the script for what that does and does not
           # catch.
           tools/msvc6_standin_check.sh
+
+      - name: The DXGI bridge as Visual C++ 2005 and 2010 build it
+        shell: bash
+        run: |
+          set -eu
+          # Their SDKs have no dxgi1_5.h or d3d12.h; the griffin builds
+          # for them still compile and link the bridge.
+          tools/dxgi_bridge_old_sdk_check.sh
 
       - name: Run the waveout audio driver on a wave output device (Wine)
         working-directory: samples/audio/waveout
@@ -67,7 +78,7 @@ jobs:
           pactl load-module module-null-sink sink_name=ci >/dev/null
           pactl set-default-sink ci
           WINE=$(command -v wine64 || command -v wine || echo /usr/lib/wine/wine64)
-          make clean all
+          make clean && make -j$(nproc) all
           WINEDEBUG=-all timeout 300 make check WINE="$WINE" | tee waveout.log
           grep -q "PASS waveout_test" waveout.log
           make clean
@@ -87,7 +98,7 @@ jobs:
           # failure here.
           trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
           WINE=$(command -v wine64 || command -v wine || echo /usr/lib/wine/wine64)
-          make clean all
+          make clean && make -j$(nproc) all
           WINEDEBUG=-all timeout 300 make check WINE="$WINE" | tee win32_input.log
           grep -q "PASS win32_input_test" win32_input.log
           if grep -q "^\[skip\]" win32_input.log; then
@@ -111,7 +122,7 @@ jobs:
           # that are not there not asked at every poll.
           trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
           WINE=$(command -v wine64 || command -v wine || echo /usr/lib/wine/wine64)
-          make clean all
+          make clean && make -j$(nproc) all
           WINEDEBUG=-all timeout 300 make check WINE="$WINE" | tee winmm_joypad.log
           grep -q "PASS winmm_joypad_test" winmm_joypad.log
           make clean

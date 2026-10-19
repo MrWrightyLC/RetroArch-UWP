@@ -45,9 +45,6 @@
 #endif
 
 #include "input_driver.h"
-#if defined(HAVE_OPENXR) && defined(ANDROID)
-#include "drivers/openxr_input.h"
-#endif
 #ifdef HAVE_THREADS
 #include "input_key_lane.h"
 #endif
@@ -1728,6 +1725,11 @@ static const input_device_driver_t *input_joypad_for_read_(
       return NULL;
    if (st->flags & INP_FLAG_JOYPAD_UNFOCUSED)
       return &idle_joypad;
+#ifdef HAVE_OPENXR
+   /* the headset's controllers, in slots of their own: under the
+    * bridge, which then snapshots them with the driver's */
+   drv = input_openxr_joypad(drv);
+#endif
    if ((bridge = input_snapshot_for(st, drv)))
       return bridge;
    return drv;
@@ -1836,21 +1838,18 @@ bool input_driver_set_rumble(
 
    primary_joypad = input_driver_st.primary_joypad;
 
+#ifdef HAVE_OPENXR
+   /* input_set_rumble_state() leaves the gain to a driver that applies
+    * it in the device; the headset's slots have none. */
+   if (     input_openxr_has_slot(joy_idx)
+         && primary_joypad && primary_joypad->set_rumble_gain)
+      strength = (uint16_t)((config_get_ptr()->uints.input_rumble_gain
+            * strength) / 100);
+   primary_joypad = input_openxr_joypad(primary_joypad);
+#endif
+
    if (primary_joypad && primary_joypad->set_rumble)
       rumble_state = primary_joypad->set_rumble(joy_idx, effect, strength);
-
-#ifdef HAVE_OPENXR
-   /* The headset's controllers rumble too. input_set_rumble_state()
-    * leaves the gain to a driver that applies it in the device. */
-   {
-      uint16_t xr_strength = strength;
-      if (!primary_joypad || primary_joypad->set_rumble_gain)
-         xr_strength = (uint16_t)((config_get_ptr()->uints.input_rumble_gain
-               * strength) / 100);
-      if (input_openxr_set_rumble(port, effect, xr_strength))
-         rumble_state = true;
-   }
-#endif
 
    return rumble_state;
 }
@@ -3106,75 +3105,6 @@ static INLINE unsigned input_analog_dpad_mode_in_effect(unsigned mode,
     && !(input_analog_dpad_modes[mode] & 4) \
     && ((input_analog_dpad_modes[mode] >> (idx)) & 1))
 
-#ifdef HAVE_OPENXR
-unsigned input_driver_analog_dpad_mode(unsigned port)
-{
-   settings_t *settings = config_get_ptr();
-   unsigned mapped_port = settings->uints.input_remap_ports[port];
-   return input_analog_dpad_mode_in_effect(
-         settings->uints.input_analog_dpad_mode[port],
-            mapped_port < MAX_USERS
-         && input_driver_st.analog_requested[mapped_port]);
-}
-
-uint16_t input_driver_analog_dpad_buttons(unsigned mode,
-      const int16_t *analog, float axis_threshold)
-{
-   float analog_x, analog_y;
-   uint16_t buttons = 0;
-
-   switch (mode)
-   {
-      case ANALOG_DPAD_LSTICK:
-      case ANALOG_DPAD_TWINSTICK:
-         analog_x = (float)analog[0] / 0x7fff;
-         analog_y = (float)analog[1] / 0x7fff;
-         break;
-      case ANALOG_DPAD_RSTICK:
-         analog_x = (float)analog[2] / 0x7fff;
-         analog_y = (float)analog[3] / 0x7fff;
-         break;
-      case ANALOG_DPAD_LRSTICK:
-         analog_x = (float)analog[0] / 0x7fff;
-         analog_y = (float)analog[1] / 0x7fff;
-         if (!analog_x)
-            analog_x = (float)analog[2] / 0x7fff;
-         if (!analog_y)
-            analog_y = (float)analog[3] / 0x7fff;
-         break;
-      default:
-         return 0;
-   }
-
-   if (analog_x <= -axis_threshold)
-      buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_LEFT);
-   if (analog_x >=  axis_threshold)
-      buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_RIGHT);
-   if (analog_y <= -axis_threshold)
-      buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_UP);
-   if (analog_y >=  axis_threshold)
-      buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_DOWN);
-
-   /* Twin Stick's right stick is the face buttons. */
-   if (mode == ANALOG_DPAD_TWINSTICK)
-   {
-      analog_x = (float)analog[2] / 0x7fff;
-      analog_y = (float)analog[3] / 0x7fff;
-
-      if (analog_x <= -axis_threshold)
-         buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_Y);
-      if (analog_x >=  axis_threshold)
-         buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_A);
-      if (analog_y <= -axis_threshold)
-         buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_X);
-      if (analog_y >=  axis_threshold)
-         buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_B);
-   }
-
-   return buttons;
-}
-#endif
-
 /* A pad button for an analog button's read: a bit of the frame's copy
  * where the read goes through it, without the call. */
 static INLINE bool input_analog_button_key(
@@ -3846,15 +3776,20 @@ void input_keyboard_line_append(struct input_keyboard_line *kb_line,
 {
    /* Need room for current content + inserted text + NUL terminator.
     * new_size is the string length after insertion (not counting NUL). */
-   size_t new_size     = kb_line->size + len;
+   size_t new_size     = kb_line->select_all ? len : kb_line->size + len;
 
    /* Overflow guard */
-   if (new_size < kb_line->size || new_size < len)
+   if ((!kb_line->select_all && new_size < kb_line->size) || new_size < len)
+      return;
+
+   /* A native keyboard's buffer cannot grow or move under it */
+   if (new_size > kb_line->capacity && kb_line->fixed)
       return;
 
    /* Grow buffer with exponential strategy if needed */
    if (new_size > kb_line->capacity)
    {
+
       /* At least double the current capacity, with a minimum of 64 */
       size_t new_cap = kb_line->capacity ? kb_line->capacity * 2 : 64;
       char *newbuf;
@@ -3869,6 +3804,13 @@ void input_keyboard_line_append(struct input_keyboard_line *kb_line,
 
       kb_line->buffer   = newbuf;
       kb_line->capacity = new_cap;
+   }
+
+   if (kb_line->select_all)
+   {
+      kb_line->ptr        = 0;
+      kb_line->size       = 0;
+      kb_line->select_all = false;
    }
 
    /* Shift existing content after insertion point to make room */
@@ -3893,6 +3835,8 @@ void input_keyboard_line_clear(input_driver_state_t *input_st)
    input_st->keyboard_line.ptr          = 0;
    input_st->keyboard_line.size         = 0;
    input_st->keyboard_line.capacity     = 0;
+   input_st->keyboard_line.select_all   = false;
+   input_st->keyboard_line.fixed        = false;
 }
 
 /* A line of text has been opened, or closed. This is the one place the
@@ -3923,6 +3867,8 @@ void input_keyboard_line_free(input_driver_state_t *input_st)
    kb_line->cb                 = NULL;
    kb_line->userdata           = NULL;
    kb_line->enabled            = false;
+   kb_line->select_all         = false;
+   kb_line->fixed              = false;
    input_st->osk_textbox_focus = false;
    input_text_entry_changed(false);
 }
@@ -3939,6 +3885,8 @@ const char **input_keyboard_start_line(
    kb_line->cb                       = cb;
    kb_line->userdata                 = userdata;
    kb_line->enabled                  = true;
+   kb_line->select_all               = false;
+   kb_line->fixed                    = false;
    input_driver_st.osk_textbox_focus = false;
    input_text_entry_changed(true);
 
@@ -4273,6 +4221,176 @@ static void input_remote_poll(input_driver_state_t *input_st,
 }
 #endif
 
+/* ===== BEGIN input turbo and hold =====
+ * Hold and turbo applied to RetroPad button @id of @port, whose
+ * plain pressed state is @res; returns the state the core reads. */
+static int16_t input_turbo_hold_apply(
+      turbo_buttons_t *turbo, hold_buttons_t *hold,
+      const settings_t *settings,
+      unsigned port, unsigned id, int16_t res)
+{
+   uint8_t turbo_period     = settings->uints.input_turbo_period;
+   uint8_t turbo_duty_cycle = settings->uints.input_turbo_duty_cycle;
+   uint8_t turbo_mode       = settings->uints.input_turbo_mode;
+
+   /* Apply hold button logic.
+    * When hold modifier is pressed, tapping buttons toggles their held state.
+    * Held buttons report as pressed even when not physically touched.
+    * Physical presses pass through normally (no modification). */
+
+   /* Handle hold modifier state and toggle logic */
+   if (!hold->frame_enable[port])
+   {
+      /* Hold modifier not pressed - clear edge detection state */
+      hold->hold_pressed[port] = 0;
+   }
+   else
+   {
+      /* Hold modifier is pressed - handle toggle on rising edge */
+      if (!res)
+         hold->hold_pressed[port] &= ~(1 << id);
+      else if (!(hold->hold_pressed[port] & (1 << id)))
+      {
+         /* Rising edge - toggle hold for this button */
+         hold->hold_pressed[port] |= (1 << id);
+         hold->enable[port] ^= (1 << id);
+      }
+   }
+
+   /* Apply hold effect: if button is held and not physically pressed */
+   if (!res && (hold->enable[port] & (1 << id)))
+      res = 1;
+
+   /* Apply turbo button if activated. */
+
+   /* Don't allow classic mode turbo for D-pad unless explicitly allowed. */
+   if (     turbo_mode <= INPUT_TURBO_MODE_CLASSIC_TOGGLE
+         && !settings->bools.input_turbo_allow_dpad
+         && id >= RETRO_DEVICE_ID_JOYPAD_UP
+         && id <= RETRO_DEVICE_ID_JOYPAD_RIGHT)
+      return res;
+
+   if (turbo_duty_cycle == 0)
+      turbo_duty_cycle = turbo_period / 2;
+
+   /* Clear underlying button to prevent duplicates. */
+   if (turbo->frame_enable[port])
+   {
+      /* The empty Turbo Bind uses the port's turbo hotkey,
+       * which has no RetroPad button to clear. */
+      int turbo_bind = settings->ints.input_turbo_bind;
+
+      if (     turbo_bind >= 0
+            && id == settings->uints.input_remap_ids[port][turbo_bind])
+         res = 0;
+   }
+
+   if (turbo_mode > INPUT_TURBO_MODE_CLASSIC_TOGGLE)
+   {
+      unsigned turbo_button = settings->uints.input_turbo_button;
+      unsigned remap_button = settings->uints.input_remap_ids[port][turbo_button];
+
+      /* Single button modes only care about the defined button. */
+      if (id != remap_button)
+         return res;
+
+      /* Pressing turbo bind toggles turbo button on or off.
+       * Holding the button will pass through, else
+       * the pressed state will be modulated by a
+       * periodic pulse defined by the configured duty cycle.
+       */
+
+      /* Avoid detecting the turbo button being held as multiple toggles */
+      if (!turbo->frame_enable[port])
+         turbo->turbo_pressed[port] &= ~(1U << 31);
+      else if (!(turbo->turbo_pressed[port] & (1U << 31)))
+      {
+         turbo->turbo_pressed[port] |= (1U << 31);
+         /* Toggle turbo for selected button. */
+         if (turbo->enable[port] != (1 << id))
+            turbo->enable[port] = (1 << id);
+         turbo->mode1_enable[port] ^= 1;
+      }
+
+      if (turbo->turbo_pressed[port] & (1U << 31))
+      {
+         /* Avoid detecting buttons being held as multiple toggles */
+         if (!res)
+            turbo->turbo_pressed[port] &= ~(1U << id);
+         else if (!(turbo->turbo_pressed[port] & (1U << id))
+               && turbo_mode == INPUT_TURBO_MODE_SINGLEBUTTON)
+         {
+            uint16_t enable_new;
+            turbo->turbo_pressed[port] |= 1U << id;
+            enable_new = turbo->enable[port] ^ (1 << id);
+            if (enable_new)
+               turbo->enable[port] = enable_new;
+         }
+      }
+      /* Hold mode stops turbo on release */
+      else if ((turbo_mode == INPUT_TURBO_MODE_SINGLEBUTTON_HOLD)
+            && (turbo->enable[port])
+            && (turbo->mode1_enable[port]))
+         turbo->mode1_enable[port] = 0;
+
+      if (     (!res)
+            && (turbo->mode1_enable[port])
+            && (turbo->enable[port] & (1 << id)))
+         res = ((turbo->count % turbo_period) < turbo_duty_cycle);
+   }
+   else if (turbo_mode == INPUT_TURBO_MODE_CLASSIC)
+   {
+      /* If turbo button is held, all buttons pressed
+       * will go into a turbo mode. Until the button is
+       * released again, the input state will be modulated by a
+       * periodic pulse defined by the configured duty cycle.
+       */
+      if (res)
+      {
+         if (turbo->frame_enable[port])
+            turbo->enable[port] |= (1 << id);
+
+         if (turbo->enable[port] & (1 << id))
+            /* if turbo button is enabled for this key ID */
+            res = ((turbo->count % turbo_period) < turbo_duty_cycle);
+      }
+      else
+         turbo->enable[port] &= ~(1 << id);
+   }
+   else /* Classic toggle mode */
+   {
+      /* Works pretty much the same as
+       * classic mode above but with a
+       * toggle mechanic */
+
+      /* Check if it's to enable the turbo func,
+       * if we're still holding the button from
+       * previous toggle then ignore */
+      if (   (res)
+          && (turbo->frame_enable[port]))
+      {
+         if (!(turbo->turbo_pressed[port] & (1U << id)))
+         {
+            turbo->enable[port] ^= (1 << id);
+            /* Remember for the toggle check */
+            turbo->turbo_pressed[port] |= (1U << id);
+         }
+      }
+      else
+         turbo->turbo_pressed[port] &= ~(1U << id);
+
+      if (res)
+      {
+         /* If turbo button is enabled for this key ID */
+         if (turbo->enable[port] & (1 << id))
+            res = ((turbo->count % turbo_period) < turbo_duty_cycle);
+      }
+   }
+
+   return res;
+}
+/* ===== END input turbo and hold ===== */
+
 static int16_t input_state_device(
       input_driver_state_t *input_st,
       settings_t *settings,
@@ -4347,185 +4465,11 @@ static int16_t input_state_device(
                      res |= 1;
                }
 #endif
-#ifdef HAVE_OPENXR
-               /* The headset's controllers, as the overlay's buttons: a
-                * remapped button was mapped in input_driver_poll(). */
-               if (input_openxr_button(port, id))
-               {
-#ifdef HAVE_MENU
-                  bool menu_alive = (menu_state_get_ptr()->flags
-                        & MENU_ST_FLAG_ALIVE) ? true : false;
-#else
-                  bool menu_alive = false;
-#endif
-                  if (     menu_alive
-                        || !settings->bools.input_remap_binds_enable
-                        || (id == remap_button))
-                     res |= 1;
-               }
-#endif
             }
 
             if (id <= RETRO_DEVICE_ID_JOYPAD_R3)
-            {
-               uint8_t turbo_period     = settings->uints.input_turbo_period;
-               uint8_t turbo_duty_cycle = settings->uints.input_turbo_duty_cycle;
-               uint8_t turbo_mode       = settings->uints.input_turbo_mode;
-
-               /* Apply hold button logic.
-                * When hold modifier is pressed, tapping buttons toggles their held state.
-                * Held buttons report as pressed even when not physically touched.
-                * Physical presses pass through normally (no modification). */
-
-               /* Handle hold modifier state and toggle logic */
-               if (!input_st->hold_btns.frame_enable[port])
-               {
-                  /* Hold modifier not pressed - clear edge detection state */
-                  input_st->hold_btns.hold_pressed[port] = 0;
-               }
-               else
-               {
-                  /* Hold modifier is pressed - handle toggle on rising edge */
-                  if (!res)
-                     input_st->hold_btns.hold_pressed[port] &= ~(1 << id);
-                  else if (!(input_st->hold_btns.hold_pressed[port] & (1 << id)))
-                  {
-                     /* Rising edge - toggle hold for this button */
-                     input_st->hold_btns.hold_pressed[port] |= (1 << id);
-                     input_st->hold_btns.enable[port] ^= (1 << id);
-                  }
-               }
-
-               /* Apply hold effect: if button is held and not physically pressed */
-               if (!res && (input_st->hold_btns.enable[port] & (1 << id)))
-                  res = 1;
-
-               /* Apply turbo button if activated. */
-
-               /* Don't allow classic mode turbo for D-pad unless explicitly allowed. */
-               if (     turbo_mode <= INPUT_TURBO_MODE_CLASSIC_TOGGLE
-                     && !settings->bools.input_turbo_allow_dpad
-                     && id >= RETRO_DEVICE_ID_JOYPAD_UP
-                     && id <= RETRO_DEVICE_ID_JOYPAD_RIGHT)
-                  break;
-
-               if (turbo_duty_cycle == 0)
-                  turbo_duty_cycle = turbo_period / 2;
-
-               /* Clear underlying button to prevent duplicates. */
-               if (input_st->turbo_btns.frame_enable[port])
-               {
-                  /* The empty Turbo Bind uses the port's turbo hotkey,
-                   * which has no RetroPad button to clear. */
-                  int turbo_bind = settings->ints.input_turbo_bind;
-
-                  if (     turbo_bind >= 0
-                        && id == settings->uints.input_remap_ids[port][turbo_bind])
-                     res = 0;
-               }
-
-               if (turbo_mode > INPUT_TURBO_MODE_CLASSIC_TOGGLE)
-               {
-                  unsigned turbo_button = settings->uints.input_turbo_button;
-                  unsigned remap_button = settings->uints.input_remap_ids[port][turbo_button];
-
-                  /* Single button modes only care about the defined button. */
-                  if (id != remap_button)
-                     break;
-
-                  /* Pressing turbo bind toggles turbo button on or off.
-                   * Holding the button will pass through, else
-                   * the pressed state will be modulated by a
-                   * periodic pulse defined by the configured duty cycle.
-                   */
-
-                  /* Avoid detecting the turbo button being held as multiple toggles */
-                  if (!input_st->turbo_btns.frame_enable[port])
-                     input_st->turbo_btns.turbo_pressed[port] &= ~(1 << 31);
-                  else if (input_st->turbo_btns.turbo_pressed[port] >= 0)
-                  {
-                     input_st->turbo_btns.turbo_pressed[port] |= (1 << 31);
-                     /* Toggle turbo for selected button. */
-                     if (input_st->turbo_btns.enable[port] != (1 << id))
-                        input_st->turbo_btns.enable[port] = (1 << id);
-                     input_st->turbo_btns.mode1_enable[port] ^= 1;
-                  }
-
-                  if (input_st->turbo_btns.turbo_pressed[port] & (1 << 31))
-                  {
-                     /* Avoid detecting buttons being held as multiple toggles */
-                     if (!res)
-                        input_st->turbo_btns.turbo_pressed[port] &= ~(1 << id);
-                     else if (!(input_st->turbo_btns.turbo_pressed[port] & (1 << id))
-                           && turbo_mode == INPUT_TURBO_MODE_SINGLEBUTTON)
-                     {
-                        uint16_t enable_new;
-                        input_st->turbo_btns.turbo_pressed[port] |= 1 << id;
-                        enable_new = input_st->turbo_btns.enable[port] ^ (1 << id);
-                        if (enable_new)
-                           input_st->turbo_btns.enable[port] = enable_new;
-                     }
-                  }
-                  /* Hold mode stops turbo on release */
-                  else if ((turbo_mode == INPUT_TURBO_MODE_SINGLEBUTTON_HOLD)
-                        && (input_st->turbo_btns.enable[port])
-                        && (input_st->turbo_btns.mode1_enable[port]))
-                     input_st->turbo_btns.mode1_enable[port] = 0;
-
-                  if (     (!res)
-                        && (input_st->turbo_btns.mode1_enable[port])
-                        && (input_st->turbo_btns.enable[port] & (1 << id)))
-                     res = ((input_st->turbo_btns.count % turbo_period) < turbo_duty_cycle);
-               }
-               else if (turbo_mode == INPUT_TURBO_MODE_CLASSIC)
-               {
-                  /* If turbo button is held, all buttons pressed
-                   * will go into a turbo mode. Until the button is
-                   * released again, the input state will be modulated by a
-                   * periodic pulse defined by the configured duty cycle.
-                   */
-                  if (res)
-                  {
-                     if (input_st->turbo_btns.frame_enable[port])
-                        input_st->turbo_btns.enable[port] |= (1 << id);
-
-                     if (input_st->turbo_btns.enable[port] & (1 << id))
-                        /* if turbo button is enabled for this key ID */
-                        res = ((input_st->turbo_btns.count % turbo_period) < turbo_duty_cycle);
-                  }
-                  else
-                     input_st->turbo_btns.enable[port] &= ~(1 << id);
-               }
-               else /* Classic toggle mode */
-               {
-                  /* Works pretty much the same as
-                   * classic mode above but with a
-                   * toggle mechanic */
-
-                  /* Check if it's to enable the turbo func,
-                   * if we're still holding the button from
-                   * previous toggle then ignore */
-                  if (   (res)
-                      && (input_st->turbo_btns.frame_enable[port]))
-                  {
-                     if (!(input_st->turbo_btns.turbo_pressed[port] & (1 << id)))
-                     {
-                        input_st->turbo_btns.enable[port] ^= (1 << id);
-                        /* Remember for the toggle check */
-                        input_st->turbo_btns.turbo_pressed[port] |= (1 << id);
-                     }
-                  }
-                  else
-                     input_st->turbo_btns.turbo_pressed[port] &= ~(1 << id);
-
-                  if (res)
-                  {
-                     /* If turbo button is enabled for this key ID */
-                     if (input_st->turbo_btns.enable[port] & (1 << id))
-                        res = ((input_st->turbo_btns.count % turbo_period) < turbo_duty_cycle);
-                  }
-               }
-            }
+               res = input_turbo_hold_apply(&input_st->turbo_btns,
+                     &input_st->hold_btns, settings, port, id, res);
          }
 
          break;
@@ -4660,9 +4604,6 @@ static int16_t input_state_device(
                               }
                            }
                         }
-#endif
-#ifdef HAVE_OPENXR
-                        res = input_openxr_analog(port, idx, id, res);
 #endif
                      }
                   }
@@ -5044,28 +4985,6 @@ static bool input_state_device_mask_plain(
       if (!menu_alive && settings->bools.input_remap_binds_enable)
          held &= ident;
       res |= held;
-   }
-#endif
-
-#ifdef HAVE_OPENXR
-   /* The headset's controllers, by the overlay's rule. */
-   {
-      unsigned held = 0;
-      for (id = 0; id < RARCH_FIRST_CUSTOM_BIND; id++)
-         if (input_openxr_button(port, id))
-            held |= (1u << id);
-      if (held)
-      {
-#ifdef HAVE_MENU
-         bool menu_alive = (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE)
-            ? true : false;
-#else
-         bool menu_alive = false;
-#endif
-         if (!menu_alive && settings->bools.input_remap_binds_enable)
-            held &= ident;
-         res |= held;
-      }
    }
 #endif
 
@@ -5956,14 +5875,13 @@ static bool input_overlay_update_apng_frame(input_overlay_t *ol,
    const uint32_t *pix = ol->anim_2frame_pix[i];
    size_t frame_len;
 
-   if (     !pix || !s || !s->num_slots || s->inflight
-         || !gfx_surface_slot_writable(s, 0))
+   if (!pix || !s || !s->num_slots || s->inflight)
       return false;
 
    frame_len = VIDEO_SCALE_AREA(s->dims);
-   memcpy(s->slots[0], pix + (target_frame ? frame_len : 0),
-         frame_len * sizeof(uint32_t));
-   switch (gfx_surface_submit(s, 0, ol->images[i]->supports_rgba))
+   switch (gfx_surface_submit_pixels(s,
+            pix + (target_frame ? frame_len : 0),
+            ol->images[i]->supports_rgba))
    {
       case GFX_SURFACE_SUBMIT_DONE:
       case GFX_SURFACE_SUBMIT_QUEUED:
@@ -6058,6 +5976,7 @@ void input_overlay_animate(input_overlay_t *ol, retro_time_t now)
          cb.surface = input_overlay_anim_surface;
          cb.shown   = input_overlay_anim_shown;
          cb.feed    = NULL;
+         cb.feed_user = NULL;
          /* Overlays loop whatever the file says: an animated control
           * surface is for that. */
          if (!(gsp = gfx_surface_player_new(ol->anim_stream[i],
@@ -7917,7 +7836,7 @@ static bool input_keyboard_line_event(
 #ifdef HAVE_LANGEXTRA
    static uint32_t composition = 0;
    /* reset composition, when edit box is opened. */
-   if (state->size == 0)
+   if (state->size == 0 || state->select_all)
       composition = 0;
    /* reset composition, when 1 byte(=english) input */
    if (character && character < 0xff)
@@ -7969,7 +7888,14 @@ static bool input_keyboard_line_event(
    }
    else if (c == '\b' || c == '\x7f') /* 0x7f is ASCII for del */
    {
-      if (state->ptr && state->buffer)
+      if (state->select_all)
+      {
+         state->buffer[0] = '\0';
+         state->ptr = state->size = 0;
+         state->select_all = false;
+         word = state->buffer;
+      }
+      else if (state->ptr && state->buffer)
       {
          size_t ptr = state->ptr;
 
@@ -7990,20 +7916,10 @@ static bool input_keyboard_line_event(
    }
    else if (ISPRINT(c))
    {
-      char *newbuf = (char*)
-         realloc(state->buffer, state->size + 2);
-      if (!newbuf)
+      size_t new_size = state->select_all ? 1 : state->size + 1;
+      input_keyboard_line_append(state, &c, 1);
+      if (state->select_all || state->size != new_size)
          return false;
-
-      memmove(newbuf + state->ptr + 1,
-            newbuf + state->ptr,
-            state->size - state->ptr + 1);
-      newbuf[state->ptr] = c;
-      state->ptr++;
-      state->size++;
-      newbuf[state->size] = '\0';
-
-      state->buffer = newbuf;
 
       array[0] = c;
       array[1] = 0;
@@ -8390,9 +8306,13 @@ float input_core_get_sensor_state(unsigned port, unsigned id)
 
 const char *joypad_driver_name(unsigned i)
 {
-   if (!input_driver_st.primary_joypad || !input_driver_st.primary_joypad->name)
+   const input_device_driver_t *joypad = input_driver_st.primary_joypad;
+#ifdef HAVE_OPENXR
+   joypad = input_openxr_joypad(joypad);
+#endif
+   if (!joypad || !joypad->name)
       return NULL;
-   return input_driver_st.primary_joypad->name(i);
+   return joypad->name(i);
 }
 
 static void input_rumble_forget(void);
@@ -8698,6 +8618,10 @@ void input_driver_registry_restart(void)
 
    input_registry_restart(&input_registry, port_of_slot, MAX_USERS);
    input_registry_restart_time = cpu_features_get_time_usec();
+#ifdef HAVE_OPENXR
+   /* no joypad driver reports the headset's controllers */
+   input_openxr_reannounce();
+#endif
 }
 
 /* Every controller the driver had before it restarted is back. */
@@ -8742,6 +8666,34 @@ static void input_driver_registry_restore_ports(void)
             " had.\n");
 }
 
+#ifdef HAVE_OPENXR
+/* For the headset's controllers, moved on by a pad that took their
+ * slot: a runtime matter, as a restart's is. */
+void input_driver_exchange_ports(unsigned a, unsigned b)
+{
+   unsigned i;
+   settings_t *settings = config_get_ptr();
+   unsigned *index      = settings->uints.input_joypad_index;
+
+   if (a >= MAX_USERS || b >= MAX_USERS || a == b)
+      return;
+   if (     !input_ports_runtime_active
+         || memcmp(index, input_ports_runtime, sizeof(input_ports_runtime)))
+      memcpy(input_ports_configured, index, sizeof(input_ports_configured));
+   for (i = 0; i < MAX_USERS; i++)
+   {
+      if (index[i] == a)
+         index[i] = b;
+      else if (index[i] == b)
+         index[i] = a;
+   }
+   memcpy(input_ports_runtime, index, sizeof(input_ports_runtime));
+   input_ports_runtime_active = memcmp(input_ports_runtime,
+         input_ports_configured, sizeof(input_ports_runtime)) != 0;
+   input_driver_deadzones_refresh();
+}
+#endif
+
 void input_driver_registry_connect(unsigned slot, const char *provider,
       const char *name, const char *phys, uint16_t vid, uint16_t pid)
 {
@@ -8759,6 +8711,9 @@ void input_driver_registry_connect(unsigned slot, const char *provider,
    rec    = input_registry_get(&input_registry, handle);
 
    input_snapshot_forget_pad(slot);
+#ifdef HAVE_OPENXR
+   input_openxr_slot_connected(slot, provider);
+#endif
 
    if (rec)
       RARCH_LOG("[Input] Device %u, \"%s\" (%04x:%04x, %s): %s slot %u.\n",
@@ -10539,6 +10494,11 @@ void input_driver_init_command(input_driver_state_t *input_st,
 #ifdef HAVE_STDIN_CMD
    bool input_stdin_cmd_enable       = settings->bools.stdin_cmd_enable;
 
+#ifdef HAVE_MCP
+   /* --mcp-stdio has stdin */
+   if (command_mcp_stdio_claimed())
+      input_stdin_cmd_enable = false;
+#endif
    if (input_stdin_cmd_enable)
    {
       input_driver_state_t *input_st = &input_driver_st;
@@ -10561,6 +10521,16 @@ void input_driver_init_command(input_driver_state_t *input_st,
             started = false;
          }
       }
+   }
+#endif
+
+#ifdef HAVE_MCP
+   /* in the slot the stdin interface, which it replaces, would take */
+   if (     command_mcp_stdio_claimed()
+         && !(input_st->command[0] = command_mcp_stdio_new()))
+   {
+      RARCH_ERR("[MCP] Failed to start the MCP server on stdio.\n");
+      started = false;
    }
 #endif
 
@@ -10609,7 +10579,19 @@ void input_driver_init_command(input_driver_state_t *input_st,
                   (uint16_t)settings->uints.mcp_server_port,
                   settings->arrays.mcp_server_bind_address, token)))
       {
+         /* on screen too: a client talking to another RetroArch on
+          * that port would otherwise never know */
+         char msg[256];
+         const char *addr = settings->arrays.mcp_server_bind_address;
+         size_t _len      = (size_t)snprintf(msg, sizeof(msg),
+               msg_hash_to_str(MSG_MCP_SERVER_NOT_LISTENING),
+               *addr ? addr : "127.0.0.1",
+               settings->uints.mcp_server_port);
          RARCH_ERR("[MCP] Failed to start the MCP server.\n");
+         if (_len >= sizeof(msg))
+            _len = sizeof(msg) - 1;
+         runloop_msg_queue_push(msg, _len, 1, 300, false, NULL,
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_ERROR);
          started = false;
       }
    }
@@ -10655,6 +10637,7 @@ void input_driver_deinit_command(input_driver_state_t *input_st)
       input_st->command[i] = NULL;
     }
    input_st->command_config[0] = '\0';
+   input_driver_command_release(MAX_USERS);
 }
 #endif
 
@@ -11328,7 +11311,6 @@ void input_pad_connect(unsigned port, input_device_driver_t *driver)
 
 static bool input_keys_pressed_other_sources(
       input_driver_state_t *input_st,
-      unsigned port,
       unsigned i,
       input_bits_t *p_new_state)
 {
@@ -11357,12 +11339,8 @@ static bool input_keys_pressed_other_sources(
 #endif
 
 #ifdef HAVE_OPENXR
-   if (input_openxr_button(port, i))
-   {
-      if (i < 16)
-         input_st->system_buttons_not_overlay |= (uint16_t)(1u << i);
+   if (input_openxr_hotkey(i))
       return true;
-   }
 #endif
 
 #ifdef HAVE_OVERLAY
@@ -11378,7 +11356,7 @@ static bool input_keys_pressed_other_sources(
  * one word: a command interface and the remote pad - whose buttons are
  * not the overlay's alone, which is noted - and then the overlay. */
 static unsigned input_pad_buttons_other_sources(
-      input_driver_state_t *input_st, unsigned port)
+      input_driver_state_t *input_st)
 {
    unsigned held = 0;
 #ifdef HAVE_COMMAND
@@ -11397,15 +11375,6 @@ static unsigned input_pad_buttons_other_sources(
    /* Only process key presses related to game input if using Remote RetroPad */
    if (input_st->remote)
       held |= (unsigned)(input_st->remote_st_ptr.buttons[0] & 0xffff);
-#endif
-
-#ifdef HAVE_OPENXR
-   {
-      unsigned i;
-      for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
-         if (input_openxr_button(port, i))
-            held |= (1u << i);
-   }
 #endif
 
    input_st->system_buttons_not_overlay |= (uint16_t)held;
@@ -11473,12 +11442,15 @@ static void input_hotkeys_maybe_held(input_driver_state_t *input_st,
    maybe[RARCH_MENU_TOGGLE >> 5] |= (1u << (RARCH_MENU_TOGGLE & 31));
 #ifdef HAVE_OPENXR
    /* The headset's own are behind no key or pad. */
-   if (input_openxr_button(port, RARCH_HEADSET_RECENTER))
+   if (input_openxr_hotkey(RARCH_HEADSET_RECENTER))
       maybe[RARCH_HEADSET_RECENTER >> 5]     |=
          (1u << (RARCH_HEADSET_RECENTER & 31));
-   if (input_openxr_button(port, RARCH_LASER_POINTER_TOGGLE))
+   if (input_openxr_hotkey(RARCH_LASER_POINTER_TOGGLE))
       maybe[RARCH_LASER_POINTER_TOGGLE >> 5] |=
          (1u << (RARCH_LASER_POINTER_TOGGLE & 31));
+   if (input_openxr_hotkey(RARCH_HEADSET_VIEW_TOGGLE))
+      maybe[RARCH_HEADSET_VIEW_TOGGLE >> 5]  |=
+         (1u << (RARCH_HEADSET_VIEW_TOGGLE & 31));
 #endif
 }
 
@@ -13071,7 +13043,7 @@ static void input_keys_pressed(
        * the overlay holds. They were gone through a button at a time,
        * each asking every other source in turn. */
       unsigned held    = ((unsigned)ret & 0xffff)
-         | input_pad_buttons_other_sources(input_st, port);
+         | input_pad_buttons_other_sources(input_st);
       unsigned deliver = held;
 
       if (held)
@@ -13126,7 +13098,7 @@ static void input_keys_pressed(
 
          if (     bit_pressed
                || (i == RARCH_MENU_TOGGLE && input_st->platform_menu_button)
-               || input_keys_pressed_other_sources(input_st, port, i, p_new_state))
+               || input_keys_pressed_other_sources(input_st, i, p_new_state))
          {
             if (!(input_st->flags & INP_FLAG_MENU_PRESS_PENDING))
                input_st->flags &= ~INP_FLAG_MENU_PRESS_CANCEL;
@@ -13219,7 +13191,7 @@ static void input_keys_pressed(
 
          i = (hot_word << 5) + (unsigned)compat_ctz(hot);
 
-         other_pressed = input_keys_pressed_other_sources(input_st, port, i, p_new_state);
+         other_pressed = input_keys_pressed_other_sources(input_st, i, p_new_state);
          bit_pressed   = INPUT_HOT_BIT(input_hotkey_set.valid, i)
                && input_state_wrap(
                      input_st->current_driver,
@@ -13231,12 +13203,6 @@ static void input_keys_pressed(
                      port, RETRO_DEVICE_JOYPAD, 0,
                      i);
 
-#if defined(HAVE_OPENXR) && defined(ANDROID)
-         /* the headset's menu button, held: on whichever port the
-          * hotkeys are read - this loop runs for that one alone */
-         if (i == RARCH_MENU_TOGGLE)
-            bit_pressed = bit_pressed || openxr_input_menu_long_press();
-#endif
          if (     bit_pressed
                || other_pressed
                || (i == RARCH_MENU_TOGGLE && input_st->platform_menu_button))
@@ -13839,6 +13805,11 @@ const char *input_driver_keyboard_line_view(size_t *cursor)
    return line->buffer;
 }
 
+bool input_driver_keyboard_line_selected(void)
+{
+   return input_driver_st.keyboard_line.select_all;
+}
+
 /* The keys go to the text and not to the on-screen keyboard: the text
  * box has the focus (Tab moves it). */
 bool input_driver_keyboard_textbox_focus(void)
@@ -13869,7 +13840,7 @@ static enum input_text_type input_text_entry_type_val;
  * label and type. */
 const char **input_driver_text_entry_open(void *userdata,
       input_keyboard_line_complete_t cb,
-      const char *label, enum input_text_type type)
+      const char *label, enum input_text_type type, const char *initial_text)
 {
    const char **buffer;
 
@@ -13884,18 +13855,36 @@ const char **input_driver_text_entry_open(void *userdata,
    buffer = input_keyboard_start_line(userdata,
          &input_driver_st.keyboard_line, cb);
    input_keyboard_capture_hold(INPUT_KEYBOARD_CAPTURE_TEXT);
+   if (!string_is_empty(initial_text))
+   {
+      input_driver_keyboard_line_append(initial_text, strlen(initial_text));
+      input_driver_st.keyboard_line.select_all =
+            input_driver_st.keyboard_line.size > 0;
+   }
 
 #if defined(HAVE_COCOATOUCH)
-   ios_keyboard_start((char**)buffer,
+   if (ios_keyboard_start((char**)buffer,
          &input_driver_st.keyboard_line.size,
          &input_driver_st.keyboard_line.ptr,
-         label, cb, userdata);
+         label, cb, userdata))
+   {
+      input_driver_st.keyboard_line.select_all = false;
+      input_driver_st.keyboard_line.capacity   =
+            INPUT_NATIVE_KEYBOARD_BUFFER_SIZE - 1;
+      input_driver_st.keyboard_line.fixed      = true;
+   }
 #elif defined(ANDROID)
-   if (config_get_ptr()->bools.input_android_system_keyboard)
-      android_keyboard_start((char**)buffer,
+   if (     config_get_ptr()->bools.input_android_system_keyboard
+         && android_keyboard_start((char**)buffer,
             &input_driver_st.keyboard_line.size,
             &input_driver_st.keyboard_line.ptr,
-            label, cb, userdata);
+            label, cb, userdata))
+   {
+      input_driver_st.keyboard_line.select_all = false;
+      input_driver_st.keyboard_line.capacity   =
+            INPUT_NATIVE_KEYBOARD_BUFFER_SIZE - 1;
+      input_driver_st.keyboard_line.fixed      = true;
+   }
 #endif
 
    return buffer;
@@ -13938,6 +13927,8 @@ void input_driver_osk_press(enum osk_type *osk_idx, int ptr,
  * remembered as the last one typed, as the on-screen keyboard's are. */
 void input_driver_keyboard_line_type(const char *word, size_t len)
 {
+   if (input_driver_st.keyboard_line.select_all && len)
+      input_driver_st.osk_textbox_focus = true;
    input_keyboard_line_append(&input_driver_st.keyboard_line, word, len);
    osk_update_last_codepoint(&input_driver_st.osk_last_codepoint,
          &input_driver_st.osk_last_codepoint_len, word);
@@ -14545,6 +14536,9 @@ void input_driver_capture_pad(unsigned pad, bool poll,
    unsigned i;
    const input_device_driver_t *joypad = input_driver_st.primary_joypad;
 
+#ifdef HAVE_OPENXR
+   joypad = input_openxr_joypad(joypad);
+#endif
    if (!joypad)
       return;
    {
@@ -14601,6 +14595,11 @@ void input_driver_autoconfigure_pad(unsigned pad)
 {
    const input_device_driver_t *joypad = input_driver_st.primary_joypad;
 
+#ifdef HAVE_OPENXR
+   /* the headset's own, not the joypad driver's */
+   if (input_openxr_autoconfigure(pad))
+      return;
+#endif
    if (joypad)
       input_autoconfigure_connect(joypad->name(pad),
             NULL, NULL, joypad->ident,
@@ -14767,7 +14766,7 @@ void input_driver_poll(void)
    if (input && input->poll)
       input->poll(input_st->current_data);
 #ifdef HAVE_OPENXR
-   input_openxr_poll(settings->uints.video_openxr_controllers,
+   input_openxr_poll(max_users, settings->uints.video_openxr_controllers,
          settings->uints.video_openxr_laser, input_axis_threshold);
 #endif
    input_poll_generation++;
@@ -15254,10 +15253,6 @@ void input_driver_poll(void)
                         current_button_value |= BIT256_GET(ol_state->buttons, j);
                   }
 #endif
-#ifdef HAVE_OPENXR
-                  if (input_openxr_button((unsigned)i, (unsigned)j))
-                     current_button_value = 1;
-#endif
                   /* Press */
                   if ((current_button_value == 1)
                         && !MAPPER_GET_KEY(handle, remap_key))
@@ -15320,10 +15315,6 @@ void input_driver_poll(void)
                      if (ol_state)
                         current_button_value |= BIT256_GET(ol_state->buttons, j);
                   }
-#endif
-#ifdef HAVE_OPENXR
-                  if (input_openxr_button((unsigned)i, (unsigned)j))
-                     current_button_value = 1;
 #endif
                   remap_valid                   =
                         (current_button_value == 1)
@@ -15645,6 +15636,108 @@ static int16_t input_socd_clean(input_driver_state_t *input_st,
    return (int16_t)((uint16_t)view & ~drop);
 }
 
+static void input_cmd_update(input_driver_state_t *input_st)
+{
+   unsigned p, a;
+   bool     any = false;
+   for (p = 0; p < MAX_USERS && !any; p++)
+   {
+      any = input_st->cmd_buttons[p] != 0;
+      for (a = 0; a < 4 && !any; a++)
+         any = input_st->cmd_analog[p][a] != 0;
+   }
+   input_st->cmd_input = any;
+}
+
+void input_driver_command_hold(unsigned port, unsigned control,
+      int16_t value)
+{
+   input_driver_state_t *input_st = &input_driver_st;
+   if (port >= MAX_USERS || control >= 20)
+      return;
+   if (control >= 16)
+      input_st->cmd_analog[port][control - 16] = value;
+   else if (value)
+      input_st->cmd_buttons[port] |=  (uint16_t)(1u << control);
+   else
+      input_st->cmd_buttons[port] &= ~(uint16_t)(1u << control);
+   input_cmd_update(input_st);
+}
+
+void input_driver_command_release(unsigned port)
+{
+   input_driver_state_t *input_st = &input_driver_st;
+   if (port < MAX_USERS)
+   {
+      input_st->cmd_buttons[port] = 0;
+      memset(input_st->cmd_analog[port], 0,
+            sizeof(input_st->cmd_analog[port]));
+   }
+   else
+   {
+      memset(input_st->cmd_buttons, 0, sizeof(input_st->cmd_buttons));
+      memset(input_st->cmd_analog,  0, sizeof(input_st->cmd_analog));
+   }
+   input_cmd_update(input_st);
+}
+
+bool input_driver_replay_recording(void)
+{
+#ifdef HAVE_BSV_MOVIE
+   input_driver_state_t *input_st = &input_driver_st;
+   return BSV_MOVIE_IS_RECORDING();
+#else
+   return false;
+#endif
+}
+
+uint16_t input_driver_command_held(unsigned port, int16_t *analog)
+{
+   input_driver_state_t *input_st = &input_driver_st;
+   if (port >= MAX_USERS)
+   {
+      memset(analog, 0, 4 * sizeof(*analog));
+      return 0;
+   }
+   memcpy(analog, input_st->cmd_analog[port], 4 * sizeof(*analog));
+   return input_st->cmd_buttons[port];
+}
+
+/* What SET_INPUT holds, over what the port reads */
+static int16_t input_cmd_state(input_driver_state_t *input_st,
+      unsigned port, unsigned device, unsigned idx, unsigned id,
+      int16_t result)
+{
+   uint16_t held = input_st->cmd_buttons[port];
+
+   switch (device & RETRO_DEVICE_MASK)
+   {
+      case RETRO_DEVICE_JOYPAD:
+         if (idx == 0)
+         {
+            if (id == RETRO_DEVICE_ID_JOYPAD_MASK)
+               return (int16_t)((uint16_t)result | held);
+            if (id < 16 && (held & (1u << id)))
+               return 1;
+         }
+         break;
+      case RETRO_DEVICE_ANALOG:
+         if (idx == RETRO_DEVICE_INDEX_ANALOG_BUTTON)
+         {
+            if (id < 16 && (held & (1u << id)))
+               return 0x7fff;
+         }
+         else if (   idx <= RETRO_DEVICE_INDEX_ANALOG_RIGHT
+                  && id  <= RETRO_DEVICE_ID_ANALOG_Y
+                  && input_st->cmd_analog[port][idx * 2 + id])
+            return input_st->cmd_analog[port][idx * 2 + id];
+         break;
+      default:
+         break;
+   }
+   return result;
+}
+
 int16_t input_driver_state_wrapper(unsigned port, unsigned device,
       unsigned idx, unsigned id)
 {
@@ -15798,6 +15891,9 @@ int16_t input_driver_state_wrapper(unsigned port, unsigned device,
          }
       }
    }
+
+   if (input_st->cmd_input)
+      result = input_cmd_state(input_st, port, device, idx, id, result);
 
    /* Register any analog stick input requests for
     * this 'virtual' (core) port.  The first one switches
@@ -16027,6 +16123,9 @@ size_t input_first_press_describe(unsigned user, unsigned port,
    const char *name     = NULL;
    bool keys            = false;
 
+#ifdef HAVE_OPENXR
+   joypad = input_openxr_joypad(joypad);
+#endif
    if (joypad && joypad->query_pad && joypad->query_pad(joy_idx))
    {
       name = input_config_get_device_display_name(joy_idx);
@@ -16395,9 +16494,6 @@ void input_driver_collect_system_input(input_driver_state_t *input_st,
             for (a = RETRO_DEVICE_ID_ANALOG_X; a <= RETRO_DEVICE_ID_ANALOG_Y; a++)
             {
                int16_t ret = stick_xy[a];
-#ifdef HAVE_OPENXR
-               ret = input_openxr_analog(port, s, a, ret);
-#endif
 
                if (ret)
                {
@@ -16930,11 +17026,22 @@ static void input_keyboard_event_now_act(bool down, unsigned code,
          return;
       }
 
+      if (line->select_all
+            && (code == RETROK_LEFT || code == RETROK_RIGHT
+               || (character >= 0x20 && character != 0x7f)))
+         input_st->osk_textbox_focus = true;
+
       if (input_st->osk_textbox_focus)
       {
          switch (code)
          {
             case RETROK_LEFT:
+               if (line->select_all)
+               {
+                  line->select_all = false;
+                  line->ptr = 0;
+                  return;
+               }
                if (line->ptr && line->buffer)
                {
                   line->ptr--;
@@ -16948,6 +17055,12 @@ static void input_keyboard_event_now_act(bool down, unsigned code,
                }
                return;
             case RETROK_RIGHT:
+               if (line->select_all)
+               {
+                  line->select_all = false;
+                  line->ptr = line->size;
+                  return;
+               }
                if (line->buffer && line->ptr < line->size)
                {
                   line->ptr++;
@@ -16961,9 +17074,11 @@ static void input_keyboard_event_now_act(bool down, unsigned code,
                }
                return;
             case RETROK_UP:
+               line->select_all = false;
                line->ptr = 0;
                return;
             case RETROK_DOWN:
+               line->select_all = false;
                line->ptr = line->size;
                return;
             default:

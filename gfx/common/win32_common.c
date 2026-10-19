@@ -610,7 +610,6 @@ void win32_get_video_size(void *data,
 static void win32_resize_after_display_change(HWND hwnd, HMONITOR monitor)
 {
    MONITORINFO info;
-   memset(&info, 0, sizeof(info));
    info.cbSize = sizeof(info);
    if (GetMonitorInfo(monitor, &info))
       SetWindowPos(hwnd, 0, 0, 0,
@@ -1003,10 +1002,6 @@ static LRESULT CALLBACK wnd_proc_common(
       case WM_CLOSE:
       case WM_DESTROY:
       case WM_QUIT:
-         /* a window that was left up for a driver that did not take
-          * it, being taken down */
-         if (hwnd && hwnd == win32_retiring_hwnd)
-            break;
 #if !defined(_XBOX)
          win32_sizemove_abort();
 #endif
@@ -1430,24 +1425,17 @@ static LRESULT win32_wnd_proc_route(HWND hwnd,
    /* The focus lost by a window that is no longer the main window.
     *
     * The input driver keeps one focus for the process, and the mouse
-    * is clipped for the process: both go by the main window. A window
-    * that has been replaced still loses the focus, and can lose it
-    * after its replacement has gained it - the loss would then clear
-    * the driver's focus and the keyboard would be dead until the next
-    * Alt-Tab. Two ways that happens:
-    *
-    * - A window left up for a driver that did not take it loses the
-    *   focus as it is destroyed (win32_retiring_hwnd).
-    * - Threaded video turned on or off moves the window to another
-    *   thread: the new window is another thread's, and the old one is
-    *   told it lost the focus through its own thread's queue, which
-    *   that thread gets to after the new window is up.
-    *
-    * Neither is the process losing the focus, and neither is passed
-    * on. If the focus does leave, the main window is told so itself. */
+    * is clipped for the process: both go by the main window. Threaded
+    * video turned on or off moves the window to another thread: the
+    * new window is another thread's, and the old one is told it lost
+    * the focus through its own thread's queue, which that thread gets
+    * to after the new window is up - the loss would then clear the
+    * driver's focus and the keyboard would be dead until the next
+    * Alt-Tab. That is not the process losing the focus, and it is not
+    * passed on. If the focus does leave, the main window is told so
+    * itself. */
    if (     message == WM_KILLFOCUS
-         && (   hwnd == win32_retiring_hwnd
-             || (main_window.hwnd && hwnd != main_window.hwnd)))
+         && main_window.hwnd && hwnd != main_window.hwnd)
       route &= ~(WIN32_ROUTE_INPUT | WIN32_ROUTE_CLIP_ON | WIN32_ROUTE_CLIP_OFF);
 
 #ifdef HAVE_CLIP_WINDOW
@@ -1456,9 +1444,7 @@ static LRESULT win32_wnd_proc_route(HWND hwnd,
       win32_clip_window((route & WIN32_ROUTE_CLIP_ON) != 0);
 #endif
 
-   /* Nothing from a window on its way out reaches the input driver. */
    if (     (route & WIN32_ROUTE_INPUT)
-         && hwnd != win32_retiring_hwnd
          && win32_wnd_input_message(message, wparam, lparam))
       return 0;
 
@@ -1648,6 +1634,14 @@ void win32_text_entry(bool active)
 LRESULT CALLBACK win32_window_proc(HWND hwnd, UINT message,
       WPARAM wparam, LPARAM lparam)
 {
+   /* A window left up for a driver that did not take it, being taken
+    * down: the main window's state, the input driver and the video
+    * driver are the next driver's, and what the desktop sends a
+    * window on its way out (its size, position, activation and focus)
+    * is none of theirs. */
+   if (hwnd == win32_retiring_hwnd)
+      return DefWindowProc(hwnd, message, wparam, lparam);
+
    if (message == WIN32_WM_TEXT_ENTRY)
    {
       win32_ime_sync(hwnd);
@@ -1756,6 +1750,10 @@ void win32_window_proc_setup(enum win32_window_family family)
  * it now (win32_window_pixel_format_fits()); otherwise it goes and a
  * new one is made.
  *
+ * An OpenGL or Vulkan window also carries the way it is presented on,
+ * native or through DXGI, as its tag (win32_window_tag_presentation()):
+ * a window is not taken by a driver presenting the other way.
+ *
  * And for a Direct3D driver that has given its window a tag
  * (win32_window_tag()), which says two things: that it frees
  * everything it had on the window before it leaves it, and that it
@@ -1776,6 +1774,19 @@ static bool win32_window_pixel_format_fits(HWND hwnd);
 void win32_window_tag(const char *tag)
 {
    win32_wnd_tag = tag;
+}
+
+/* An OpenGL or Vulkan window that has carried a DXGI flip-model swap
+ * chain does not go back to the driver's own presentation, and one
+ * presented natively does not take a swap chain reliably either: the
+ * presentation path is part of what the window is. A driver of either
+ * family says which one it will use, and a kept window is taken only
+ * by a driver using the same one; changing the setting, or an
+ * override that changes it for one core, gets a new window. */
+void win32_window_tag_presentation(bool dxgi)
+{
+   static const char tag_dxgi[] = "dxgi";
+   win32_wnd_tag = dxgi ? tag_dxgi : NULL;
 }
 
 bool win32_window_was_taken(void)
@@ -2009,6 +2020,15 @@ static bool win32_window_create(void *data, unsigned style,
       win32_wnd_taken = true;
       free(title_local);
 
+      /* A window minimised has no client area, and the driver makes
+       * its surface for the one it finds below (a Vulkan swapchain is
+       * refused at 0x0): it is put back up first, as a new window
+       * would be shown, and before it is restyled - a style without
+       * WS_MINIMIZE on a window still minimised leaves the two out of
+       * step. */
+      if (IsIconic(hwnd))
+         ShowWindow(hwnd, SW_RESTORE);
+
       /* win32_set_window() gives a windowed window its menu again:
        * the same one, which is kept in the meantime */
       if (menu)
@@ -2067,10 +2087,11 @@ static bool win32_window_create(void *data, unsigned style,
    g_win32->taskbar_message            =
       RegisterWindowMessage("TaskbarButtonCreated");
 
-   memset(&notification_filter, 0, sizeof(notification_filter));
    notification_filter.dbcc_size       = sizeof(DEV_BROADCAST_DEVICEINTERFACE);
    notification_filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
    notification_filter.dbcc_classguid  = GUID_DEVINTERFACE_HID;
+   notification_filter.dbcc_reserved   = 0;
+   notification_filter.dbcc_name[0]    = 0;
    /* a window taken back is still registered */
    if (!reused)
       notification_handler             = RegisterDeviceNotification(
@@ -2192,7 +2213,6 @@ retro_time_t win32_dwm_last_vblank_time(void)
    if (!get_timing)
       return 0;
 
-   memset(&info, 0, sizeof(info));
    info.cbSize = sizeof(info);
    if (FAILED(get_timing(NULL, &info)))
       return 0;
@@ -2729,6 +2749,15 @@ static bool win32_window_change_fullscreen(unsigned dims, bool fullscreen,
       windowed_rect_of = hwnd;
    }
 
+   /* A fullscreen size of 0x0 means the monitor's own: the display
+    * mode asked for and the window put over it are the monitor's
+    * current size, as a driver starting up resolves it. */
+   if (fullscreen && (!width || !height))
+   {
+      width  = mon_rect.right  - mon_rect.left;
+      height = mon_rect.bottom - mon_rect.top;
+   }
+
    if (!win32_set_style(&current_mon, &hm_to_use, &width, &height,
             fullscreen, windowed_full, &rect, &mon_rect, &style))
       return false;
@@ -2939,12 +2968,18 @@ static int win32_try_scrgb_pixel_format(HDC target_hdc)
    int          result    = 0;
    static const char *probe_class = "RetroArch-WGL-Probe";
 
-   memset(&wc, 0, sizeof(wc));
    wc.cbSize        = sizeof(wc);
    wc.style         = CS_OWNDC;
    wc.lpfnWndProc   = DefWindowProcA;
    wc.hInstance     = GetModuleHandle(NULL);
    wc.lpszClassName = probe_class;
+   wc.cbClsExtra    = 0;
+   wc.cbWndExtra    = 0;
+   wc.hIcon         = NULL;
+   wc.hCursor       = NULL;
+   wc.hbrBackground = NULL;
+   wc.lpszMenuName  = NULL;
+   wc.hIconSm       = NULL;
 
    if (!RegisterClassExA(&wc))
       return 0;

@@ -85,8 +85,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.ccache
           key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
@@ -100,7 +103,7 @@ jobs:
           export CCACHE_DIR="$HOME/.ccache"
           echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
-          ccache -M 500M
+          ccache -M 250M
           ccache -z
 
       - name: Settings lists have room for what they are given
@@ -116,7 +119,7 @@ jobs:
           # each build profile, what every list is given against the
           # size it is allocated with, so that the next one is found
           # here.
-          timeout 300 python3 tools/settings_capacity_check.py
+          timeout 300 tools/check.sh tools/settings_capacity_check.c
           echo "[pass] settings_capacity_check"
 
       - name: Build and run pipeline_migration_test (ASan + UBSan)
@@ -135,9 +138,23 @@ jobs:
           # multi-character values are untouched. The rule under test
           # is restated from config_load_file(), which needs most of the
           # frontend to run; a change to one must be made in the other.
-          make clean all SANITIZER=address,undefined
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
           test -x pipeline_migration_test
           ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
              UBSAN_OPTIONS=print_stacktrace=1 timeout 60 \
              ./pipeline_migration_test
           echo "[pass] pipeline_migration_test (ASan)"
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}

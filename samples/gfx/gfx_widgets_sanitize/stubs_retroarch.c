@@ -118,12 +118,14 @@ const char *font_driver_language_font_file(void) { return NULL; }
 
 void font_driver_bind_block(void *font_data, void *block)
 { (void)font_data; (void)block; }
-void font_driver_free(font_data_t *font) { (void)font; }
-
-/* Retiring a font for a deferred release. No frame clock here and
- * nothing owning a GPU atlas, so this is the same no-op as the free
- * above. */
-void font_driver_free_deferred(font_data_t *font) { (void)font; }
+/* Counted, so a test can tell a font freed here from one handed to
+ * its owner. No GPU atlas behind either. */
+unsigned stub_fonts_freed;
+unsigned stub_fonts_retired;
+void font_driver_free(font_data_t *font)
+{ if (font) stub_fonts_freed++; }
+void font_driver_free_deferred(font_data_t *font)
+{ if (font) stub_fonts_retired++; }
 
 /* Whether the font already loaded is the one being asked for.
  * gfx_display_font_file() below never produces one, so the honest
@@ -260,6 +262,9 @@ static settings_t s_settings;
 settings_t *config_get_ptr(void) { return &s_settings; }
 retro_time_t cpu_features_get_time_usec(void) { return 0; }
 void video_thread_status_text(const char *s) { (void)s; }
+bool video_driver_thread_wrapper_active(void) { return false; }
+bool video_thread_run_queued(custom_command_method_t func, void *data)
+{ (void)func; (void)data; return false; }
 
 /* --- video driver --- */
 uint32_t video_driver_get_disp_flags(void) { return 0; }
