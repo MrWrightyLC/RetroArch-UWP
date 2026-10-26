@@ -547,6 +547,8 @@ static void gfx_surface_done(void *user, uintptr_t handle)
    }
    else if (s->node.kind == VIDEO_THREAD_ASYNC_LOAD)
    {
+      /* A compressed payload was only lent to the upload */
+      s->img.compressed = NULL;
       if (handle)
       {
          /* The new texture has read the frame, wherever it lay; the
@@ -646,6 +648,41 @@ static void gfx_surface_done(void *user, uintptr_t handle)
     * texture loads do). dropped is cleared on the next completion. */
    if (s->release)
       s->release(s->user, s, slot);
+}
+#endif
+
+#ifdef HAVE_THREADS
+/* Post the GPU-native payload @img carries to the video thread as a
+ * load. The descriptor travels in the surface; the payload is read
+ * until the completion. False when the wrapper would not take it. */
+static bool gfx_surface_post_compressed(gfx_surface_t *s,
+      const struct texture_image *img)
+{
+   s->img              = *img;
+   s->img.pixels       = NULL;
+   s->img.planar       = NULL;
+   s->node.kind        = VIDEO_THREAD_ASYNC_LOAD;
+   s->node.img         = &s->img;
+   s->node.handle      = 0;
+   s->node.filter      = s->filter;
+   s->node.done        = gfx_surface_done;
+   s->node.user        = s;
+   s->node.release     = NULL;
+   s->node.dropped     = 0;
+   s->node.made        = 0;
+   s->node.lend        = 0;
+   s->node.lend_refresh = 0;
+   s->node.lend_padded = 0;
+   s->node.lent_idx[0] = s->node.lent_idx[1] = -1;
+   s->node.lent_mem[0] = s->node.lent_mem[1] = NULL;
+   if (video_thread_async_post(&s->node))
+   {
+      s->inflight      = 1;
+      s->inflight_slot = 0;
+      return true;
+   }
+   s->img.compressed   = NULL;
+   return false;
 }
 #endif
 
@@ -1030,6 +1067,52 @@ enum gfx_surface_submit_result gfx_surface_submit_external(gfx_surface_t *s,
    return r;
 }
 
+enum gfx_surface_submit_result gfx_surface_submit_compressed(
+      gfx_surface_t *s, struct texture_image *img,
+      gfx_surface_release_t release, void *user)
+{
+   enum gfx_surface_submit_result r = GFX_SURFACE_SUBMIT_FAILED;
+   uintptr_t tex                    = 0;
+
+   if (     !s || s->num_slots || !img || !img->compressed
+         || !video_driver_supports_texture_format(img->compressed->format))
+   {
+      gfx_surface_count(r);
+      return r;
+   }
+   if (s->inflight)
+   {
+      GFX_INSTR_INC(GFX_INSTR_SUBMIT_BUSY);
+      return GFX_SURFACE_SUBMIT_BUSY;
+   }
+   s->release = release;
+   s->user    = user;
+   s->dims    = VIDEO_SCALE_PACK(img->width, img->height);
+   s->fmt     = GFX_SURFACE_FMT_NONE;
+#ifdef HAVE_THREADS
+   if (video_driver_thread_wrapper_active())
+   {
+      /* the payload stays the caller's until the completion */
+      if (gfx_surface_post_compressed(s, img))
+      {
+         r = GFX_SURFACE_SUBMIT_QUEUED;
+         gfx_surface_count(r);
+         return r;
+      }
+   }
+#endif
+   if (video_driver_texture_load(img, s->filter, &tex) && tex)
+   {
+      if (s->handle)
+         gfx_surface_unload(&s->handle);
+      s->handle         = tex;
+      s->texture_filter = s->filter;
+      r                 = GFX_SURFACE_SUBMIT_DONE;
+   }
+   gfx_surface_count(r);
+   return r;
+}
+
 void gfx_surface_free(gfx_surface_t *s)
 {
    if (!s)
@@ -1139,6 +1222,20 @@ bool gfx_surface_submit_image(gfx_surface_t *s, struct texture_image *img)
    }
 
 #ifdef HAVE_THREADS
+   /* A payload the driver samples: posted, the image the surface's
+    * until the completion */
+   if (     img->compressed && !img->pixels
+         && video_driver_thread_wrapper_active()
+         && task_is_on_main_thread()
+         && video_driver_supports_texture_format(img->compressed->format))
+   {
+      s->payload      = img;
+      s->payload_free = gfx_surface_image_free;
+      if (gfx_surface_post_compressed(s, img))
+         return true;
+      s->payload      = NULL;
+      s->payload_free = NULL;
+   }
    if (     img->pixels && !img->compressed
          && VIDEO_SCALE_FITS(img->width, img->height)
          && video_driver_thread_wrapper_active()
@@ -1526,16 +1623,23 @@ bool gfx_surface_slot_writable(gfx_surface_t *s, unsigned slot)
    return true;
 }
 
-bool gfx_surface_free_adopt(gfx_surface_t *s, void *pixels)
+bool gfx_surface_free_adopt_payload(gfx_surface_t *s, void *payload,
+      gfx_surface_payload_free_t payload_free)
 {
-   if (s && s->inflight && !s->num_slots && pixels && !s->payload_free)
+   if (     s && s->inflight && !s->num_slots && payload && payload_free
+         && !s->payload_free)
    {
       GFX_INSTR_INC(GFX_INSTR_SURFACE_FREE);
-      s->payload      = pixels;
-      s->payload_free = free;
+      s->payload      = payload;
+      s->payload_free = payload_free;
       s->dying        = 1;
       return true;
    }
    gfx_surface_free(s);
    return false;
+}
+
+bool gfx_surface_free_adopt(gfx_surface_t *s, void *pixels)
+{
+   return gfx_surface_free_adopt_payload(s, pixels, free);
 }

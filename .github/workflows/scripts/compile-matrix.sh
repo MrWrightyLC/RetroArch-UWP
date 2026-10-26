@@ -355,7 +355,7 @@ platform_video "openvg video" "-DHAVE_VG -DHAVE_EGL" \
 # core's views, through calls these lanes check.
 platform_video "drm video" "" "-I/usr/include/libdrm" \
    gfx/drivers/drm_gfx.c /usr/include/xf86drm.h
-platform_video "exynos video" "-DHAVE_EXYNOS" \
+platform_video "exynos video" "-DHAVE_EXYNOS -DHAVE_OVERLAY" \
    "-I$STUBS/exynos -I/usr/include/libdrm" \
    gfx/drivers/exynos_gfx.c /usr/include/libdrm/drm_fourcc.h
 platform_video "dispmanx video" "-DHAVE_DISPMANX" "-I$STUBS/videocore" \
@@ -440,6 +440,22 @@ d3d_video "d3d11 video, no threads"  "$D3DDEFS -DHAVE_D3D11 -UHAVE_THREADS" \
    gfx/drivers/d3d11.c
 d3d_video "d3d12 video, no threads"  "$D3DDEFS -DHAVE_D3D12 -UHAVE_THREADS" \
    gfx/drivers/d3d12.c
+d3d_video "d3d12 video, NGX upscaler" "$D3DDEFS -DHAVE_D3D12 -DHAVE_NGX" \
+   gfx/drivers/d3d12.c
+d3d_video "d3d12 NGX backend" "$D3DDEFS -DHAVE_D3D12 -DHAVE_NGX" \
+   gfx/common/d3d12_ngx.c
+d3d_video "d3d12 NGX backend, no threads" \
+   "$D3DDEFS -DHAVE_D3D12 -DHAVE_NGX -UHAVE_THREADS" gfx/common/d3d12_ngx.c
+d3d_video "d3d12 upscaler dispatch" "$D3DDEFS -DHAVE_D3D12 -DHAVE_NGX" \
+   gfx/common/d3d12_upscaler.c
+d3d_video "d3d12 FSR backend" "$D3DDEFS -DHAVE_D3D12 -DHAVE_NGX" \
+   gfx/common/d3d12_ffx.c
+d3d_video "d3d12 FSR backend, no threads" \
+   "$D3DDEFS -DHAVE_D3D12 -DHAVE_NGX -UHAVE_THREADS" gfx/common/d3d12_ffx.c
+d3d_video "d3d12 XeSS backend" "$D3DDEFS -DHAVE_D3D12 -DHAVE_NGX" \
+   gfx/common/d3d12_xess.c
+d3d_video "d3d12 XeSS backend, no threads" \
+   "$D3DDEFS -DHAVE_D3D12 -DHAVE_NGX -UHAVE_THREADS" gfx/common/d3d12_xess.c
 # With the MP4 previews: frames from rh264's D3D11 video backend,
 # imported by D3D11 and D3D12 through shared handles and fences (11.4
 # interfaces from the bundled headers), and the backend itself.
@@ -584,7 +600,19 @@ check "gl2: GLES3" \
    "$GLDEFS -DHAVE_OPENGLES -DHAVE_OPENGLES3 -DHAVE_EGL $GLINC" gfx/drivers/gl2.c
 check "gl2: desktop" \
    "$GLDEFS $GLINC" gfx/drivers/gl2.c
-GL3DEFS="-DHAVE_OPENGL -DHAVE_OPENGL_CORE -DHAVE_SLANG -DHAVE_GLSLANG -DHAVE_SPIRV_CROSS -DHAVE_REWIND -DHAVE_OVERLAY -Ideps/SPIRV-Cross"
+# On KMS, gl2 samples a software core's frames from GBM buffers
+# (gfx/common/egl_gbm_frames.c): its own path, in GLES and desktop GL
+KMSINC="$(pkg-config --cflags libdrm 2>/dev/null || echo -I/usr/include/libdrm)"
+check "gl2: GLES2 on KMS" \
+   "$GLDEFS -DHAVE_OPENGLES -DHAVE_OPENGLES2 -DHAVE_EGL -DHAVE_KMS $GLINC $KMSINC" \
+   gfx/drivers/gl2.c gfx/common/egl_gbm_frames.c
+check "gl2: GLES3 on KMS" \
+   "$GLDEFS -DHAVE_OPENGLES -DHAVE_OPENGLES3 -DHAVE_EGL -DHAVE_KMS $GLINC $KMSINC" \
+   gfx/drivers/gl2.c gfx/common/egl_gbm_frames.c
+check "gl2: desktop on KMS" \
+   "$GLDEFS -DHAVE_EGL -DHAVE_KMS $GLINC $KMSINC" \
+   gfx/drivers/gl2.c gfx/common/egl_gbm_frames.c
+GL3DEFS="-DHAVE_OPENGL -DHAVE_OPENGL_CORE -DHAVE_SLANG -DHAVE_RSLC -DHAVE_REWIND -DHAVE_OVERLAY"
 check "gl3: desktop" \
    "$GL3DEFS $GLINC" gfx/drivers/gl3.c
 check "gl3: GLES3" \
@@ -914,6 +942,12 @@ check "AV1 hardware registry: threads" "-DHAVE_RAV1" libretro-common/formats/av1
 check_nothreads "no threads: AV1 hardware registry" "-DHAVE_RAV1" libretro-common/formats/av1/rav1_hw.c
 check "vp9/h265/video streams: threads" "-DHAVE_RVP9 -DHAVE_RVP8 -DHAVE_RWEBM -DHAVE_RMP4 -DHAVE_RH264 -DHAVE_RH265" libretro-common/formats/vp9/rvp9.c libretro-common/formats/h265/rh265.c libretro-common/formats/webm/rwebm_video.c libretro-common/formats/mp4/rmp4_video.c libretro-common/formats/image/image_blit_bands.c
 check_nothreads "no threads: vp9/h265/video streams" "-DHAVE_RVP9 -DHAVE_RVP8 -DHAVE_RWEBM -DHAVE_RMP4 -DHAVE_RH264 -DHAVE_RH265" libretro-common/formats/vp9/rvp9.c libretro-common/formats/h265/rh265.c libretro-common/formats/webm/rwebm_video.c libretro-common/formats/mp4/rmp4_video.c libretro-common/formats/image/image_blit_bands.c
+check "Matroska AVC/HEVC without MP4 or VP9" "-DHAVE_RWEBM" \
+   libretro-common/formats/h264/rh264.c libretro-common/formats/h265/rh265.c \
+   libretro-common/formats/webm/rwebm_video.c libretro-common/formats/image_transfer.c
+check_nothreads "no threads: Matroska AVC/HEVC without MP4 or VP9" "-DHAVE_RWEBM" \
+   libretro-common/formats/h264/rh264.c libretro-common/formats/h265/rh265.c \
+   libretro-common/formats/webm/rwebm_video.c libretro-common/formats/image_transfer.c
 check "gfx_surface: threads" "$GLINC" gfx/gfx_surface.c gfx/gfx_thumbnail.c gfx/gfx_surface_player.c libretro-common/formats/video_player.c
 check_nothreads "no threads: gfx_surface" "$GLINC" gfx/gfx_surface.c gfx/gfx_thumbnail.c gfx/gfx_surface_player.c libretro-common/formats/video_player.c
 check_nothreads "no threads: gl2"          "$GLDEFS $GLINC"       gfx/drivers/gl2.c
@@ -1010,7 +1044,7 @@ check_gates "griffin: HAVE_RETROSMB + cloud sync"  "$UIDEFS -DRARCH_INTERNAL -DH
 # griffin can carry. A static helper in one translation unit that
 # another one also defines (get32 in net_smb2.c and rvorbis.c) only
 # collides here, so this lane carries as much of griffin as a host can.
-GRIFFIN_FULL="-DRARCH_INTERNAL -DHAVE_GRIFFIN=1 -DHAVE_MENU -DHAVE_RGUI -DHAVE_XMB -DHAVE_OZONE -DHAVE_MATERIALUI -DHAVE_GFX_WIDGETS -DHAVE_OVERLAY -DHAVE_CONFIGFILE -DHAVE_CHEEVOS -DRC_DISABLE_LUA -DHAVE_RUNAHEAD -DHAVE_REWIND -DHAVE_PATCH -DHAVE_XDELTA -DHAVE_CHEATS -DHAVE_SCREENSHOTS -DHAVE_TRANSLATE -DHAVE_LIBRETRODB -DHAVE_DYNAMIC -DHAVE_DYLIB -DHAVE_THREADS -DHAVE_AUDIOMIXER -DHAVE_DSP_FILTER -DHAVE_VIDEO_FILTER -DHAVE_RWAV -DHAVE_RFLAC -DHAVE_RVORBIS -DHAVE_RMP3 -DHAVE_RAC3 -DHAVE_RPNG -DHAVE_RJPEG -DHAVE_RBMP -DHAVE_RTGA -DHAVE_RWEBP -DHAVE_RDDS -DHAVE_RZSTD -DHAVE_7ZIP -DHAVE_CHD -DHAVE_RCHD -DHAVE_IMAGEVIEWER -DHAVE_STB_FONT -DHAVE_NETWORKING -DHAVE_IFINFO -DHAVE_NETWORK_CMD -DHAVE_NETPLAYDISCOVERY -DHAVE_ONLINE_UPDATER -DHAVE_UPDATE_ASSETS -DHAVE_UPDATE_CORES -DHAVE_UPDATE_CORE_INFO -DHAVE_CORE_INFO_CACHE -DHAVE_CLOUDSYNC -DHAVE_S3 -DHAVE_CRYPTO -DHAVE_KEYCHAIN -DHAVE_SSL -DHAVE_RETROSSL -DHAVE_SMBCLIENT -DHAVE_RETROSMB -DHAVE_NFSCLIENT -DHAVE_RETRONFS -DHAVE_LANGEXTRA -DHAVE_SHADERPIPELINE -DHAVE_GLSL -DHAVE_OPENGL -D_GNU_SOURCE"
+GRIFFIN_FULL="-DRARCH_INTERNAL -DHAVE_GRIFFIN=1 -DHAVE_MENU -DHAVE_RGUI -DHAVE_XMB -DHAVE_OZONE -DHAVE_MATERIALUI -DHAVE_GFX_WIDGETS -DHAVE_OVERLAY -DHAVE_CONFIGFILE -DHAVE_CHEEVOS -DRC_DISABLE_LUA -DHAVE_RUNAHEAD -DHAVE_REWIND -DHAVE_PATCH -DHAVE_XDELTA -DHAVE_CHEATS -DHAVE_SCREENSHOTS -DHAVE_TRANSLATE -DHAVE_LIBRETRODB -DHAVE_DYNAMIC -DHAVE_DYLIB -DHAVE_THREADS -DHAVE_AUDIOMIXER -DHAVE_DSP_FILTER -DHAVE_VIDEO_FILTER -DHAVE_RWAV -DHAVE_RFLAC -DHAVE_RVORBIS -DHAVE_RMP3 -DHAVE_RAC3 -DHAVE_RPNG -DHAVE_RJPEG -DHAVE_RBMP -DHAVE_RTGA -DHAVE_RWEBP -DHAVE_RDDS -DHAVE_RZSTD -DHAVE_7ZIP -DHAVE_CHD -DHAVE_RCHD -DHAVE_STB_FONT -DHAVE_NETWORKING -DHAVE_IFINFO -DHAVE_NETWORK_CMD -DHAVE_NETPLAYDISCOVERY -DHAVE_ONLINE_UPDATER -DHAVE_UPDATE_ASSETS -DHAVE_UPDATE_CORES -DHAVE_UPDATE_CORE_INFO -DHAVE_CORE_INFO_CACHE -DHAVE_CLOUDSYNC -DHAVE_S3 -DHAVE_CRYPTO -DHAVE_KEYCHAIN -DHAVE_SSL -DHAVE_RETROSSL -DHAVE_SMBCLIENT -DHAVE_RETROSMB -DHAVE_NFSCLIENT -DHAVE_RETRONFS -DHAVE_LANGEXTRA -DHAVE_SHADERPIPELINE -DHAVE_GLSL -DHAVE_OPENGL -D_GNU_SOURCE"
 check_gates "griffin: full unity (every codec + network stack)" "$UIDEFS $GRIFFIN_FULL" griffin/griffin.c
 # The SMB show-settings row read a HAVE_MENU-only default under
 # HAVE_SMBCLIENT alone; with the built-in client on by default that
@@ -1075,12 +1109,20 @@ GFXDEFS="-DHAVE_RGUI -DHAVE_OVERLAY -DHAVE_GFX_WIDGETS"
 VK_H=/usr/include/vulkan/vulkan.h
 platform_video "vulkan back end" "$GFXDEFS -DHAVE_VULKAN" "" \
    gfx/drivers/vulkan.c "$VK_H"
+check "Vulkan Video: Matroska without MP4" "-DHAVE_VULKAN -DHAVE_RWEBM -DHAVE_DYLIB -Igfx/include" \
+   gfx/common/vulkan_common.c gfx/common/vulkan_video_decode.c
 check "Vulkan Video: AV1 disabled" "-DHAVE_VULKAN -DHAVE_RMP4 -DHAVE_DYLIB -Igfx/include" gfx/common/vulkan_common.c gfx/common/vulkan_video_decode.c
 check "Vulkan Video: AV1 enabled, VP9 disabled" "-DHAVE_VULKAN -DHAVE_RMP4 -DHAVE_RAV1 -DHAVE_DYLIB -Igfx/include" gfx/common/vulkan_common.c gfx/common/vulkan_video_decode.c
 platform_video "vulkan shader back end" "$GFXDEFS -DHAVE_VULKAN" "" \
    gfx/drivers_shader/shader_vulkan.c "$VK_H"
 check "cg shader back end" "$GFXDEFS -DHAVE_CG -DHAVE_OPENGL" \
    gfx/drivers_shader/shader_gl_cg.c
+for api in OPENGLES2 OPENGLES3; do
+   defs="$GFXDEFS -DHAVE_CG -DHAVE_OPENGL -DHAVE_OPENGLES -DHAVE_$api"
+   check "cg shader back end: $api" "$defs" gfx/drivers_shader/shader_gl_cg.c
+   d3d_video "cg shader back end: $api mingw" "$defs -Igfx/include/ANGLE" \
+      gfx/drivers_shader/shader_gl_cg.c
+done
 check "framebuffer back ends" "$GFXDEFS" \
    gfx/drivers/fpga_gfx.c gfx/drivers/hub75_gfx.c gfx/drivers/sunxi_gfx.c
 X11_H=/usr/include/X11/Xlib.h
@@ -1105,18 +1147,22 @@ check "runahead: both"             "$RADEFS -DHAVE_DYNAMIC -DHAVE_DYLIB" runahea
 # the stand-ins do not declare is an error: a new Metal call needs its
 # declaration added there.
 if command -v clang > /dev/null 2>&1; then
-   if ! out=$(clang -x objective-c -fobjc-runtime=macosx-10.13 -fblocks \
+   for metal_features in "" "-DHAVE_RMP4 -DHAVE_THREADS" "-DHAVE_RWEBM -DHAVE_THREADS"; do
+   for metal_ownership in "" "-fobjc-arc"; do
+   if ! out=$(clang -x objective-c -fobjc-runtime=macosx-10.13 -fblocks $metal_ownership \
          -fsyntax-only -Wall -Wno-unused-function -Werror=objc-method-access \
          -Werror=unused-but-set-variable $HOSTOFF -D__APPLE__ -D__MACH__ \
-         -DHAVE_METAL -Itools/platform_stubs/metal $INC $BASE \
+         -DHAVE_METAL $metal_features -Itools/platform_stubs/metal -Itools/platform_stubs/gcd $INC $BASE \
          gfx/drivers/metal.m 2>&1); then
-      echo "FAIL  metal video (stubs)"
+      echo "FAIL  metal video (stubs) $metal_features $metal_ownership"
       echo "      gfx/drivers/metal.m"
       show_out "$out"
       fail=1
    else
-      echo "ok    metal video (stubs)"
+      echo "ok    metal video (stubs) $metal_features $metal_ownership"
    fi
+   done
+   done
 else
    echo "skip  metal video (stubs) (no clang)"
 fi
@@ -1221,11 +1267,36 @@ UNITY_DIR=$(mktemp -d)
 printf '#include "gfx/drivers/gl2.c"\n#include "gfx/drivers/gl3.c"\n#include "gfx/drivers/vulkan.c"\n' \
    > "$UNITY_DIR/unity_gfx.c"
 check "unity: gl2 + gl3 + vulkan in one translation unit" \
-   "-Igfx/include -DHAVE_OPENGL -DHAVE_OPENGL_CORE -DHAVE_GLSL -DHAVE_VULKAN -DHAVE_SLANG -DHAVE_SHADERPIPELINE -DHAVE_SPIRV_CROSS -DHAVE_GFX_WIDGETS -DHAVE_OVERLAY -DHAVE_X11" \
+   "-Igfx/include -DHAVE_OPENGL -DHAVE_OPENGL_CORE -DHAVE_GLSL -DHAVE_VULKAN -DHAVE_SLANG -DHAVE_SHADERPIPELINE -DHAVE_RSLC -DHAVE_GFX_WIDGETS -DHAVE_OVERLAY -DHAVE_X11" \
    "$UNITY_DIR/unity_gfx.c"
 rm -rf "$UNITY_DIR"
 
 check "image YUV: PS2 C89" "-DPS2 -DRARCH_CONSOLE $HOSTOFF -std=c89" \
    libretro-common/formats/image/image_yuv_blit.c
+
+echo "== screens' own windows: with HAVE_VIDEO_WINDOWS =="
+# Android builds the screens' windows and a desktop build does not, so
+# no other lane compiles the drivers' window code or the frontend's
+# with it; and without threads, as a --disable-threads build would.
+WINDEFS="-DHAVE_VIDEO_WINDOWS -DHAVE_EGL"
+WINTU="gfx/video_driver.c gfx/video_thread_wrapper.c input/input_driver.c \
+   configuration.c menu/menu_setting.c menu/menu_displaylist.c \
+   gfx/common/egl_common.c gfx/video_windows.c"
+check "windows: frontend" "$UIDEFS $WINDEFS -DHAVE_OPENGL -DHAVE_OVERLAY" $WINTU
+check_nothreads "windows: frontend, no threads" \
+   "$UIDEFS $WINDEFS -DHAVE_OPENGL -DHAVE_OVERLAY" \
+   $(echo "$WINTU" | sed 's|gfx/video_thread_wrapper.c||')
+check "windows: gl2 GLES2" \
+   "$GLDEFS -DHAVE_OPENGLES -DHAVE_OPENGLES2 $WINDEFS $GLINC" gfx/drivers/gl2.c
+check "windows: gl2 GLES3" \
+   "$GLDEFS -DHAVE_OPENGLES -DHAVE_OPENGLES3 $WINDEFS $GLINC" gfx/drivers/gl2.c
+check "windows: gl2 desktop" "$GLDEFS $WINDEFS $GLINC" gfx/drivers/gl2.c
+check_nothreads "windows: gl2, no threads" "$GLDEFS $WINDEFS $GLINC" \
+   gfx/drivers/gl2.c
+platform_video "windows: vulkan back end" \
+   "$GFXDEFS -DHAVE_VULKAN -DHAVE_VIDEO_WINDOWS" "" gfx/drivers/vulkan.c "$VK_H"
+check "windows: vulkan second output" \
+   "-DHAVE_VULKAN -DHAVE_DYLIB -DHAVE_VIDEO_WINDOWS -Igfx/include" \
+   gfx/common/vulkan_common.c
 
 exit $fail

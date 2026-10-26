@@ -11,6 +11,7 @@
 #include <file/file_path.h>
 #include <retro_dirent.h>
 #include <rthreads/rthreads.h>
+#include <retro_timers.h>
 #include "../../../libretro-common/vfs/vfs_implementation_smb.h"
 
 #define NTHREADS 4
@@ -106,11 +107,13 @@ int main(int argc, char **argv)
    snprintf(url_file, sizeof(url_file), "smb://%s/%s/rsmb_test.bin", argv[1], argv[2]);
    snprintf(url_dir, sizeof(url_dir), "smb://%s/%s", argv[1], argv[2]);
    /* read-ahead off, then on: off is one request per read with no
-    * prefetcher; on, a read-only open starts one (with threads) */
-   for (phase = 0; phase < 2; phase++)
+    * prefetcher; on, a read-only open starts one (with threads), once
+    * with a window larger than the file and once with windows far
+    * smaller than one read */
+   for (phase = 0; phase < 3; phase++)
    {
       RFILE *f;
-      cfg.readahead = phase ? 1024 : 0;
+      cfg.readahead = phase == 0 ? 0 : phase == 1 ? 1024 : 1;
       smb_init_cfg(&cfg);
       for (i = 0; i < NTHREADS; i++)
          t[i] = sthread_create(worker, (void*)(intptr_t)i);
@@ -158,6 +161,63 @@ int main(int argc, char **argv)
             failures++;
          }
       }
+      /* one read reaching past the ready windows: it still gets every
+       * octet it asked for, the rest read from the network, as a
+       * parser checking for the exact length expects */
+      if (phase == 2 && (f = filestream_open(url_file, RETRO_VFS_FILE_ACCESS_READ,
+                  RETRO_VFS_FILE_ACCESS_HINT_NONE)))
+      {
+         static uint8_t whole[200000];
+         unsigned window_kib, direct_kib;
+         int64_t  got;
+         uint32_t j;
+         /* a first octet sends the prefetcher to the start of the file;
+          * the rest is then asked for in one read, past its windows */
+         got = filestream_read(f, whole, 1);
+         retro_sleep(200);
+         if (got == 1)
+            got += filestream_read(f, whole + 1, sizeof(whole) - 1);
+         filestream_close(f);
+         smb_take_readahead_stats(&window_kib, &direct_kib);
+         if (got != (int64_t)sizeof(whole))
+         {
+            fprintf(stderr, "FAIL: read past the windows got %lld of %u\n",
+                  (long long)got, (unsigned)sizeof(whole));
+            failures++;
+         }
+         else
+            for (j = 0; j < sizeof(whole); j++)
+               if (whole[j] != (uint8_t)(j * 31 + 7))
+               {
+                  fprintf(stderr, "FAIL: read past the windows, octet %u\n", j);
+                  failures++;
+                  break;
+               }
+         if (!window_kib)
+         {
+            fprintf(stderr, "FAIL: read past the windows took nothing from them (%u KiB direct)\n", direct_kib);
+            failures++;
+         }
+      }
+      /* a read-only open asking to be mapped, as the archive layer's
+       * does: a network stream has no descriptor to map, so it must still
+       * open, seek and read through its own backend */
+      {
+         RFILE *mf = filestream_open(url_file, RETRO_VFS_FILE_ACCESS_READ,
+               RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS);
+         uint8_t buf2[16];
+         if (     !mf
+               || filestream_get_size(mf) <= 0
+               || filestream_seek(mf, 100, RETRO_VFS_SEEK_POSITION_START) != 0
+               || filestream_read(mf, buf2, sizeof(buf2)) != (int64_t)sizeof(buf2)
+               || buf2[0] != (uint8_t)(100 * 31 + 7))
+         {
+            fprintf(stderr, "FAIL: open asking for a mapping\n");
+            failures++;
+         }
+         if (mf)
+            filestream_close(mf);
+      }
       smb_shutdown();
    }
    if (failures)
@@ -165,7 +225,7 @@ int main(int argc, char **argv)
       fprintf(stderr, "FAIL: %d bad operations across %d threads\n", failures, NTHREADS);
       return 1;
    }
-   printf("ok: %d threads x %d rounds through the VFS, read-ahead off and on\n",
+   printf("ok: %d threads x %d rounds through the VFS, read-ahead off and on, reads past the windows\n",
          NTHREADS, ROUNDS);
    return 0;
 }

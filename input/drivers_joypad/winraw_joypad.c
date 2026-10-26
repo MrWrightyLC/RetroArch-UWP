@@ -54,8 +54,10 @@
 #include "../../tasks/tasks_internal.h"
 #include "../input_driver.h"
 #include "../common/sony_pad_output.h"
+#include "../common/hid_sjoy_output.h"
 #include "../common/output_writer.h"
 #include "../common/sony_pad_motion.h"
+#include <features/features_cpu.h>
 #include "../../verbosity.h"
 
 /* ------------------------------------------------------------------ */
@@ -148,9 +150,10 @@ typedef struct winraw_joypad_joypad_data
    uint16_t            num_hats;
    USAGE               btn_usage_min;
 
-   int16_t             axes[RAWINPUT_MAX_AXES];        /* 16 bytes */
-   uint8_t             hats[RAWINPUT_MAX_HATS];        /*  4 bytes */
-   bool                buttons[RAWINPUT_MAX_BUTTONS];  /* 128 bytes */
+   /* the buttons, the hats' four directions and the axes as the reads
+    * answer them: lent to the frontend's readers between two polls
+    * where the reports are parsed in the poll, nothing copied */
+   input_pad_view_t    view;
 
    /* --- Cold fields (accessed only at device add/remove) ---------- */
    PHIDP_PREPARSED_DATA preparsed;   /* HID preparsed data (opaque blob) */
@@ -179,6 +182,15 @@ typedef struct winraw_joypad_joypad_data
    bool                motion_seen;  /* a report has had them            */
    sony_pad_motion_t   motion;
 } winraw_joypad_joypad_data_t;
+
+#define WINRAW_BUTTON(pad, i)        BIT256_GET((pad)->view.buttons, (i))
+#define WINRAW_SET_BUTTON(pad, i, on) do { if (on) \
+   BIT256_SET((pad)->view.buttons, (i)); \
+   else BIT256_CLEAR((pad)->view.buttons, (i)); } while (0)
+/* hat @h's four bits: up, down, left, right from the low one */
+#define WINRAW_HAT(pad, h)  (((pad)->view.hats >> ((h) * 4)) & 0xf)
+#define WINRAW_SET_HAT(pad, h, bits) ((pad)->view.hats = (uint16_t)( \
+   ((pad)->view.hats & ~(0xf << ((h) * 4))) | (((bits) & 0xf) << ((h) * 4))))
 
 /* ------------------------------------------------------------------ */
 /* Static globals                                                      */
@@ -397,6 +409,21 @@ typedef DWORD (WINAPI *winraw_xinput_set_state_t)(DWORD, winraw_xinput_vibration
 
 /* a device to write to: a Sony pad open for writing, with what its
  * reports are to look like, or one of XInput's pads */
+/* A DualShock 3 on Sony's own driver, sixaxis.sys, or on DsHidMini in
+ * its mode that stands in for it, sends no input reports: its state is
+ * feature report 0, asked for. The thread asks every few milliseconds
+ * and hands the newest to the poll through three buffers; the pad's
+ * lights and motors are that driver's commands, in output report 0.
+ * A DualShock 3 is tried this way until its reports come anyway, or
+ * the first ask fails - Windows' own HID driver, which has not started
+ * the pad, has no report 0. */
+#define WINRAW_SIXAXIS_LEN      64
+#define WINRAW_SIXAXIS_EVERY_US 4000
+#define WINRAW_SIXAXIS_TRYING   0
+#define WINRAW_SIXAXIS_READING  1
+#define WINRAW_SIXAXIS_DONE     2
+#define WINRAW_SIXAXIS_FRESH    4
+
 typedef struct
 {
    bool     xinput;     /* an XInput pad; the rest is a Sony pad's    */
@@ -406,6 +433,13 @@ typedef struct
    bool     bluetooth;
    bool     v2;         /* DualSense: the newer way of the motors     */
    USHORT   report_len; /* the length Windows wants of a write        */
+   /* a DualShock 3, read through feature report 0 */
+   bool     sixaxis;
+   uint8_t  sixaxis_state;   /* WINRAW_SIXAXIS_*                      */
+   USHORT   feature_len;
+   /* a PlayStation adapter's port, its report placed by Windows */
+   PHIDP_PREPARSED_DATA sjoy_pp;
+   hid_sjoy_output_t sjoy;
 } winraw_joypad_out_dev_t;
 
 /* "close what you hold", in a pad's inbox */
@@ -428,10 +462,21 @@ typedef struct
     * report, loaded by the thread to tell which of XInput's pads this
     * is. */
    retro_atomic_int_t buttons;
+   /* a DualShock 3's feature reports: the thread writes one buffer
+    * and the poll reads another, swapping with the one in between,
+    * WINRAW_SIXAXIS_FRESH set while it is newer than the poll's */
+   uint8_t feat[3][WINRAW_SIXAXIS_LEN];
+   retro_atomic_int_t feat_middle;
+   int feat_write;      /* the thread's */
+   int feat_read;       /* the poll's   */
+   /* its input reports came after all, said by the poll */
+   retro_atomic_int_t raw_seen;
    /* the driver's own: a device was handed over for this pad; and it
-    * is an XInput pad, whose buttons are to be published */
+    * is an XInput pad, whose buttons are to be published; and a
+    * DualShock 3 that may be read through its feature report */
    bool present;
    bool xinput;
+   bool sixaxis;
    int  player_asked;   /* the player last stored for the thread     */
    /* the thread's own */
    winraw_joypad_out_dev_t *dev;
@@ -450,6 +495,11 @@ static winraw_xinput_set_state_t winraw_xinput_set_state;
 static int                       winraw_xinput_taken[WINRAW_XINPUT_PADS];
 /* the thread: input/common/output_writer.h's */
 static input_output_writer_t *winraw_joypad_out_writer;
+/* the driver's: DualShock 3s that may be read through their feature
+ * report, looked at by the poll while there are any */
+static unsigned winraw_joypad_sixaxis_count;
+/* the thread's: when the next feature reports are asked for */
+static retro_time_t winraw_joypad_sixaxis_due;
 /* counted for the log; the thread's while it runs */
 static unsigned long       winraw_joypad_out_writes;
 
@@ -565,19 +615,141 @@ static bool winraw_xinput_write(unsigned slot, winraw_joypad_out_dev_t *dev,
    return false;
 }
 
+/* One request to the device, given up after a while: the length
+ * moved, or -1. */
+static int winraw_joypad_out_io(HANDLE handle, DWORD ioctl,
+      uint8_t *buf, DWORD len)
+{
+   OVERLAPPED ov;
+   DWORD moved = 0;
+   BOOL ok     = FALSE;
+
+   memset(&ov, 0, sizeof(ov));
+   if (!(ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL)))
+      return -1;
+   ok = ioctl
+      ? DeviceIoControl(handle, ioctl, buf, len, buf, len, &moved, &ov)
+      : WriteFile(handle, buf, len, &moved, &ov);
+   if (!ok && GetLastError() == ERROR_IO_PENDING)
+   {
+      if (WaitForSingleObject(ov.hEvent, WINRAW_JOYPAD_OUT_TIMEOUT_MS)
+            != WAIT_OBJECT_0)
+         CancelIo(handle);
+      ok = GetOverlappedResult(handle, &ov, &moved, TRUE);
+   }
+   CloseHandle(ov.hEvent);
+   return ok ? (int)moved : -1;
+}
+
+/* IOCTL_HID_GET_FEATURE: HidD_GetFeature's, on a handle opened for
+ * overlapped requests, which HidD_GetFeature is not made for */
+#define WINRAW_IOCTL_HID_GET_FEATURE 0x000B0192
+
+/* The thread's: the pad's state, asked for, handed to the poll. */
+static void winraw_joypad_sixaxis_read(winraw_joypad_out_t *out,
+      winraw_joypad_out_dev_t *dev, unsigned slot)
+{
+   int old;
+   uint8_t *buf = out->feat[out->feat_write];
+
+   if (retro_atomic_load_acquire_int(&out->raw_seen))
+   {
+      dev->sixaxis_state = WINRAW_SIXAXIS_DONE;
+      RARCH_LOG("[RawInput Joypad] The DualShock 3 in slot %u sends its"
+            " reports: read as any controller.\n", slot);
+      return;
+   }
+   memset(buf, 0, dev->feature_len);
+   if (winraw_joypad_out_io(dev->handle, WINRAW_IOCTL_HID_GET_FEATURE,
+            buf, dev->feature_len) < 0 || buf[0] != 0)
+   {
+      if (dev->sixaxis_state == WINRAW_SIXAXIS_TRYING)
+      {
+         dev->sixaxis_state = WINRAW_SIXAXIS_DONE;
+         RARCH_LOG("[RawInput Joypad] The DualShock 3 in slot %u has no"
+               " state to ask for: its driver is not Sony's.\n", slot);
+      }
+      return;
+   }
+   if (dev->sixaxis_state == WINRAW_SIXAXIS_TRYING)
+   {
+      dev->sixaxis_state = WINRAW_SIXAXIS_READING;
+      RARCH_LOG("[RawInput Joypad] The DualShock 3 in slot %u is on Sony's"
+            " driver, or one standing in for it: its state is asked for"
+            " every %u ms.\n", slot, WINRAW_SIXAXIS_EVERY_US / 1000);
+   }
+   old = retro_atomic_exchange_int(&out->feat_middle,
+         out->feat_write | WINRAW_SIXAXIS_FRESH);
+   out->feat_write = old & 3;
+}
+
+/* That driver's command in output report 0: 1 the lights, 2 the
+ * motors. */
+static bool winraw_joypad_sixaxis_write(const winraw_joypad_out_dev_t *dev,
+      uint8_t command, const uint8_t *args, size_t n)
+{
+   uint8_t buf[WINRAW_SIXAXIS_LEN];
+   DWORD len = dev->report_len >= 9 && dev->report_len <= sizeof(buf)
+      ? dev->report_len : 49;
+
+   memset(buf, 0, sizeof(buf));
+   buf[1] = command;
+   memcpy(buf + 5, args, n);
+   return winraw_joypad_out_io(dev->handle, 0, buf, len) >= 0;
+}
+
+/* The motors, from 0 to 255 the large one and on or off the small;
+ * and the lights: the player's from 1, or all out for none. */
+static bool winraw_joypad_sixaxis_out(const winraw_joypad_out_dev_t *dev,
+      int want, int sent, int player, int sent_player)
+{
+   bool ok = true;
+   if (want != sent)
+   {
+      uint8_t motors[4];
+      motors[0] = 0xff;   /* how long the small one runs: until told */
+      motors[1] = (((unsigned)want >> 16) & 0xFFFF) ? 1 : 0;
+      motors[2] = 0xff;
+      motors[3] = (uint8_t)(((unsigned)want & 0xFFFF) >> 8);
+      ok = winraw_joypad_sixaxis_write(dev, 2, motors, sizeof(motors));
+   }
+   if (player && player != sent_player)
+   {
+      /* LED 4 first: 0 off, 1 on */
+      uint8_t lights[4];
+      memset(lights, 0, sizeof(lights));
+      if (player > 0)
+         lights[3 - ((player - 1) % 4)] = 1;
+      ok = winraw_joypad_sixaxis_write(dev, 1, lights, sizeof(lights)) && ok;
+   }
+   return ok;
+}
+
 static bool winraw_joypad_out_write(const winraw_joypad_out_dev_t *dev,
       int want, int player)
 {
    uint8_t buf[1024];
-   OVERLAPPED ov;
-   DWORD written = 0;
    bool ok       = false;
-   size_t report = sony_pad_output_report(buf, sizeof(buf),
-         (enum sony_pad_model)dev->model, dev->bluetooth, dev->v2,
-         (uint8_t)(((unsigned)want & 0xFFFF) >> 8),
-         (uint8_t)((((unsigned)want >> 16) & 0xFFFF) >> 8),
-         player);
-   size_t len    = report;
+   size_t report = 0;
+   size_t len;
+
+   if (dev->sjoy_pp)
+   {
+      if (     dev->report_len <= sizeof(buf)
+            && hid_sjoy_output_report(&dev->sjoy, dev->sjoy_pp, buf,
+               dev->report_len,
+               (uint8_t)(((unsigned)want & 0xFFFF) >> 8),
+               (uint8_t)((((unsigned)want >> 16) & 0xFFFF) >> 8),
+               HidP_SetUsageValue, HidP_SetUsageValueArray))
+         report = dev->report_len;
+   }
+   else
+      report = sony_pad_output_report(buf, sizeof(buf),
+            (enum sony_pad_model)dev->model, dev->bluetooth, dev->v2,
+            (uint8_t)(((unsigned)want & 0xFFFF) >> 8),
+            (uint8_t)((((unsigned)want >> 16) & 0xFFFF) >> 8),
+            player);
+   len = report;
 
    if (!report)
       return false;
@@ -591,21 +763,7 @@ static bool winraw_joypad_out_write(const winraw_joypad_out_dev_t *dev,
     * up after a while and not waited on for as long as Windows
     * would: the other pads' writes, and the driver stopping, wait
     * behind it. */
-   memset(&ov, 0, sizeof(ov));
-   ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
-   if (ov.hEvent)
-   {
-      if (WriteFile(dev->handle, buf, (DWORD)len, &written, &ov))
-         ok = true;
-      else if (GetLastError() == ERROR_IO_PENDING)
-      {
-         if (WaitForSingleObject(ov.hEvent, WINRAW_JOYPAD_OUT_TIMEOUT_MS)
-               != WAIT_OBJECT_0)
-            CancelIo(dev->handle);
-         ok = GetOverlappedResult(dev->handle, &ov, &written, TRUE) != 0;
-      }
-      CloseHandle(ov.hEvent);
-   }
+   ok = winraw_joypad_out_io(dev->handle, 0, buf, (DWORD)len) >= 0;
    if (ok)
       return true;
    /* some links take an output report only as a control request, and
@@ -621,6 +779,8 @@ static void winraw_joypad_out_dev_free(winraw_joypad_out_dev_t *dev)
       return;
    if (!dev->xinput)
       CloseHandle(dev->handle);
+   if (dev->sjoy_pp)
+      HidD_FreePreparsedData(dev->sjoy_pp);
    free(dev);
 }
 
@@ -641,6 +801,12 @@ static void winraw_joypad_out_drop(winraw_joypad_out_t *out)
             if (out->dev->xuser >= 0)
                winraw_xinput_taken[out->dev->xuser] = -1;
          }
+      }
+      else if (out->dev->sixaxis)
+      {
+         /* sent only to one that was on Sony's driver */
+         if (out->sent)
+            winraw_joypad_sixaxis_out(out->dev, 0, out->sent, 0, 0);
       }
       else if (out->sent)
          winraw_joypad_out_write(out->dev, 0, out->sent_player);
@@ -672,7 +838,26 @@ static void winraw_joypad_out_run(void *unused, bool quit)
             out->dev = (winraw_joypad_out_dev_t*)msg;
       }
 
-      if (out->dev && !quit)
+      if (out->dev && out->dev->sixaxis && !quit)
+      {
+         int want   = retro_atomic_load_acquire_int(&out->want);
+         int player = retro_atomic_load_acquire_int(&out->player);
+         if (     out->dev->sixaxis_state != WINRAW_SIXAXIS_DONE
+               && cpu_features_get_time_usec() >= winraw_joypad_sixaxis_due)
+            winraw_joypad_sixaxis_read(out, out->dev, i);
+         /* written only to a pad that is Sony's driver's */
+         if (     out->dev->sixaxis_state == WINRAW_SIXAXIS_READING
+               && (want != out->sent || (player && player != out->sent_player)))
+         {
+            if (winraw_joypad_sixaxis_out(out->dev, want, out->sent,
+                     player, out->sent_player))
+               winraw_joypad_out_writes++;
+            out->sent        = want;
+            if (player)
+               out->sent_player = player;
+         }
+      }
+      else if (out->dev && !quit)
       {
          int want   = retro_atomic_load_acquire_int(&out->want);
          int player = retro_atomic_load_acquire_int(&out->player);
@@ -710,6 +895,28 @@ static void winraw_joypad_out_run(void *unused, bool quit)
       if (quit)
          winraw_joypad_out_drop(out);
    }
+   if (winraw_joypad_sixaxis_due <= cpu_features_get_time_usec())
+      winraw_joypad_sixaxis_due = cpu_features_get_time_usec()
+         + WINRAW_SIXAXIS_EVERY_US;
+}
+
+/* The thread's, before it waits: how long until the next feature
+ * reports are asked for, while a DualShock 3 is read that way. */
+static int winraw_joypad_out_timeout(void *unused)
+{
+   unsigned i;
+   retro_time_t now;
+   (void)unused;
+   for (i = 0; i < MAX_USERS; i++)
+      if (     winraw_joypad_out[i].dev && winraw_joypad_out[i].dev->sixaxis
+            && winraw_joypad_out[i].dev->sixaxis_state
+               != WINRAW_SIXAXIS_DONE)
+         break;
+   if (i == MAX_USERS)
+      return -1;
+   now = cpu_features_get_time_usec();
+   return winraw_joypad_sixaxis_due > now
+      ? (int)((winraw_joypad_sixaxis_due - now + 999) / 1000) : 0;
 }
 
 /* A pad has gone, or its slot is to hold another: the thread is told
@@ -721,8 +928,11 @@ static void winraw_joypad_out_close(unsigned slot)
 
    if (!out->present)
       return;
+   if (out->sixaxis)
+      winraw_joypad_sixaxis_count--;
    out->present = false;
    out->xinput  = false;
+   out->sixaxis = false;
    old = retro_atomic_exchange_ptr(&out->inbox, WINRAW_JOYPAD_OUT_CLOSE);
    /* a device handed over and never taken is still the driver's */
    if (old && old != WINRAW_JOYPAD_OUT_CLOSE)
@@ -737,15 +947,16 @@ static void winraw_joypad_out_close(unsigned slot)
 static bool winraw_joypad_out_start(void)
 {
    if (!winraw_joypad_out_writer)
-      winraw_joypad_out_writer = input_output_writer_new(
-            winraw_joypad_out_run, NULL);
+      winraw_joypad_out_writer = input_output_writer_new_timed(
+            winraw_joypad_out_run, winraw_joypad_out_timeout, NULL);
    return winraw_joypad_out_writer != NULL;
 }
 
 /* A pad has arrived: if it is one there is a rumble report for, its
  * device is opened for writing and handed to the thread. */
 static void winraw_joypad_out_open(unsigned slot,
-      uint16_t vid, uint16_t pid, const char *path, USHORT report_len)
+      uint16_t vid, uint16_t pid, const char *path, USHORT report_len,
+      USHORT feature_len)
 {
    void *old;
    winraw_joypad_out_dev_t *dev;
@@ -755,8 +966,13 @@ static void winraw_joypad_out_open(unsigned slot,
     * with "IG_" in its path */
    bool xinput               = path
       && (strstr(path, "IG_") || strstr(path, "ig_"));
+   /* a DualShock 3 with a feature report the size of its state */
+   bool sixaxis              = vid == 0x054C && pid == 0x0268
+      && feature_len >= 49 && feature_len <= WINRAW_SIXAXIS_LEN;
+   bool sjoy                 = hid_sjoy_rumbles(vid, pid);
 
-   if ((model == SONY_PAD_NONE && !xinput) || !path || !*path)
+   if (     (model == SONY_PAD_NONE && !xinput && !sixaxis && !sjoy)
+         || !path || !*path)
       return;
    if (!(dev = (winraw_joypad_out_dev_t*)calloc(1, sizeof(*dev))))
       return;
@@ -780,8 +996,25 @@ static void winraw_joypad_out_open(unsigned slot,
          free(dev);
          return;
       }
-      dev->model      = (uint8_t)model;
-      dev->report_len = report_len;
+      dev->model       = (uint8_t)model;
+      dev->report_len  = report_len;
+      dev->sixaxis     = sixaxis;
+      dev->feature_len = feature_len;
+      if (sjoy)
+      {
+         HIDP_CAPS caps;
+         if (     !HidD_GetPreparsedData(dev->handle, &dev->sjoy_pp)
+               || HidP_GetCaps(dev->sjoy_pp, &caps) != HIDP_STATUS_SUCCESS
+               || !hid_sjoy_output_setup(&dev->sjoy, dev->sjoy_pp,
+                  caps.NumberOutputValueCaps, HidP_GetValueCaps))
+         {
+            RARCH_LOG("[RawInput Joypad] Rumble: the adapter in slot %u"
+                  " (%04X:%04X) has no rumble report (%u bytes out).\n",
+                  slot, vid, pid, (unsigned)report_len);
+            winraw_joypad_out_dev_free(dev);
+            return;
+         }
+      }
       dev->bluetooth  =
             strstr(path, "00001124-0000-1000-8000-00805f9b34fb") != NULL
          || strstr(path, "00001124-0000-1000-8000-00805F9B34FB") != NULL;
@@ -812,6 +1045,14 @@ static void winraw_joypad_out_open(unsigned slot,
       RARCH_LOG("[RawInput Joypad] Rumble: the controller in slot %u is an"
             " XInput pad; it is rumbled through XInput, from the driver's"
             " own thread.\n", slot);
+   else if (sixaxis)
+      RARCH_LOG("[RawInput Joypad] The controller in slot %u is a DualShock"
+            " 3: its state is asked for if its reports do not come.\n",
+            slot);
+   else if (sjoy)
+      RARCH_LOG("[RawInput Joypad] Rumble: the controller in slot %u is on"
+            " a PlayStation adapter (%04X:%04X); it is written to from the"
+            " driver's own thread.\n", slot, vid, pid);
    else
       RARCH_LOG("[RawInput Joypad] Rumble: the controller in slot %u is a %s"
             " over %s; it is written to from the driver's own thread.\n", slot,
@@ -824,11 +1065,22 @@ static void winraw_joypad_out_open(unsigned slot,
     * still the driver's to close. */
    retro_atomic_store_release_int(&out->want, 0);
    retro_atomic_store_release_int(&out->buttons, 0);
+   retro_atomic_store_release_int(&out->raw_seen, 0);
+   if (sixaxis)
+   {
+      /* a report the last pad here left is not this one's */
+      if (retro_atomic_load_acquire_int(&out->feat_middle)
+            & WINRAW_SIXAXIS_FRESH)
+         out->feat_read = retro_atomic_exchange_int(&out->feat_middle,
+               out->feat_read) & 3;
+      winraw_joypad_sixaxis_count++;
+   }
    old = retro_atomic_exchange_ptr(&out->inbox, dev);
    if (old && old != WINRAW_JOYPAD_OUT_CLOSE)
       winraw_joypad_out_dev_free((winraw_joypad_out_dev_t*)old);
    out->present = true;
    out->xinput  = xinput;
+   out->sixaxis = sixaxis;
    input_output_writer_wake(winraw_joypad_out_writer);
 }
 
@@ -872,8 +1124,10 @@ static void winraw_joypad_out_stop(void)
          winraw_joypad_out_dev_free((winraw_joypad_out_dev_t*)old);
       out->present = false;
       out->xinput  = false;
+      out->sixaxis = false;
       retro_atomic_store_release_int(&out->want, 0);
    }
+   winraw_joypad_sixaxis_count = 0;
    /* the thread has ended: what was its own is put away */
    if (winraw_xinput_dll)
       FreeLibrary(winraw_xinput_dll);
@@ -991,18 +1245,18 @@ static void winraw_joypad_xinput_fill(winraw_joypad_joypad_data_t *pad,
    unsigned i;
 
    for (i = 0; i < 10; i++)
-      pad->buttons[i] = (st->buttons & bits[i]) != 0;
-   pad->hats[0] = (uint8_t)(
+      WINRAW_SET_BUTTON(pad, i, (st->buttons & bits[i]) != 0);
+   WINRAW_SET_HAT(pad, 0,
            ((st->buttons & 0x0001) ? (1 << 0) : 0)
          | ((st->buttons & 0x0002) ? (1 << 1) : 0)
          | ((st->buttons & 0x0004) ? (1 << 2) : 0)
          | ((st->buttons & 0x0008) ? (1 << 3) : 0));
-   pad->axes[0] = st->lx == -32768 ? -32767 : st->lx;
-   pad->axes[1] = st->ly == -32768 ? -32767 : st->ly;
-   pad->axes[2] = st->rx == -32768 ? -32767 : st->rx;
-   pad->axes[3] = st->ry == -32768 ? -32767 : st->ry;
-   pad->axes[4] = (int16_t)(st->left_trigger  * 32767 / 255);
-   pad->axes[5] = (int16_t)(st->right_trigger * 32767 / 255);
+   pad->view.axes[0] = st->lx == -32768 ? -32767 : st->lx;
+   pad->view.axes[1] = st->ly == -32768 ? -32767 : st->ly;
+   pad->view.axes[2] = st->rx == -32768 ? -32767 : st->rx;
+   pad->view.axes[3] = st->ry == -32768 ? -32767 : st->ry;
+   pad->view.axes[4] = (int16_t)(st->left_trigger  * 32767 / 255);
+   pad->view.axes[5] = (int16_t)(st->right_trigger * 32767 / 255);
 }
 
 /* XInput's four pads are looked at: one that has come is given a
@@ -1384,7 +1638,8 @@ static bool winraw_joypad_add_device(HANDLE hDevice)
    /* a pad there is a rumble report for is opened for writing */
    winraw_joypad_out_close((unsigned)slot);
    winraw_joypad_out_open((unsigned)slot, pad->vid, pad->pid, pad->path,
-         pad->caps.OutputReportByteLength);
+         pad->caps.OutputReportByteLength,
+         pad->caps.FeatureReportByteLength);
 
    return true;
 }
@@ -1440,9 +1695,67 @@ static void winraw_joypad_out_publish_buttons(
    if (slot >= MAX_USERS || !winraw_joypad_out[slot].xinput)
       return;
    for (b = 0; b < 10 && b < pad->num_buttons; b++)
-      if (pad->buttons[b])
+      if (WINRAW_BUTTON(pad, b))
          mask |= 1 << b;
    retro_atomic_store_release_int(&winraw_joypad_out[slot].buttons, mask);
+}
+
+/* Before the thread starts: each pad's three buffers, the poll's 0,
+ * the thread's 1, 2 in between, and so they stay, swapped round. */
+static void winraw_joypad_sixaxis_init(void)
+{
+   unsigned i;
+   for (i = 0; i < MAX_USERS; i++)
+   {
+      winraw_joypad_out[i].feat_read  = 0;
+      winraw_joypad_out[i].feat_write = 1;
+      retro_atomic_int_init(&winraw_joypad_out[i].feat_middle, 2);
+      retro_atomic_int_init(&winraw_joypad_out[i].raw_seen, 0);
+   }
+   winraw_joypad_sixaxis_count = 0;
+}
+
+/* A DualShock 3's state from its feature report: report 0, then its
+ * input report as the pad sends it - buttons from byte 2, the sticks
+ * from byte 6 - laid out as its own HID description lays it out, the
+ * buttons 1 to 19 and the sticks X, Y, Z and Rz, so a profile for the
+ * pad on its USB description binds it. */
+static void winraw_joypad_parse_sixaxis(winraw_joypad_joypad_data_t *pad,
+      const uint8_t *feature)
+{
+   unsigned i;
+   const uint8_t *r = feature + 1;
+   uint32_t b       = r[2] | ((uint32_t)r[3] << 8) | ((uint32_t)r[4] << 16);
+
+   pad->num_buttons = 19;
+   pad->num_axes    = 6;
+   pad->num_hats    = 0;
+   for (i = 0; i < 19; i++)
+      WINRAW_SET_BUTTON(pad, i, (b >> i) & 1);
+   pad->view.axes[0] = winraw_joypad_scale_axis(r[6], 0, 255);
+   pad->view.axes[1] = winraw_joypad_scale_axis(r[7], 0, 255);
+   pad->view.axes[2] = winraw_joypad_scale_axis(r[8], 0, 255);
+   pad->view.axes[5] = winraw_joypad_scale_axis(r[9], 0, 255);
+   winraw_joypad_reports_parsed++;
+}
+
+/* The poll's: each DualShock 3's newest feature report, once. */
+static void winraw_joypad_sixaxis_take(void)
+{
+   unsigned slot;
+   for (slot = 0; slot < MAX_USERS; slot++)
+   {
+      winraw_joypad_out_t *out = &winraw_joypad_out[slot];
+      if (     out->sixaxis
+            && (retro_atomic_load_acquire_int(&out->feat_middle)
+               & WINRAW_SIXAXIS_FRESH))
+      {
+         out->feat_read = retro_atomic_exchange_int(&out->feat_middle,
+               out->feat_read) & 3;
+         winraw_joypad_parse_sixaxis(&winraw_joypad_pads[slot],
+               out->feat[out->feat_read]);
+      }
+   }
 }
 
 static void winraw_joypad_parse_hid_report(winraw_joypad_joypad_data_t *pad,
@@ -1457,12 +1770,19 @@ static void winraw_joypad_parse_hid_report(winraw_joypad_joypad_data_t *pad,
       return;
 
    winraw_joypad_reports_parsed++;
+   {
+      /* a DualShock 3 sending its reports is read from them */
+      unsigned slot = (unsigned)(pad - winraw_joypad_pads);
+      if (slot < MAX_USERS && winraw_joypad_out[slot].sixaxis)
+         retro_atomic_store_release_int(&winraw_joypad_out[slot].raw_seen, 1);
+   }
    num_buttons = pad->num_buttons;
 
    /* --- Buttons --- */
-   /* Clear only the buttons this device actually has, not the full 128 */
+   /* Those past the device's own are never set: all thirty-two bytes
+    * are one clear */
    if (num_buttons > 0)
-      memset(pad->buttons, 0, num_buttons * sizeof(pad->buttons[0]));
+      BIT256_CLEAR_ALL(pad->view.buttons);
 
    /* Hats are cleared for the same reason as buttons: a hat whose
     * usage is absent from this report must read as centred rather
@@ -1473,7 +1793,7 @@ static void winraw_joypad_parse_hid_report(winraw_joypad_joypad_data_t *pad,
     * and zeroing them would fight sticks that legitimately rest
     * off-centre. */
    if (pad->num_hats > 0)
-      memset(pad->hats, 0, pad->num_hats * sizeof(pad->hats[0]));
+      pad->view.hats = 0;
 
    usage_count = (ULONG)num_buttons;
    if (usage_count > RAWINPUT_MAX_BUTTONS)
@@ -1492,7 +1812,7 @@ static void winraw_joypad_parse_hid_report(winraw_joypad_joypad_data_t *pad,
       {
          unsigned btn_index = usages[i] - btn_min;
          if (btn_index < num_buttons)
-            pad->buttons[btn_index] = true;
+            BIT256_SET(pad->view.buttons, btn_index);
       }
    }
 
@@ -1546,10 +1866,11 @@ static void winraw_joypad_parse_hid_report(winraw_joypad_joypad_data_t *pad,
          if (is_hat)
          {
             if ((unsigned)slot_idx < max_hats)
-               pad->hats[slot_idx] = winraw_joypad_hat_value_to_bitmask(
+               WINRAW_SET_HAT(pad, slot_idx,
+                     winraw_joypad_hat_value_to_bitmask(
                      (LONG)value,
                      pad->val_caps[i].LogicalMin,
-                     pad->val_caps[i].LogicalMax);
+                     pad->val_caps[i].LogicalMax));
          }
          else
          {
@@ -1558,7 +1879,7 @@ static void winraw_joypad_parse_hid_report(winraw_joypad_joypad_data_t *pad,
                LONG signed_value = (pad->val_caps[i].LogicalMin < 0)
                   ? winraw_joypad_sign_extend(value, pad->val_caps[i].BitSize)
                   : (LONG)value;
-               pad->axes[slot_idx] = winraw_joypad_scale_axis(
+               pad->view.axes[slot_idx] = winraw_joypad_scale_axis(
                      signed_value,
                      pad->val_caps[i].LogicalMin,
                      pad->val_caps[i].LogicalMax);
@@ -1854,6 +2175,7 @@ static void *winraw_joypad_joypad_init(void *data)
 {
    memset(winraw_joypad_pads, 0, sizeof(winraw_joypad_pads));
    memset(winraw_joypad_held, 0, sizeof(winraw_joypad_held));
+   winraw_joypad_sixaxis_init();
    winraw_joypad_pad_count      = 0;
    winraw_joypad_reports_taken  = 0;
    winraw_joypad_reports_parsed = 0;
@@ -1977,13 +2299,13 @@ static int32_t winraw_joypad_joypad_button(unsigned port, uint16_t joykey)
       switch (hat_dir)
       {
          case HAT_UP_MASK:
-            return (pad->hats[hat_index] & (1 << 0)) ? 1 : 0;
+            return (WINRAW_HAT(pad, hat_index) & (1 << 0)) ? 1 : 0;
          case HAT_DOWN_MASK:
-            return (pad->hats[hat_index] & (1 << 1)) ? 1 : 0;
+            return (WINRAW_HAT(pad, hat_index) & (1 << 1)) ? 1 : 0;
          case HAT_LEFT_MASK:
-            return (pad->hats[hat_index] & (1 << 2)) ? 1 : 0;
+            return (WINRAW_HAT(pad, hat_index) & (1 << 2)) ? 1 : 0;
          case HAT_RIGHT_MASK:
-            return (pad->hats[hat_index] & (1 << 3)) ? 1 : 0;
+            return (WINRAW_HAT(pad, hat_index) & (1 << 3)) ? 1 : 0;
          default:
             break;
       }
@@ -1991,15 +2313,24 @@ static int32_t winraw_joypad_joypad_button(unsigned port, uint16_t joykey)
    }
 
    if (joykey < pad->num_buttons)
-      return pad->buttons[joykey] ? 1 : 0;
+      return WINRAW_BUTTON(pad, joykey) ? 1 : 0;
 
    return 0;
+}
+
+/* Lent where the reports are read in the poll, which is then the only
+ * place a pad's state changes; under the window of its own, read on
+ * whichever thread made it, it is copied. */
+static const input_pad_view_t *winraw_joypad_joypad_view(unsigned port)
+{
+   if (port >= MAX_USERS || !winraw_joypad_by_poll)
+      return NULL;
+   return &winraw_joypad_pads[port].view;
 }
 
 static void winraw_joypad_joypad_get_buttons(unsigned port,
    input_bits_t *state)
 {
-   unsigned i;
    const winraw_joypad_joypad_data_t *pad;
 
    if (port >= MAX_USERS)
@@ -2015,12 +2346,7 @@ static void winraw_joypad_joypad_get_buttons(unsigned port,
       return;
    }
 
-   BIT256_CLEAR_ALL_PTR(state);
-   for (i = 0; i < pad->num_buttons && i < RAWINPUT_MAX_BUTTONS; i++)
-   {
-      if (pad->buttons[i])
-         BIT256_SET_PTR(state, i);
-   }
+   *state = pad->view.buttons;
 }
 
 static int16_t winraw_joypad_joypad_axis(unsigned port, uint32_t joyaxis)
@@ -2054,7 +2380,7 @@ static int16_t winraw_joypad_joypad_axis(unsigned port, uint32_t joyaxis)
    if (axis < 0 || (unsigned)axis >= pad->num_axes)
       return 0;
 
-   val = pad->axes[axis];
+   val = pad->view.axes[axis];
 
    if (is_neg && val > 0)
       return 0;
@@ -2114,7 +2440,7 @@ static int16_t winraw_joypad_joypad_state(
             unsigned hat_index = GET_HAT(key);
             if (hat_index < pad->num_hats)
             {
-               uint8_t hv = pad->hats[hat_index];
+               uint8_t hv = (uint8_t)WINRAW_HAT(pad, hat_index);
                switch (hat_dir)
                {
                   case HAT_UP_MASK:    if (hv & (1 << 0)) ret |= (1 << i); break;
@@ -2125,7 +2451,7 @@ static int16_t winraw_joypad_joypad_state(
                }
             }
          }
-         else if (key < pad->num_buttons && pad->buttons[key])
+         else if (key < pad->num_buttons && WINRAW_BUTTON(pad, key))
             ret |= (1 << i);
 
          /* If button matched, skip axis check for this bind */
@@ -2144,7 +2470,7 @@ static int16_t winraw_joypad_joypad_state(
             axis = AXIS_NEG_GET(joyaxis);
             if (axis >= 0 && (unsigned)axis < pad->num_axes)
             {
-               val = pad->axes[axis];
+               val = pad->view.axes[axis];
                if (val < 0 && abs((int)val) > threshold)
                   ret |= (1 << i);
             }
@@ -2154,7 +2480,7 @@ static int16_t winraw_joypad_joypad_state(
             axis = AXIS_POS_GET(joyaxis);
             if (axis >= 0 && (unsigned)axis < pad->num_axes)
             {
-               val = pad->axes[axis];
+               val = pad->view.axes[axis];
                if (val > 0 && val > threshold)
                   ret |= (1 << i);
             }
@@ -2215,12 +2541,10 @@ static bool winraw_joypad_poll_window_up(void)
    return true;
 }
 
-/* For winraw_input.c's answer to whether the input driver can be left
- * running across a video driver restart: this driver is kept or
- * restarted with it, and can stay when it is the joypad driver in use
- * and read by the poll - its window is then the polling thread's, and
- * it holds nothing of the video driver's. */
-bool winraw_joypad_survives_video(void)
+/* Whether this driver can be kept across a video driver restart: when
+ * read by the poll - its window is then the polling thread's, and it
+ * holds nothing of the video driver's. */
+static bool winraw_joypad_survives_video(void)
 {
    return winraw_joypad_initialised && winraw_joypad_by_poll;
 }
@@ -2273,6 +2597,8 @@ static void winraw_joypad_joypad_poll(void)
 
    winraw_joypad_xinput_poll();
    winraw_joypad_player_lights();
+   if (winraw_joypad_sixaxis_count)
+      winraw_joypad_sixaxis_take();
 
    if (winraw_joypad_by_poll)
    {
@@ -2414,4 +2740,9 @@ input_device_driver_t winraw_joypad = {
    winraw_joypad_joypad_get_sensor_input,
    winraw_joypad_joypad_name,
    "winraw_joypad",
+   NULL,                         /* get_bt_host  */
+   NULL,                         /* set_bt_host  */
+   winraw_joypad_survives_video,
+   NULL,                         /* set_player   */
+   winraw_joypad_joypad_view
 };

@@ -167,8 +167,8 @@ enum title_variant
 
 typedef struct title_enum_map
 {
-   uint32_t label;      /* MENU_ENUM_LABEL_* matched by string    */
-   uint32_t title;      /* MENU_ENUM_LABEL_VALUE_* to render       */
+   msg_hash_id_t label; /* MENU_ENUM_LABEL_* matched by string    */
+   msg_hash_id_t title; /* MENU_ENUM_LABEL_VALUE_* to render       */
    uint8_t  variant;    /* enum title_variant                      */
 } title_enum_map_t;
 
@@ -204,6 +204,7 @@ static const title_enum_map_t title_enum_map[] = {
    { MENU_ENUM_LABEL_DEFERRED_CPU_POLICY_ENTRY, MENU_ENUM_LABEL_VALUE_CPU_POLICY_ENTRY, TITLE_VARIANT_PLAIN },
    { MENU_ENUM_LABEL_DEFERRED_MENU_SOUNDS_LIST, MENU_ENUM_LABEL_VALUE_MENU_SOUNDS, TITLE_VARIANT_PLAIN },
    { MENU_ENUM_LABEL_DEFERRED_MENU_FILE_BROWSER_SETTINGS_LIST, MENU_ENUM_LABEL_VALUE_MENU_FILE_BROWSER_SETTINGS, TITLE_VARIANT_PLAIN },
+   { MENU_ENUM_LABEL_DEFERRED_MEDIA_PLAYER_SETTINGS_LIST, MENU_ENUM_LABEL_VALUE_MEDIA_PLAYER_SETTINGS, TITLE_VARIANT_PLAIN },
    { MENU_ENUM_LABEL_DEFERRED_RETRO_ACHIEVEMENTS_SETTINGS_LIST, MENU_ENUM_LABEL_VALUE_RETRO_ACHIEVEMENTS_SETTINGS, TITLE_VARIANT_PLAIN },
    { MENU_ENUM_LABEL_DEFERRED_CHEEVOS_APPEARANCE_SETTINGS_LIST, MENU_ENUM_LABEL_VALUE_CHEEVOS_APPEARANCE_SETTINGS, TITLE_VARIANT_PLAIN },
    { MENU_ENUM_LABEL_DEFERRED_CHEEVOS_VISIBILITY_SETTINGS_LIST, MENU_ENUM_LABEL_VALUE_CHEEVOS_VISIBILITY_SETTINGS, TITLE_VARIANT_PLAIN },
@@ -633,9 +634,27 @@ static int action_get_title_dropdown_item(
                else if ((enum_idx >= MENU_ENUM_LABEL_INPUT_AIM_STICK) &&
                      (enum_idx <= MENU_ENUM_LABEL_INPUT_AIM_STICK_LAST))
                   enum_idx = MENU_ENUM_LABEL_VALUE_INPUT_AIM_STICK;
+               else if ((enum_idx >= MENU_ENUM_LABEL_INPUT_TOUCHPAD) &&
+                     (enum_idx <= MENU_ENUM_LABEL_INPUT_TOUCHPAD_LAST))
+                  enum_idx = MENU_ENUM_LABEL_VALUE_INPUT_TOUCHPAD;
                else if ((enum_idx >= MENU_ENUM_LABEL_INPUT_REMAP_PORT) &&
                      (enum_idx <= MENU_ENUM_LABEL_INPUT_REMAP_PORT_LAST))
                   enum_idx = MENU_ENUM_LABEL_VALUE_INPUT_REMAP_PORT;
+               else if (
+                        (   enum_idx - 2 >= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MODE
+                         && enum_idx - 2 <= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MODE_LAST)
+                     || (   enum_idx - 2 >= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MONITOR
+                         && enum_idx - 2 <= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MONITOR_LAST))
+               {
+                  /* The screen's own row label, "Screen 2" */
+                  rarch_setting_t *setting = menu_setting_find_enum(
+                        (enum msg_hash_enums)(enum_idx - 2));
+                  if (s && setting && setting->short_description)
+                  {
+                     strlcpy(s, setting->short_description, len);
+                     return 1;
+                  }
+               }
 
                {
                   const char *title = msg_hash_to_str(enum_idx);

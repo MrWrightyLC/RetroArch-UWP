@@ -1,7 +1,7 @@
 /*  RetroArch - A frontend for libretro.
  *  Copyright (C) 2011-2017 - Daniel De Matteis
- *  Copyright (C) 2014-2017 - Jean-André Santoni
- *  Copyright (C) 2016-2019 - Andrés Suárez
+ *  Copyright (C) 2014-2017 - Jean-AndrÃ© Santoni
+ *  Copyright (C) 2016-2019 - AndrÃ©s SuÃ¡rez
  *  Copyright (C) 2016-2019 - Brad Parker
  *
  *  RetroArch is free software: you can redistribute it and/or modify it under the terms
@@ -123,6 +123,9 @@
 #include <file/file_watch.h>
 #include "../ui/ui_companion_driver.h"
 #include "../gfx/video_display_server.h"
+#ifdef HAVE_NGX
+#include "../gfx/video_upscaler.h"
+#endif
 #ifdef HAVE_MODELINE
 #include "../gfx/modeline/modeline_edid.h"
 #endif
@@ -174,6 +177,8 @@
 #if defined(HAVE_NETWORKING) && defined(HAVE_IFINFO)
 #include <net/net_ifinfo.h>
 #endif
+
+#include "../input/drivers_hid/winusb_bind.h"
 
 /* TODO/FIXME - globals - need to find a way to
  * get rid of these */
@@ -632,7 +637,7 @@ static int filebrowser_parse(
       enum rarch_content_type path_type = RARCH_CONTENT_NONE;
       enum msg_file_type file_type      = FILE_TYPE_NONE;
       const char *file_path             = str_list.elems[i].data;
-      int attr                          = str_list.elems[i].attr.i; /* [8] cache attr — read twice below */
+      int attr                          = str_list.elems[i].attr.i; /* [8] cache attr â€” read twice below */
 
       if (!file_path || !*file_path)
          continue;
@@ -723,7 +728,7 @@ static int filebrowser_parse(
 #endif
                break;
             case RARCH_CONTENT_IMAGE:
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
                if (builtin_imageviewer_enable && type != DISPLAYLIST_IMAGES)
                   file_type = FILE_TYPE_IMAGEVIEWER;
                else
@@ -1633,13 +1638,13 @@ static unsigned menu_displaylist_parse_core_manager_list(file_list_t *list,
          count++;
 #endif
 
-#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_AUDIOMIXER)
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU) || defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_AUDIOMIXER)
    {
       /* MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM requires 'settings',
        * so the scope only exists where one of the entries below
        * is built in. */
       settings_t *settings = config_get_ptr();
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
       if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
             MENU_ENUM_LABEL_USE_BUILTIN_IMAGE_VIEWER, PARSE_ONLY_BOOL,
             false) == 0)
@@ -2324,6 +2329,36 @@ static unsigned menu_displaylist_parse_display_info(file_list_t *list)
             MENU_ENUM_LABEL_DISPLAY_INFO_ENTRY, MENU_SETTINGS_CORE_INFO_NONE,
             0, 0, NULL))
          count++;
+      /* Whether the low-latency release the setting asks for is in
+       * effect, and why not when it is not: asked for and working
+       * are two different things. */
+      if (config_get_ptr()->uints.video_driver_pacing)
+      {
+         runloop_driver_pacing_string(pbuf, sizeof(pbuf));
+         _len  = strlcpy(entry,
+               msg_hash_to_str(MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_DRIVER_PACING),
+               sizeof(entry));
+         _len +=  strlcpy_lit(entry + _len, ": ", sizeof(entry) - _len);
+         strlcpy(entry + _len, pbuf, sizeof(entry) - _len);
+         if (menu_entries_append(list, entry, "",
+               MENU_ENUM_LABEL_DISPLAY_INFO_ENTRY, MENU_SETTINGS_CORE_INFO_NONE,
+               0, 0, NULL))
+            count++;
+      }
+#ifdef HAVE_NGX
+      /* Whether the upscaler can be offered, and where its runtime is
+       * looked for: the setting is hidden until both are found. */
+      video_upscaler_status_string(pbuf, sizeof(pbuf));
+      _len  = strlcpy(entry,
+            msg_hash_to_str(MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_TEMPORAL_UPSCALER),
+            sizeof(entry));
+      _len +=  strlcpy_lit(entry + _len, ": ", sizeof(entry) - _len);
+      strlcpy(entry + _len, pbuf, sizeof(entry) - _len);
+      if (menu_entries_append(list, entry, "",
+            MENU_ENUM_LABEL_DISPLAY_INFO_ENTRY, MENU_SETTINGS_CORE_INFO_NONE,
+            0, 0, NULL))
+         count++;
+#endif
    }
 
    /* Display Width / Height (mm), DPI: the context's metrics */
@@ -2977,14 +3012,19 @@ static unsigned menu_displaylist_parse_input_info(file_list_t *list)
          uint8_t pad_host[6];
          if (input_driver_get_bt_host(port, pad_host))
          {
+            static const uint8_t none[6] = { 0 };
             char addr[18];
             bool this_host = host_known && !memcmp(pad_host, host, 6);
             menu_displaylist_bt_addr(addr, sizeof(addr), pad_host);
             snprintf(entry, sizeof(entry), msg_hash_to_str(this_host
                      ? MENU_ENUM_LABEL_VALUE_PORT_BT_HOST_THIS
+                     : !memcmp(pad_host, none, 6)
+                     ? MENU_ENUM_LABEL_VALUE_PORT_BT_HOST_NONE
                      : MENU_ENUM_LABEL_VALUE_PORT_BT_HOST), addr);
+            /* a line of its own: the controller's details are the
+             * port's entry's, not this one's */
             if (menu_entries_append(list, entry, "",
-                  MENU_ENUM_LABEL_SYSTEM_INFO_CONTROLLER_ENTRY,
+                  MENU_ENUM_LABEL_SYSTEM_INFO_ENTRY,
                   MENU_SETTINGS_CORE_INFO_NONE, 0, port, NULL))
                count++;
             if (host_known && !this_host && menu_entries_append(list,
@@ -2994,7 +3034,37 @@ static unsigned menu_displaylist_parse_input_info(file_list_t *list)
                count++;
          }
       }
+
+#ifdef HAVE_WINUSB_BIND
+      /* A DualShock 3: on Windows' own driver, which cannot start it,
+       * a row to move it to WinUSB; on WinUSB, read by the HID driver,
+       * one to give it back */
+      if (winusb_bind_is_ds3(input_config_get_device_vid(port),
+               input_config_get_device_pid(port)))
+      {
+         bool on_winusb = string_is_equal(
+               input_config_get_device_joypad_driver(port), "hid");
+         if (menu_entries_append(list, msg_hash_to_str(on_winusb
+                     ? MENU_ENUM_LABEL_VALUE_PORT_DS3_RESTORE
+                     : MENU_ENUM_LABEL_VALUE_PORT_DS3_ENABLE), "",
+               on_winusb ? MENU_ENUM_LABEL_INPUT_DS3_RESTORE
+                         : MENU_ENUM_LABEL_INPUT_DS3_ENABLE,
+               MENU_SETTINGS_CORE_INFO_NONE, 0, port, NULL))
+            count++;
+      }
+#endif
    }
+
+#ifdef HAVE_WINUSB_BIND
+   /* A Wii U GameCube adapter that Windows' own driver cannot run: it
+    * is on no port, so it has a row of its own, to move it to WinUSB */
+   if (     winusb_bind_gca_waiting()
+         && menu_entries_append(list,
+               msg_hash_to_str(MENU_ENUM_LABEL_VALUE_INPUT_GCA_ENABLE), "",
+               MENU_ENUM_LABEL_INPUT_GCA_ENABLE,
+               MENU_SETTINGS_CORE_INFO_NONE, 0, 0, NULL))
+      count++;
+#endif
 
    /* This computer's Bluetooth */
    if (host_known)
@@ -5527,7 +5597,7 @@ static unsigned menu_displaylist_parse_playlists(
          }
       }
 
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
       if (settings->bools.menu_content_show_images && g_defaults.image_history)
          if (menu_entries_append(info_list,
                   playlist_get_conf_path(g_defaults.image_history),
@@ -5545,7 +5615,7 @@ static unsigned menu_displaylist_parse_playlists(
                   MENU_SETTING_ACTION, 0, 0, NULL))
             count++;
 
-#if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
+#if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_WEBMPLAYER)
       if (settings->bools.menu_content_show_video && g_defaults.video_history)
          if (menu_entries_append(info_list,
                   playlist_get_conf_path(g_defaults.video_history),
@@ -6093,7 +6163,7 @@ static unsigned menu_displaylist_parse_playlist_manager_list(
                MENU_SETTING_ACTION, 0, 0, NULL))
             count++;
 
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
    /* Add image history */
    if (playlist_size(g_defaults.image_history) > 0)
       if (menu_entries_append(list,
@@ -6113,7 +6183,7 @@ static unsigned menu_displaylist_parse_playlist_manager_list(
             MENU_SETTING_ACTION, 0, 0, NULL))
          count++;
 
-#if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
+#if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_WEBMPLAYER)
    /* Add video history */
    if (playlist_size(g_defaults.video_history) > 0)
       if (menu_entries_append(list,
@@ -7625,13 +7695,43 @@ static int menu_displaylist_parse_playlist_generic(
 }
 
 #ifdef HAVE_BLUETOOTH
+/* The devices the last scan found - their places in the list are the
+ * driver's numbers for them - or that none were; then a scan again. */
+static unsigned bluetooth_list_fill(file_list_t *list)
+{
+   unsigned i, count;
+   struct string_list *device_list = string_list_new();
+   const char *msg_connect_bluetooth =
+      msg_hash_to_str(MENU_ENUM_LABEL_CONNECT_BLUETOOTH);
+
+   if (!device_list)
+      return 0;
+   driver_bluetooth_get_devices(device_list);
+   for (i = 0; i < device_list->size; i++)
+      menu_entries_append(list,
+            device_list->elems[i].data, msg_connect_bluetooth,
+            MENU_ENUM_LABEL_CONNECT_BLUETOOTH,
+            MENU_BLUETOOTH, 0, 0, NULL);
+   /* never left empty: a list with nothing in it cannot be left */
+   if (device_list->size == 0)
+      menu_entries_append(list,
+            msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_BT_DEVICES_FOUND),
+            MENU_ENUM_LABEL_NO_BT_DEVICES_FOUND_STR,
+            MENU_ENUM_LABEL_NO_BT_DEVICES_FOUND,
+            0, 0, 0, NULL);
+   menu_entries_append(list,
+         msg_hash_to_str(MENU_ENUM_LABEL_VALUE_BLUETOOTH_SCAN),
+         MENU_ENUM_LABEL_BLUETOOTH_SCAN_STR,
+         MENU_ENUM_LABEL_BLUETOOTH_SCAN,
+         0, 0, 0, NULL);
+   count = (unsigned)device_list->size + (device_list->size ? 1 : 2);
+   string_list_free(device_list);
+   return count;
+}
+
 static void bluetooth_scan_callback(retro_task_t *task,
       void *task_data, void *user_data, const char *err)
 {
-   unsigned i;
-   struct string_list *device_list   = NULL;
-   const char *msg_connect_bluetooth =
-      msg_hash_to_str(MENU_ENUM_LABEL_CONNECT_BLUETOOTH);
    const char *path                  = NULL;
    const char *label                 = NULL;
    unsigned menu_type                = 0;
@@ -7642,26 +7742,18 @@ static void bluetooth_scan_callback(retro_task_t *task,
    menu_entries_get_last_stack(&path, &label, &menu_type, NULL, NULL);
 
    /* Don't push the results if we left the bluetooth menu */
-   if (!string_is_equal(label,
-         MENU_ENUM_LABEL_DEFERRED_BLUETOOTH_SETTINGS_LIST_STR))
+   if (     !selection_buf
+         || !string_is_equal(label,
+            MENU_ENUM_LABEL_DEFERRED_BLUETOOTH_SETTINGS_LIST_STR))
       return;
 
    menu_entries_clear(selection_buf);
+   bluetooth_list_fill(selection_buf);
+}
 
-   device_list = string_list_new();
-
-   driver_bluetooth_get_devices(device_list);
-
-   for (i = 0; i < device_list->size; i++)
-   {
-      const char *device = device_list->elems[i].data;
-      menu_entries_append(selection_buf,
-            device, msg_connect_bluetooth,
-            MENU_ENUM_LABEL_CONNECT_BLUETOOTH,
-            MENU_BLUETOOTH, 0, 0, NULL);
-   }
-
-   string_list_free(device_list);
+bool menu_displaylist_bluetooth_scan(void)
+{
+   return task_push_bluetooth_scan(bluetooth_scan_callback);
 }
 #endif
 
@@ -9515,26 +9607,10 @@ unsigned menu_displaylist_build_list(
          {
             if (!string_is_equal(settings->arrays.bluetooth_driver, "null"))
             {
-               struct string_list *device_list = string_list_new();
-               driver_bluetooth_get_devices(device_list);
-
-               if (device_list->size == 0)
-                  task_push_bluetooth_scan(bluetooth_scan_callback);
-               else
-               {
-                  unsigned i;
-                  for (i = 0; i < device_list->size; i++)
-                  {
-                     const char *device = device_list->elems[i].data;
-                     if (menu_entries_append(list,
-                              device,
-                              msg_hash_to_str(
-                                 MENU_ENUM_LABEL_CONNECT_BLUETOOTH),
-                              MENU_ENUM_LABEL_CONNECT_BLUETOOTH,
-                              MENU_BLUETOOTH, 0, 0, NULL))
-                        count++;
-                  }
-               }
+               /* looked for again each time, the last scan's list shown
+                * meanwhile: a pad put in pairing mode since is found */
+               task_push_bluetooth_scan(bluetooth_scan_callback);
+               count += bluetooth_list_fill(list);
             }
          }
 #endif
@@ -10049,11 +10125,18 @@ unsigned menu_displaylist_build_list(
 #endif
          if (     !settings->bools.kiosk_mode_enable
                &&  settings->bools.settings_show_file_browser)
+         {
             menu_entries_append(list,
                   msg_hash_to_str(MENU_ENUM_LABEL_VALUE_MENU_FILE_BROWSER_SETTINGS),
                   MENU_ENUM_LABEL_MENU_FILE_BROWSER_SETTINGS_STR,
                   MENU_ENUM_LABEL_MENU_FILE_BROWSER_SETTINGS,
                   MENU_SETTING_ACTION, 0, 0, NULL);
+            menu_entries_append(list,
+                  msg_hash_to_str(MENU_ENUM_LABEL_VALUE_MEDIA_PLAYER_SETTINGS),
+                  MENU_ENUM_LABEL_MEDIA_PLAYER_SETTINGS_STR,
+                  MENU_ENUM_LABEL_MEDIA_PLAYER_SETTINGS,
+                  MENU_SETTING_ACTION, 0, 0, NULL);
+         }
          break;
       }
       case DISPLAYLIST_INPUT_MENU_SETTINGS_LIST:
@@ -12196,6 +12279,7 @@ unsigned menu_displaylist_build_list(
 #endif
                {MENU_ENUM_LABEL_VIDEO_FRAME_DELAY_AUTO,     PARSE_ONLY_BOOL, true},
                {MENU_ENUM_LABEL_VIDEO_FRAME_DELAY,          PARSE_ONLY_UINT, true},
+               {MENU_ENUM_LABEL_VIDEO_DRIVER_PACING,               PARSE_ONLY_UINT, false},
                {MENU_ENUM_LABEL_VRR_RUNLOOP_ENABLE,         PARSE_ONLY_BOOL, true},
             };
 
@@ -12262,6 +12346,16 @@ unsigned menu_displaylist_build_list(
                      break;
                   case MENU_ENUM_LABEL_VIDEO_MAX_SWAPCHAIN_IMAGES:
                      build_list[i].checked = swapchain_images;
+                     break;
+                  case MENU_ENUM_LABEL_VIDEO_DRIVER_PACING:
+                     /* The drivers with a backend for the release */
+                     {
+                        const char *ident = video_driver_get_ident();
+                        build_list[i].checked =
+                              string_is_equal(ident, "vulkan")
+                           || string_is_equal(ident, "d3d11")
+                           || string_is_equal(ident, "d3d12");
+                     }
                      break;
                   case MENU_ENUM_LABEL_VIDEO_SCANLINE_SYNC:
                   case MENU_ENUM_LABEL_VIDEO_SCANLINE_SYNC_OFFSET:
@@ -12367,6 +12461,40 @@ unsigned menu_displaylist_build_list(
                   MENU_ENUM_LABEL_VIDEO_SCREEN_LAYOUT,
                   PARSE_ONLY_UINT, false) == 0)
             count++;
+#ifdef HAVE_VIDEO_WINDOWS
+         if (video_driver_test_all_flags(GFX_CTX_FLAGS_VIDEO_WINDOWS))
+         {
+            if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                     MENU_ENUM_LABEL_VIDEO_WINDOWS_ENABLE,
+                     PARSE_ONLY_BOOL, false) == 0)
+               count++;
+            if (settings->bools.video_windows_enable)
+            {
+               /* Screen 2, and each further one the core has */
+               video_driver_state_t *video_st = video_state_get_ptr();
+               unsigned screens               = 2;
+               unsigned screen;
+               if (     video_st->views_presented
+                     && video_st->views_core.num_screens > screens)
+                  screens = video_st->views_core.num_screens;
+               if (screens > RETRO_VIDEO_VIEWS_MAX)
+                  screens = RETRO_VIDEO_VIEWS_MAX;
+               for (screen = 1; screen < screens; screen++)
+               {
+                  if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                           (enum msg_hash_enums)
+                           (MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MODE + screen),
+                           PARSE_ONLY_UINT, false) == 0)
+                     count++;
+                  if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                           (enum msg_hash_enums)
+                           (MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MONITOR + screen),
+                           PARSE_ONLY_UINT, false) == 0)
+                     count++;
+               }
+            }
+         }
+#endif
 #ifdef HAVE_OPENXR
          if (video_driver_has_headset_path(settings->arrays.video_driver))
          {
@@ -12477,6 +12605,48 @@ unsigned menu_displaylist_build_list(
                         MENU_ENUM_LABEL_VIDEO_VIEWPORT_BIAS_Y,
                         PARSE_ONLY_FLOAT, false) == 0)
                   count++;
+#ifdef HAVE_NGX
+               {
+                  /* The drivers with a backend. The upscaler itself only
+                   * with its runtimes found, and kept while on so it can
+                   * be turned off; the directory always, so the runtime
+                   * can be pointed at. */
+                  const char *ident = video_driver_get_ident();
+                  if (   string_is_equal(ident, "vulkan")
+                      || string_is_equal(ident, "d3d12"))
+                  {
+                     if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                              MENU_ENUM_LABEL_VIDEO_TEMPORAL_UPSCALER,
+                              PARSE_ONLY_UINT, false) == 0)
+                        count++;
+                     if (settings->uints.video_temporal_upscaler)
+                     {
+                        if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                                 MENU_ENUM_LABEL_VIDEO_TEMPORAL_UPSCALER_QUALITY,
+                                 PARSE_ONLY_UINT, false) == 0)
+                           count++;
+                        /* (the preset is DLSS's model) */
+                        if (settings->uints.video_temporal_upscaler == VIDEO_TEMPORAL_UPSCALER_DLSS)
+                           if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                                    MENU_ENUM_LABEL_VIDEO_TEMPORAL_UPSCALER_PRESET,
+                                    PARSE_ONLY_UINT, false) == 0)
+                              count++;
+                     }
+                     if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                              MENU_ENUM_LABEL_VIDEO_DLSS_DIRECTORY,
+                              PARSE_ONLY_DIR, false) == 0)
+                        count++;
+                     if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                              MENU_ENUM_LABEL_VIDEO_FSR_DIRECTORY,
+                              PARSE_ONLY_DIR, false) == 0)
+                        count++;
+                     if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                              MENU_ENUM_LABEL_VIDEO_XESS_DIRECTORY,
+                              PARSE_ONLY_DIR, false) == 0)
+                        count++;
+                  }
+               }
+#endif
 #if defined(RARCH_MOBILE)
                if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                         MENU_ENUM_LABEL_VIDEO_VIEWPORT_BIAS_PORTRAIT_X,
@@ -12660,6 +12830,26 @@ unsigned menu_displaylist_build_list(
                            PARSE_ONLY_BOOL, false) == 0)
                   count++;
             }
+         }
+         break;
+      case DISPLAYLIST_MEDIA_PLAYER_SETTINGS_LIST:
+         {
+            static const menu_displaylist_build_info_t build_list[] = {
+               {MENU_ENUM_LABEL_MEDIA_PLAYER_CONTINUOUS, PARSE_ONLY_BOOL},
+#ifdef HAVE_MODELINE
+               {MENU_ENUM_LABEL_MEDIA_PLAYER_CRT_SWITCH, PARSE_ONLY_BOOL},
+#endif
+               {MENU_ENUM_LABEL_MEDIA_PLAYER_REFRESH_RATE, PARSE_ONLY_BOOL},
+               {MENU_ENUM_LABEL_MEDIA_PLAYER_SEEK_SECONDS, PARSE_ONLY_UINT},
+               {MENU_ENUM_LABEL_MEDIA_PLAYER_CONTROLS_TIMEOUT, PARSE_ONLY_UINT},
+               {MENU_ENUM_LABEL_MEDIA_PLAYER_SUBTITLES, PARSE_ONLY_BOOL},
+               {MENU_ENUM_LABEL_MEDIA_PLAYER_SUBTITLE_DELAY, PARSE_ONLY_INT},
+            };
+            for (i = 0; i < ARRAY_SIZE(build_list); i++)
+               if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                        build_list[i].enum_idx, build_list[i].parse_type,
+                        false) == 0)
+                  count++;
          }
          break;
       case DISPLAYLIST_MENU_FILE_BROWSER_SETTINGS_LIST:
@@ -14013,6 +14203,9 @@ unsigned menu_displaylist_build_list(
 #endif
                {MENU_ENUM_LABEL_CAMERA_DRIVER,         PARSE_ONLY_STRING_OPTIONS},
                {MENU_ENUM_LABEL_LOCATION_DRIVER,       PARSE_ONLY_STRING_OPTIONS},
+#if defined(HAVE_RSLC) && defined(HAVE_GLSLANG)
+               {MENU_ENUM_LABEL_VIDEO_SHADER_COMPILER, PARSE_ONLY_UINT},
+#endif
             };
 
             for (i = 0; i < ARRAY_SIZE(build_list); i++)
@@ -15689,6 +15882,29 @@ static bool menu_displaylist_ctl_internal(
                            MENU_SETTING_ACTION, 0, 0, NULL))
                      count++;
 
+#ifdef HAVE_SLANG
+                  /* Only slang passes are told the simulated size. */
+                  if (video_driver_test_all_flags(GFX_CTX_FLAGS_SHADERS_SLANG))
+                  {
+                     if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(info->list,
+                              MENU_ENUM_LABEL_VIDEO_SHADER_SIMULATED_INPUT_RES,
+                              PARSE_ONLY_BOOL, false) == 0)
+                        count++;
+
+                     if (settings->bools.video_shader_simulated_input_resolution)
+                     {
+                        if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(info->list,
+                                 MENU_ENUM_LABEL_VIDEO_SHADER_SIMULATED_INPUT_RES_WIDTH,
+                                 PARSE_ONLY_UINT, false) == 0)
+                           count++;
+                        if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(info->list,
+                                 MENU_ENUM_LABEL_VIDEO_SHADER_SIMULATED_INPUT_RES_HEIGHT,
+                                 PARSE_ONLY_UINT, false) == 0)
+                           count++;
+                     }
+                  }
+#endif
+
                   if (menu_entries_append(info->list,
                            msg_hash_to_str(MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_NUM_PASSES),
                            MENU_ENUM_LABEL_VIDEO_SHADER_NUM_PASSES_STR,
@@ -16098,7 +16314,7 @@ static bool menu_displaylist_ctl_internal(
             break;
          case DISPLAYLIST_VIDEO_HISTORY:
             menu_entries_clear(info->list);
-#if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
+#if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_WEBMPLAYER)
             {
                bool history_list_enable      = settings->bools.history_list_enable;
                const char *
@@ -16137,7 +16353,7 @@ static bool menu_displaylist_ctl_internal(
                info->flags    &= ~MD_FLAG_NEED_SORT;
                info->flags    |=  MD_FLAG_NEED_REFRESH
                   |  MD_FLAG_NEED_PUSH;
-#if (defined(HAVE_FFMPEG) || defined(HAVE_MPV))
+#if (defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_WEBMPLAYER))
                if (history_needs_navigation_clear(menu, g_defaults.video_history))
                   info->flags |=  MD_FLAG_NEED_NAVIGATION_CLEAR;
 #endif
@@ -16933,6 +17149,7 @@ static bool menu_displaylist_ctl_internal(
          case DISPLAYLIST_ACCOUNTS_CHEEVOS_LIST:
          case DISPLAYLIST_ACCOUNTS_LIST:
          case DISPLAYLIST_MENU_FILE_BROWSER_SETTINGS_LIST:
+         case DISPLAYLIST_MEDIA_PLAYER_SETTINGS_LIST:
          case DISPLAYLIST_MENU_VIEWS_SETTINGS_LIST:
          case DISPLAYLIST_LAKKA_SERVICES_LIST:
 #ifdef HAVE_LAKKA_SWITCH
@@ -17955,7 +18172,7 @@ static bool menu_displaylist_ctl_internal(
             break;
          case DISPLAYLIST_IMAGES_HISTORY:
             menu_entries_clear(info->list);
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
             {
                bool history_list_enable  = settings->bools.history_list_enable;
                const char *path_content_image_history = settings->paths.path_content_image_history;
@@ -17989,7 +18206,7 @@ static bool menu_displaylist_ctl_internal(
             info->flags                &= ~MD_FLAG_NEED_SORT;
             info->flags                |=  MD_FLAG_NEED_REFRESH
                                         |  MD_FLAG_NEED_PUSH;
-#if defined(HAVE_IMAGEVIEWER)
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
             if (history_needs_navigation_clear(menu, g_defaults.image_history))
                info->flags             |=  MD_FLAG_NEED_NAVIGATION_CLEAR;
 #endif

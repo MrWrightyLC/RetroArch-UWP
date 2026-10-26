@@ -210,8 +210,8 @@ ACHIEVEMENTS
 
 /* rcheevos doesn't actually spawn and manage threads, RC_NO_THREADS
  * simply disables the mutexes that provide thread safety. rc_compat
- * carries its own native mutexes for GEKKO (recursive LWP) and 3DS
- * (RecursiveLock), so threaded builds keep their locks there too. */
+ * carries native recursive mutexes for the threaded consoles, so
+ * threaded builds keep their locks there too. */
 #if !defined(HAVE_THREADS)
 #define RC_NO_THREADS 1
 #endif
@@ -287,6 +287,9 @@ CRYPTO
 #include "../gfx/video_driver.c"
 #include "../gfx/common/video_mode_select.c"
 #include "../gfx/video_views.c"
+#if defined(HAVE_VIDEO_WINDOWS)
+#include "../gfx/video_windows.c"
+#endif
 /*============================================================
 UI COMMON CONTEXT
 ============================================================ */
@@ -324,6 +327,7 @@ VIDEO CONTEXT
 #endif
 
 #if defined(ANDROID)
+#include "../gfx/common/android_windows.c"
 #include "../gfx/drivers_context/android_ctx.c"
 #if defined(HAVE_OPENXR)
 #if defined(HAVE_OPENGLES3)
@@ -401,6 +405,7 @@ VIDEO CONTEXT
 #include "../gfx/drivers_context/drm_ctx.c"
 #include "../gfx/display_servers/dispserv_kms.c"
 #include "../gfx/common/drm_hdr.c"
+#include "../gfx/common/egl_gbm_frames.c"
 #endif
 
 #if defined(HAVE_VIDEOCORE)
@@ -451,10 +456,17 @@ VIDEO SHADERS
 #include "../gfx/video_shader_parse.c"
 #endif
 
+/* The Xcode projects take rslc in here; the other griffin builds
+ * compile griffin_rslc.c on its own. */
+#ifdef HAVE_RSLC_GRIFFIN
+#include "griffin_rslc.c"
+#endif
+
 #ifdef HAVE_SLANG
 #include "../gfx/drivers_shader/glslang_util.c"
 #include "../gfx/drivers_shader/slang_cache.c"
 #include "../gfx/drivers_shader/slang_rect.c"
+#include "../gfx/drivers_shader/slang_blob.c"
 #include "../gfx/drivers_shader/slang_process.c"
 #endif
 
@@ -557,9 +569,11 @@ VIDEO IMAGE
 #include "../libretro-common/formats/webm/rwebm_audio.c"
 #endif
 
-#ifdef HAVE_RMP4
+#if defined(HAVE_RMP4) || defined(HAVE_RWEBM)
 #include "../libretro-common/formats/h264/rh264.c"
 #include "../libretro-common/formats/h265/rh265.c"
+#endif
+#ifdef HAVE_RMP4
 #include "../libretro-common/formats/mp4/rmp4.c"
 #include "../libretro-common/formats/mp4/rmp4_video.c"
 #include "../libretro-common/formats/mp4/rmp4_audio.c"
@@ -573,9 +587,7 @@ VIDEO IMAGE
 #include "../libretro-common/formats/mpeg1/rmpeg1_ps.c"
 #include "../libretro-common/formats/mpeg1/rmpeg1_video.c"
 #endif
-#if defined(HAVE_RVP9) || defined(HAVE_RMP4)
-/* Shared 10-bit / HDR I420->RGB blits: used by the webm/mp4 rvp9 paths
- * and by rmp4_video's H.265 Main10 arm, so RMP4 alone needs them too. */
+#if defined(HAVE_RVP9) || defined(HAVE_RMP4) || defined(HAVE_RWEBM)
 #include "../libretro-common/formats/image/image_hdr_blit.c"
 #endif
 #if defined(HAVE_RWEBM) || defined(HAVE_RMP4)
@@ -615,6 +627,30 @@ VIDEO IMAGE
 /*============================================================
 VIDEO DRIVER
 ============================================================ */
+#if defined(_WIN32) && (defined(HAVE_D3D) || defined(HAVE_VULKAN))
+#include "../gfx/common/d3d_driver_pacing.c"
+#include "../libretro-common/gfx/nvidia/nvapi_loader.c"
+#endif
+#ifdef HAVE_NGX
+#include "../gfx/video_upscaler.c"
+#include "../gfx/common/ffx_common.c"
+#include "../gfx/common/xess_common.c"
+#include "../libretro-common/gfx/nvidia/ngx_loader.c"
+#include "../libretro-common/gfx/amd/ffx_loader.c"
+#include "../libretro-common/gfx/intel/xess_loader.c"
+#ifdef HAVE_VULKAN
+#include "../gfx/common/vulkan_upscaler.c"
+#include "../gfx/common/vulkan_ngx.c"
+#include "../gfx/common/vulkan_ffx.c"
+#include "../gfx/common/vulkan_xess.c"
+#endif
+#ifdef HAVE_D3D12
+#include "../gfx/common/d3d12_upscaler.c"
+#include "../gfx/common/d3d12_ngx.c"
+#include "../gfx/common/d3d12_ffx.c"
+#include "../gfx/common/d3d12_xess.c"
+#endif
+#endif
 #if defined(HAVE_D3D)
 #include "../gfx/common/d3d_common.c"
 
@@ -642,7 +678,8 @@ VIDEO DRIVER
 #include "../gfx/common/d3d11_deferred_proxy.c"
 #endif
 
-#if (defined(HAVE_D3D11) || defined(HAVE_D3D12)) && defined(HAVE_RMP4) \
+#if (defined(HAVE_D3D11) || defined(HAVE_D3D12)) \
+ && (defined(HAVE_RMP4) || defined(HAVE_RWEBM)) \
  && !defined(__WINRT__)
 #include "../gfx/common/d3d11_video_decode.c"
 #endif
@@ -709,6 +746,10 @@ VIDEO DRIVER
 
 #ifdef HAVE_OMAP
 #include "../gfx/drivers/omap_gfx.c"
+#endif
+
+#if defined(HAVE_VULKAN) || (defined(HAVE_OPENGL_CORE) && defined(HAVE_SLANG))
+#include "../gfx/common/spirv_shaders.c"
 #endif
 
 #ifdef HAVE_VULKAN
@@ -981,6 +1022,10 @@ INPUT (HID)
 
 #if defined(HAVE_WINUSB) && defined(HAVE_THREADS)
 #include "../input/drivers_hid/winusb_hid.c"
+#include "../input/drivers_hid/winusb_bind.c"
+#ifdef HAVE_WGI
+#include "../input/drivers_hid/winusb_wgi.c"
+#endif
 #endif
 
 #ifdef HAVE_BTSTACK
@@ -1002,6 +1047,9 @@ INPUT (HID)
 #include "../input/connect/joypad_connection.c"
 #include "../input/connect/connect_ps3.c"
 #include "../input/connect/connect_ps4.c"
+#include "../input/connect/connect_ps5.c"
+#include "../input/connect/connect_switch_pro.c"
+#include "../input/connect/connect_switch2_pro.c"
 #include "../input/connect/connect_wii.c"
 #include "../input/connect/connect_wiiupro.c"
 #include "../input/connect/connect_snesusb.c"
@@ -1013,6 +1061,8 @@ INPUT (HID)
 #include "../input/connect/connect_ps4_hori_mini.c"
 #include "../input/connect/connect_kade.c"
 #include "../input/connect/connect_zerodelay_dragonrise.c"
+#include "../input/connect/connect_8bitdo.c"
+#include "../input/connect/connect_gamecube_pc.c"
 #endif
 
 /*============================================================
@@ -1027,15 +1077,13 @@ FIFO BUFFER
 ============================================================ */
 #include "../libretro-common/queues/fifo_queue.c"
 #include "../libretro-common/queues/retro_spsc.c"
-/* The waitable queue and the eventcount it parks on are both under
- * HAVE_THREADS, because the eventcount is not thread-free: it calls
- * slock_new and scond_new directly, in twenty-odd places, and those
- * live in rthreads.c which only this configuration builds. Moving the
- * eventcount out on the theory that it degrades to a spin was wrong
- * and produced a threadless build that linked against rthreads. */
+/* Native Windows audio workers also need rthreads and eventcounts. */
+#if defined(HAVE_THREADS) || (defined(_WIN32) && !defined(_XBOX) \
+      && (defined(HAVE_DSOUND) || defined(HAVE_XAUDIO) || defined(HAVE_WAVEOUT)))
+#include "../libretro-common/rthreads/retro_eventcount.c"
+#endif
 #if defined(HAVE_THREADS)
 #include "../libretro-common/queues/retro_waitable_spsc.c"
-#include "../libretro-common/rthreads/retro_eventcount.c"
 #include "../libretro-common/rthreads/retro_procbarrier.c"
 #include "../libretro-common/rthreads/retro_asym_eventcount.c"
 #endif
@@ -1194,6 +1242,10 @@ AUDIO
 #include "../audio/drivers/opensl.c"
 #endif
 
+#ifdef HAVE_AAUDIO
+#include "../audio/drivers/aaudio.c"
+#endif
+
 #ifdef HAVE_PIPEWIRE
 #include "../audio/drivers/pipewire.c"
 #include "../audio/common/pipewire.c"
@@ -1265,6 +1317,10 @@ DRIVERS
 #include "../gfx/gfx_surface.c"
 #include "../gfx/gfx_surface_player.c"
 #include "../gfx/gfx_thumbnail.c"
+#include "../gfx/gfx_media_controls.c"
+#include "../gfx/gfx_media_display.c"
+#include "../gfx/gfx_media_player.c"
+#include "../gfx/gfx_media_cpu.c"
 #include "../gfx/gfx_anim_preview.c"
 
 /* rflac is used by the audio mixer (HAVE_RFLAC) and by the CHD FLAC
@@ -1463,6 +1519,7 @@ FRONTEND
 #elif defined(PS2)
 #include "../frontend/drivers/platform_ps2.c"
 #elif defined(__PS3__)
+#include "../frontend/drivers/platform_ps3_paths.c"
 #include "../frontend/drivers/platform_ps3.c"
 #elif defined(ORBIS)
 #include "../frontend/drivers/platform_orbis.c"
@@ -1541,7 +1598,11 @@ BLUETOOTH
 ============================================================ */
 #ifdef HAVE_BLUETOOTH
 #include "../bluetooth/bluetooth_driver.c"
+#ifdef _WIN32
+#include "../bluetooth/drivers/windows_bt.c"
+#else
 #include "../bluetooth/drivers/bluetoothctl.c"
+#endif
 #ifdef HAVE_DBUS
 #include "../bluetooth/drivers/bluez.c"
 #endif
@@ -1565,8 +1626,18 @@ WIFI
 RECORDING
 ============================================================ */
 #include "../record/record_driver.c"
+#include "../record/record_gpu_reinit.c"
 #include "../record/drivers/record_wav.c"
 #include "../record/drivers/record_nvenc.c"
+#include "../record/drivers/record_metal.c"
+#ifdef HAVE_RECORD_METAL
+#include "../record/record_gpu_queue.c"
+#include "../record/record_audio_queue.c"
+#include "../record/record_gpu_worker_vt.c"
+#include "../record/record_avfoundation_worker.c"
+#include "../record/record_avfoundation_session.c"
+#include "../libretro-common/formats/h265/rh265_sps_crop.c"
+#endif
 #ifdef HAVE_FFMPEG
 #include "../record/drivers/record_ffmpeg.c"
 #endif
@@ -1594,6 +1665,9 @@ THREAD
 #include "../frontend/thread_elevation/rtkit.c"
 #include "../frontend/thread_elevation/eevdf.c"
 #endif
+#elif defined(_WIN32) && !defined(_XBOX) \
+      && (defined(HAVE_DSOUND) || defined(HAVE_XAUDIO) || defined(HAVE_WAVEOUT))
+#include "../libretro-common/rthreads/rthreads.c"
 #endif
 
 /* needed for playlists, netplay lobbies and achievements */
@@ -1701,6 +1775,11 @@ MENU
 #ifdef HAVE_MENU
 #include "../menu/menu_str.c"
 #include "../menu/menu_driver.c"
+#include "../libretro-common/formats/subtitle/rsubtitle_srt.c"
+#include "../tasks/task_subtitle.c"
+#include "../gfx/gfx_media_subtitle.c"
+#include "../menu/menu_media_controls.c"
+#include "../menu/menu_media_browser.c"
 #include "../menu/menu_setting.c"
 #if defined(HAVE_MATERIALUI) || defined(HAVE_XMB) || defined(HAVE_OZONE)
 #include "../menu/menu_screensaver.c"

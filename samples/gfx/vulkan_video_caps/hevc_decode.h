@@ -389,6 +389,8 @@ done:
 #include "av1_decode.h"
 #endif
 
+#include "h26x_webm_decode.h"
+
 static int hevc_decode_probe(VkInstance instance, VkPhysicalDevice gpu,
       uint32_t family, uint32_t graphics, uint32_t codecs, PFN_vkGetInstanceProcAddr get)
 {
@@ -469,9 +471,9 @@ static int hevc_decode_probe(VkInstance instance, VkPhysicalDevice gpu,
    ctx->video_xfer_family = graphics; ctx->video_lanes = 1;
    ctx->video_codec_operations = VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR;
    vkGetPhysicalDeviceMemoryProperties(gpu, &ctx->memory_properties);
+   vkGetPhysicalDeviceProperties(gpu, &ctx->gpu_properties);
 #ifdef HEVC_RENDER_TEST
    ctx->flags |= VK_CTX_FLAG_TIMELINE_SEMAPHORE;
-   vkGetPhysicalDeviceProperties(gpu, &ctx->gpu_properties);
    vkGetDeviceQueue(device, graphics, 0, &ctx->queue);
    render_context = ctx;
 #endif
@@ -480,7 +482,15 @@ static int hevc_decode_probe(VkInstance instance, VkPhysicalDevice gpu,
    sample_rejections = 0;
    vulkan_symbol_wrapper_vkCreateImage = sample_image_fault;
    vulkan_symbol_wrapper_vkCreateImageView = sample_view_fault;
+   if ((getenv("H26X_TEST_WEBM") || getenv("H26X_TEST_MP4"))) ctx->video_codec_operations = codecs;
    if (!vulkan_video_decode_init(ctx)) goto done;
+   if ((getenv("H26X_TEST_WEBM") || getenv("H26X_TEST_MP4")))
+   {
+      ok = h26x_webm_decode_fixture();
+      vkDeviceWaitIdle(device);
+      vulkan_video_decode_deinit();
+      goto done;
+   }
    ok = 1;
    for (i = 0; i < 10; i++) if (!decode_fixture(&fixtures[i])) ok = 0;
    if (!decode_external()) ok = 0;

@@ -138,6 +138,7 @@ DEFINES += -DRARCH_MOBILE \
 	   -DHAVE_PATCH \
 	   -DHAVE_DSP_FILTER \
 	   -DHAVE_VIDEO_FILTER \
+	   -DHAVE_VIDEO_WINDOWS \
 	   -DHAVE_SCREENSHOTS \
 	   -DHAVE_REWIND \
 	   -DHAVE_CHEATS \
@@ -172,7 +173,6 @@ DEFINES += -DRARCH_MOBILE \
 	   -DHAVE_SHADERPIPELINE \
 	   -DHAVE_LIBRETRODB \
 	   -DHAVE_STB_FONT \
-	   -DHAVE_IMAGEVIEWER \
 	   -DHAVE_ONLINE_UPDATER \
 	   -DHAVE_UPDATE_ASSETS \
 	   -DHAVE_UPDATE_CORES \
@@ -205,18 +205,18 @@ DEFINES += -DHAVE_GFX_WIDGETS
 endif
 
 ifeq ($(HAVE_VULKAN),1)
+# slang shaders (Vulkan, GLES 3) are compiled by rslc
 DEFINES += -DHAVE_VULKAN \
 	   -DHAVE_SLANG \
-	   -DHAVE_GLSLANG \
-	   -DHAVE_BUILTINGLSLANG \
-	   -DHAVE_SPIRV_CROSS \
-	   -DWANT_GLSLANG \
+	   -DHAVE_RSLC \
 	   -D__STDC_LIMIT_MACROS
 endif
 
 DEFINES += -DHAVE_7ZIP \
 	   \
-	   -DHAVE_SL
+	   -DHAVE_SL \
+	   -DHAVE_AAUDIO \
+	   -DHAVE_RAC3
 
 ifeq ($(HAVE_CHEEVOS),1)
 DEFINES += -DHAVE_CHEEVOS \
@@ -275,18 +275,9 @@ ifeq ($(HAVE_VULKAN),1)
 INCFLAGS         += $(LOCAL_PATH)/$(RARCH_DIR)/gfx/include
 
 LOCAL_C_INCLUDES += $(INCFLAGS)
-# slang_process.c is C and amalgamated into griffin.c; it includes
-# <spirv_cross_c.h>, so the SPIRV-Cross directory must be on the C
-# include path, not just LOCAL_CPPFLAGS.  LOCAL_C_INCLUDES applies to
-# both C and C++ compiles under ndk-build.
-LOCAL_C_INCLUDES += $(LOCAL_PATH)/$(DEPS_DIR)/SPIRV-Cross
-LOCAL_CPPFLAGS   += -I$(LOCAL_PATH)/$(DEPS_DIR)/glslang \
-		    -I$(LOCAL_PATH)/$(DEPS_DIR)/glslang/glslang/glslang/Public \
-		    -I$(LOCAL_PATH)/$(DEPS_DIR)/glslang/glslang/glslang/MachineIndependent \
-		    -I$(LOCAL_PATH)/$(DEPS_DIR)/glslang/glslang/SPIRV
 
 LOCAL_CFLAGS    += -Wno-sign-compare -Wno-unused-variable -Wno-parentheses
-LOCAL_SRC_FILES += $(RARCH_DIR)/griffin/griffin_glslang.cpp
+LOCAL_SRC_FILES += $(RARCH_DIR)/griffin/griffin_rslc.c
 endif
 
 LOCAL_LDLIBS += -lOpenSLES

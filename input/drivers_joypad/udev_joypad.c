@@ -91,7 +91,10 @@ struct udev_joypad
     * identification strings, the keycode maps and the sensor state -
     * touched at hotplug and on the rare sensor read - trail behind. */
    int fd;
-   uint64_t buttons;
+   /* the buttons, the hats' directions and the first axes as the reads
+    * answer them, kept with each event: lent to the frontend's readers
+    * between two polls, nothing copied */
+   input_pad_view_t view;
    int8_t hats[NUM_HATS][2];
    int16_t axes[NUM_AXES];
    /* Deal with analog triggers that report -32767 to 32767 */
@@ -135,6 +138,14 @@ struct udev_joypad
    bool usb;
    uint8_t pressure_axis;
    int pressure_fd;
+
+   /* A DualShock 4's or DualSense's touchpad: a sibling evdev node of
+    * its own, its first two multitouch slots read into the view */
+   int touch_fd;
+   char *touch_path;
+   int32_t touch_min[2];
+   int32_t touch_span[2];
+   uint8_t touch_slot;
 };
 
 struct joypad_udev_entry
@@ -336,8 +347,8 @@ static void udev_rumble_write(unsigned p)
                   effect, p);
             continue;
          }
-         o->due[effect] = strength
-            ? udev_rumble_now() + UDEV_RUMBLE_REFRESH_MS : 0;
+         /* from the pass's own clock, read before anything went */
+         o->due[effect] = strength ? now + UDEV_RUMBLE_REFRESH_MS : 0;
       }
       o->playing[effect] = strength;
       if (!strength)
@@ -637,6 +648,137 @@ static void udev_open_sensor_node(struct udev_joypad *pad,
          pad->sensor_has_gyro  ? "yes" : "no");
 }
 
+/* An event of the touchpad's node into the pad's view */
+static void udev_touch_event(struct udev_joypad *pad,
+      uint16_t type, uint16_t code, int32_t value)
+{
+   input_pad_view_t *view = &pad->view;
+   unsigned slot          = pad->touch_slot;
+
+   if (type == EV_KEY)
+   {
+      if (code == BTN_LEFT)
+         view->touch_down = (uint8_t)(value
+               ? (view->touch_down |  INPUT_PAD_TOUCH_PRESS)
+               : (view->touch_down & ~INPUT_PAD_TOUCH_PRESS));
+      return;
+   }
+   if (type != EV_ABS)
+      return;
+   if (code == ABS_MT_SLOT)
+   {
+      pad->touch_slot = (uint8_t)(value < 0 ? 0xff : value > 0xfe ? 0xfe : value);
+      return;
+   }
+   if (slot >= INPUT_PAD_VIEW_TOUCHES)
+      return;
+   switch (code)
+   {
+      case ABS_MT_TRACKING_ID:
+         if (value < 0)
+            view->touch_down &= (uint8_t)~(1u << slot);
+         else
+            view->touch_down |= (uint8_t)(1u << slot);
+         break;
+      case ABS_MT_POSITION_X:
+      case ABS_MT_POSITION_Y:
+         {
+            unsigned a  = (code == ABS_MT_POSITION_Y);
+            int32_t pos = pad->touch_span[a]
+               ? (int32_t)(((int64_t)(value - pad->touch_min[a]) * 0xfffe)
+                     / pad->touch_span[a]) - 0x7fff
+               : 0;
+            if (pos < -0x7fff)
+               pos = -0x7fff;
+            else if (pos > 0x7fff)
+               pos = 0x7fff;
+            view->touch[slot] = a
+               ? ((view->touch[slot] & 0xffff) | ((uint32_t)(uint16_t)(int16_t)pos << 16))
+               : ((view->touch[slot] & 0xffff0000u) | (uint16_t)(int16_t)pos);
+         }
+         break;
+      default:
+         break;
+   }
+}
+
+static void udev_open_touch_node(struct udev_joypad *pad, const char *path,
+      unsigned p)
+{
+   struct input_absinfo info;
+   int fd;
+   unsigned a;
+
+   if ((fd = open(path, O_RDONLY | O_NONBLOCK)) < 0)
+      return;
+   for (a = 0; a < 2; a++)
+   {
+      if (ioctl(fd, EVIOCGABS(a ? ABS_MT_POSITION_Y : ABS_MT_POSITION_X), &info) < 0
+            || info.maximum <= info.minimum)
+      {
+         close(fd);
+         return;
+      }
+      pad->touch_min[a]  = info.minimum;
+      pad->touch_span[a] = info.maximum - info.minimum;
+   }
+   pad->touch_fd          = fd;
+   pad->touch_path        = strdup(path);
+   pad->touch_slot        = 0;
+   pad->view.touch_down   = 0;
+   pad->view.touchpad     = true;
+   RARCH_LOG("[udev] Pad #%u: touchpad at %s.\n", p, path);
+}
+
+static void udev_close_touch_node(struct udev_joypad *pad)
+{
+   if (pad->touch_fd >= 0)
+      close(pad->touch_fd);
+   if (pad->touch_path)
+      free(pad->touch_path);
+   pad->touch_fd        = -1;
+   pad->touch_path      = NULL;
+   pad->view.touchpad   = false;
+   pad->view.touch_down = 0;
+}
+
+/* The pad's touchpad: the node with ID_INPUT_TOUCHPAD under its HID
+ * parent */
+static void udev_find_touch_sibling(struct udev_device *gamepad_dev,
+      unsigned p)
+{
+   struct udev_enumerate *enumerate;
+   struct udev_list_entry *item;
+   struct udev_device *hid_parent = udev_device_get_parent_with_subsystem_devtype(
+         gamepad_dev, "hid", NULL);
+   const char *parent_syspath     = hid_parent
+      ? udev_device_get_syspath(hid_parent) : NULL;
+
+   if (!parent_syspath || !(enumerate = udev_enumerate_new(udev_joypad_fd)))
+      return;
+   udev_enumerate_add_match_property(enumerate, "ID_INPUT_TOUCHPAD", "1");
+   udev_enumerate_add_match_subsystem(enumerate, "input");
+   udev_enumerate_scan_devices(enumerate);
+   udev_list_entry_foreach(item, udev_enumerate_get_list_entry(enumerate))
+   {
+      struct udev_device *dev = udev_device_new_from_syspath(udev_joypad_fd,
+            udev_list_entry_get_name(item));
+      struct udev_device *parent;
+      const char *devnode, *syspath;
+      if (!dev)
+         continue;
+      devnode = udev_device_get_devnode(dev);
+      parent  = udev_device_get_parent_with_subsystem_devtype(dev, "hid", NULL);
+      syspath = parent ? udev_device_get_syspath(parent) : NULL;
+      if (devnode && syspath && string_is_equal(parent_syspath, syspath))
+         udev_open_touch_node(&udev_pads[p], devnode, p);
+      udev_device_unref(dev);
+      if (udev_pads[p].touch_fd >= 0)
+         break;
+   }
+   udev_enumerate_unref(enumerate);
+}
+
 static void udev_find_sensor_sibling(struct udev_device *gamepad_dev,
       unsigned p)
 {
@@ -802,6 +944,34 @@ static const uint8_t udev_ds3_pressure_byte[UDEV_DS3_PRESSURES] = {
    24, 23, 25, 22, 20, 21, 14, 16, 17, 15
 };
 
+/* Axis @i's value in the lent state, as axis() answers it. */
+static void udev_joypad_view_axis(struct udev_joypad *pad, unsigned i)
+{
+   int16_t val;
+   if (i >= INPUT_PAD_VIEW_AXES)
+      return;
+   val = pad->axes[i];
+   /* Deal with analog triggers that report -32767 to 32767 */
+   if (pad->neg_trigger[i])
+      val = (val + 0x7fff) / 2;
+   pad->view.axes[i] = val;
+}
+
+/* Hat @h's four directions in the lent state, as button() answers
+ * them: up, down, left, right from the low bit. */
+static void udev_joypad_view_hat(struct udev_joypad *pad, unsigned h)
+{
+   unsigned bits = 0;
+   if (h >= INPUT_PAD_VIEW_HATS)
+      return;
+   if (pad->hats[h][1] < 0) bits |= 1;
+   if (pad->hats[h][1] > 0) bits |= 2;
+   if (pad->hats[h][0] < 0) bits |= 4;
+   if (pad->hats[h][0] > 0) bits |= 8;
+   pad->view.hats = (uint16_t)((pad->view.hats & ~(0xf << (h * 4)))
+         | (bits << (h * 4)));
+}
+
 static void udev_pressure_attach(struct udev_joypad *pad, int fd,
       unsigned *axes)
 {
@@ -836,6 +1006,7 @@ static void udev_pressure_read(struct udev_joypad *pad)
       {
          unsigned b = report[newest][udev_ds3_pressure_byte[n]];
          pad->axes[pad->pressure_axis + n] = (int16_t)((b << 7) | (b >> 1));
+         udev_joypad_view_axis(pad, pad->pressure_axis + n);
       }
    }
    /* gone, or no longer ours: the buttons go on without */
@@ -844,7 +1015,10 @@ static void udev_pressure_read(struct udev_joypad *pad)
       close(pad->pressure_fd);
       pad->pressure = false;
       for (n = 0; n < UDEV_DS3_PRESSURES; n++)
+      {
          pad->axes[pad->pressure_axis + n] = 0;
+         udev_joypad_view_axis(pad, pad->pressure_axis + n);
+      }
    }
 }
 
@@ -1007,6 +1181,7 @@ static int udev_add_pad(struct udev_device *dev, unsigned p, int fd, const char 
             if (     (i == ABS_Z || i == ABS_RZ)
                   && udev_compute_axis(abs, abs->value) < -1300)
               pad->neg_trigger[axes] = true;
+            udev_joypad_view_axis(pad, axes);
             pad->axes_bind[i] = axes++;
          }
       }
@@ -1020,6 +1195,7 @@ static int udev_add_pad(struct udev_device *dev, unsigned p, int fd, const char 
 
    /* Look for a sibling sensor (IMU) evdev node under the same HID parent */
    udev_find_sensor_sibling(dev, p);
+   udev_find_touch_sibling(dev, p);
 
    if (*pad->ident)
    {
@@ -1108,6 +1284,7 @@ static void udev_free_pad(unsigned pad)
       close(udev_pads[pad].fd);
    if (udev_pads[pad].sensor_fd >= 0)
       close(udev_pads[pad].sensor_fd);
+   udev_close_touch_node(&udev_pads[pad]);
    if (udev_pads[pad].pressure)
       close(udev_pads[pad].pressure_fd);
 
@@ -1123,6 +1300,7 @@ static void udev_free_pad(unsigned pad)
 
    udev_pad_set_fd(pad, -1);
    udev_pads[pad].sensor_fd = -1;
+   udev_pads[pad].touch_fd  = -1;
 }
 
 static void udev_joypad_remove_device(const char *path)
@@ -1185,6 +1363,47 @@ static void udev_hotplug_sensor_add(struct udev_device *sensor_dev,
       }
       udev_device_unref(pad_dev);
    }
+}
+
+/* A touchpad node that came after its pad */
+static void udev_hotplug_touch_add(struct udev_device *dev, const char *path)
+{
+   int i;
+   struct udev_device *parent = udev_device_get_parent_with_subsystem_devtype(
+         dev, "hid", NULL);
+   const char *syspath        = parent ? udev_device_get_syspath(parent) : NULL;
+
+   if (!syspath)
+      return;
+   for (i = 0; i < MAX_USERS; i++)
+   {
+      struct udev_joypad *pad = &udev_pads[i];
+      struct udev_device *pad_dev, *pad_parent;
+      const char *pad_syspath;
+      bool same;
+      if (pad->fd < 0 || pad->touch_fd >= 0)
+         continue;
+      if (!(pad_dev = udev_device_new_from_devnum(udev_joypad_fd, 'c', pad->device)))
+         continue;
+      pad_parent  = udev_device_get_parent_with_subsystem_devtype(pad_dev, "hid", NULL);
+      pad_syspath = pad_parent ? udev_device_get_syspath(pad_parent) : NULL;
+      same        = pad_syspath && string_is_equal(syspath, pad_syspath);
+      udev_device_unref(pad_dev);
+      if (same)
+      {
+         udev_open_touch_node(pad, path, i);
+         return;
+      }
+   }
+}
+
+static void udev_hotplug_touch_remove(const char *path)
+{
+   int i;
+   for (i = 0; i < MAX_USERS; i++)
+      if (     udev_pads[i].touch_fd >= 0 && udev_pads[i].touch_path
+            && string_is_equal(udev_pads[i].touch_path, path))
+         udev_close_touch_node(&udev_pads[i]);
 }
 
 static void udev_hotplug_sensor_remove(const char *path)
@@ -1304,12 +1523,21 @@ static void udev_joypad_poll(void)
             /* Check for sensor node hotplug */
             const char *accel_val = udev_device_get_property_value(
                   dev, "ID_INPUT_ACCELEROMETER");
+            const char *touch_val = udev_device_get_property_value(
+                  dev, "ID_INPUT_TOUCHPAD");
             if (accel_val && string_is_equal(accel_val, "1"))
             {
                if (string_is_equal(action, "add"))
                   udev_hotplug_sensor_add(dev, devnode);
                else if (string_is_equal(action, "remove"))
                   udev_hotplug_sensor_remove(devnode);
+            }
+            else if (touch_val && string_is_equal(touch_val, "1"))
+            {
+               if (string_is_equal(action, "add"))
+                  udev_hotplug_touch_add(dev, devnode);
+               else if (string_is_equal(action, "remove"))
+                  udev_hotplug_touch_remove(devnode);
             }
          }
 
@@ -1342,9 +1570,9 @@ static void udev_joypad_poll(void)
                   if (code > 0 && code < KEY_MAX)
                   {
                      if (value)
-                        BIT64_SET(pad->buttons, pad->button_bind[code]);
+                        BIT256_SET(pad->view.buttons, pad->button_bind[code]);
                      else
-                        BIT64_CLEAR(pad->buttons, pad->button_bind[code]);
+                        BIT256_CLEAR(pad->view.buttons, pad->button_bind[code]);
                   }
                   break;
 
@@ -1364,6 +1592,7 @@ static void udev_joypad_poll(void)
                      case ABS_HAT3Y:
                         code                           -= ABS_HAT0X;
                         pad->hats[code >> 1][code & 1]  = value;
+                        udev_joypad_view_hat(pad, code >> 1);
                         break;
                      default:
                         {
@@ -1378,6 +1607,7 @@ static void udev_joypad_poll(void)
                                  && abs(pad->axes[axis]) < 0x2000)
                               pad->neg_trigger[axis] = false;
                            pad->axis_reported[axis] = true;
+                           udev_joypad_view_axis(pad, axis);
                            break;
                         }
                   }
@@ -1391,6 +1621,19 @@ static void udev_joypad_poll(void)
 
       if (pad->pressure)
          udev_pressure_read(pad);
+
+      if (pad->touch_fd >= 0)
+      {
+         struct input_event tevents[32];
+         ssize_t tlen;
+         while ((tlen = read(pad->touch_fd, tevents, sizeof(tevents))) > 0)
+         {
+            tlen /= sizeof(*tevents);
+            for (i = 0; i < tlen; i++)
+               udev_touch_event(pad, tevents[i].type, tevents[i].code,
+                     tevents[i].value);
+         }
+      }
 
       /* Read sensor events from sibling IMU node */
       if (  pad->sensor_fd >= 0
@@ -1463,6 +1706,7 @@ static void *udev_joypad_init(void *data)
    {
       udev_pad_set_fd(i, -1);
       udev_pads[i].sensor_fd = -1;
+      udev_pads[i].touch_fd  = -1;
    }
    udev_rumble_start();
 
@@ -1541,7 +1785,7 @@ static int32_t udev_joypad_button_state(
       /* hat requested and no hat button down */
    }
    else if (joykey < UDEV_NUM_BUTTONS)
-      return (BIT64_GET(pad->buttons, joykey));
+      return BIT256_GET(pad->view.buttons, joykey) ? 1 : 0;
    return 0;
 }
 
@@ -1561,7 +1805,7 @@ static void udev_joypad_get_buttons(unsigned port, input_bits_t *state)
 
 	if (pad)
    {
-		BITS_COPY64_PTR( state, pad->buttons );
+		*state = pad->view.buttons;
 	}
    else
       BIT256_CLEAR_ALL_PTR(state);
@@ -1590,6 +1834,12 @@ static int16_t udev_joypad_axis_state(
          return val;
    }
    return 0;
+}
+
+/* Read in the poll alone: the state is the same until the next. */
+static const input_pad_view_t *udev_joypad_view(unsigned port)
+{
+   return (port < MAX_USERS) ? &udev_pads[port].view : NULL;
 }
 
 static int16_t udev_joypad_axis(unsigned port, uint32_t joyaxis)
@@ -1777,6 +2027,12 @@ input_device_driver_t udev_joypad = {
    "udev",
 #if defined(__linux__)
    udev_joypad_get_bt_host,
-   udev_joypad_set_bt_host
+   udev_joypad_set_bt_host,
+#else
+   NULL, /* get_bt_host */
+   NULL, /* set_bt_host */
 #endif
+   NULL, /* survives_video */
+   NULL, /* set_player */
+   udev_joypad_view
 };

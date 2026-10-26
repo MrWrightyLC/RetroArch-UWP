@@ -54,6 +54,8 @@ enum thread_cmd
    CMD_VIDEO_NONE = 0,
    CMD_INIT,
    CMD_SET_SHADER,
+   CMD_SHADER_LOAD_BEGIN,
+   CMD_SHADER_LOAD_STEP,
    CMD_FREE,
    CMD_ALIVE, /* Blocking alive check. Used when paused. */
    CMD_SET_VIEWPORT,
@@ -91,6 +93,7 @@ enum thread_cmd
    CMD_POKE_SET_VIEW_COUNT,
    CMD_POKE_HW_CONTEXT_DESTROYING,
    CMD_POKE_SET_FRAME_FORMAT,
+   CMD_POLL_PRESENTABLE, /* Re-asks the context, deferred: no frame needed. */
 
    CMD_DUMMY = INT_MAX
 };
@@ -519,6 +522,7 @@ typedef struct thread_video
    /* Video thread sets it, the hold takes it with a fetch_and */
    retro_atomic_int_t drain_pending;
    retro_atomic_int_t movie_capable;
+   video_thread_movie_state_t movie_state;
    video_thread_movie_t movie_next;
    /* Fast-forward, from the frame info at the push: the hold stands
     * down for it. Distinct from nonblock, which vsync-off also sets. */
@@ -540,6 +544,9 @@ typedef struct thread_video
    retro_time_t content_due;
    retro_time_t content_period;
    retro_time_t run_start;
+   /* Frames Driver Pacing released, the driver's sleep in the hold's
+    * place (video_thread_pace_hold). Main thread. */
+   uint64_t driver_released;
    /* Handoff cost, this window and the last full one. Main thread. */
    struct
    {
@@ -872,6 +879,11 @@ typedef struct thread_video
           * video_info.stat_text points here. Only copied when there is
           * text, so a frame without the overlay carries none. */
          char stat_text[VIDEO_STAT_TEXT_SIZE];
+#ifdef HAVE_VIDEO_WINDOWS
+         /* The screens' windows this frame was handed, for the same
+          * reason: video_info.windows points here when it has them. */
+         video_windows_frame_t windows;
+#endif
       } slot[2];
       /* Zero-copy: the slot handed to the core through
        * get_current_software_framebuffer, VIDEO_THREAD_LEND_SPARE for
@@ -893,6 +905,11 @@ typedef struct thread_video
        * Opaque here so this header needs no API types; see
        * video_thread_hw.c. */
       void *hw_ring;
+      /* 1 while hw_ring hands one GL context between the threads: the
+       * video thread reads this, not hw_ring, at every pass - the ring
+       * is set up on the main thread, and this is stored after it with
+       * release, so a thread that sees 1 sees the ring. */
+      retro_atomic_int_t hw_handoff;
       uint64_t zero_copy_count;
    } frame;
 
@@ -1021,6 +1038,11 @@ void video_thread_set_raise_priority(bool raise);
  * the video thread.
  */
 bool video_thread_host_hold(void (*on_exit)(void));
+
+#ifdef _WIN32
+/* Set on the host thread; released there after the kept window. */
+bool video_thread_host_set_cleanup(void (*cleanup)(void));
+#endif
 
 /* True while the thread is held and waiting for its next driver. */
 bool video_thread_host_is_held(void);
@@ -1154,6 +1176,10 @@ bool video_thread_get_handoff_stats(video_thread_handoff_stats_t *out);
  * will signal - a ring fence - where the video thread may need the
  * main thread first. */
 void video_thread_main_pump(void);
+
+void video_thread_core_context_take(void);
+
+void video_thread_core_context_release(void);
 
 /* From the video thread, while it is answering a synchronous command:
  * runs fn on the thread waiting for the reply and returns when it has

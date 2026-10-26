@@ -17,7 +17,7 @@ needed; the YAML the workflows use is read by the small parser below.
 
   tools/ci_local.py run <workflow> [--job ID] [--matrix KEY=VALUE]...
                         [--skip REGEX]... [--dry-run] [--clean-copy]
-                        [--host] [--force]
+                        [--host] [--force] [--times]
       Runs a workflow's jobs, or one job; every matrix combination unless
       --matrix narrows them. <workflow> is a file name, with or without
       .yml, or the workflow's name.
@@ -29,6 +29,7 @@ needed; the YAML the workflows use is read by the small parser below.
                       its image (docker or podman is used otherwise)
         --force       run a job whose runner is another OS, or that uses
                       an action this script cannot stand in for
+        --times       print every step's time, not only the three slowest
 
   tools/ci_local.py selftest
       Checks the parser against PyYAML (when installed) and resolves every
@@ -39,7 +40,7 @@ repository is cloned instead), setup-python is the host's Python, and
 cache and artifact steps are skipped. A job using any other action is
 refused unless --force is given, which skips it.
 """
-import fnmatch, json, os, re, shlex, shutil, subprocess, sys, tempfile
+import fnmatch, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WF_DIR = os.path.join(ROOT, '.github', 'workflows')
@@ -971,6 +972,8 @@ STAND_INS = {
    'taiki-e/checkout-action': 'checkout',
    'actions/setup-python': 'host',
    'actions/cache': 'skip',
+   'actions/cache/restore': 'skip',
+   'actions/cache/save': 'skip',
    'actions/upload-artifact': 'skip',
    'actions/download-artifact': 'skip',
 }
@@ -1133,11 +1136,15 @@ class Runner:
             self.failed.append(label)
             self.say('== %s: FAILED' % label)
             return 'failure', {}
+      took = []
       try:
          for n, step in enumerate(steps):
+            started = time.time()
             status = self.run_step(wf, job, step, n, ctx, status, plat,
                                    defaults, workspace, temp, files,
                                    extra_path, engine, cid)
+            took.append((time.time() - started,
+                         step.get('name') or step.get('uses') or str(n)))
       finally:
          if cid:
             subprocess.run([engine, 'rm', '-f', cid], stdout=subprocess.DEVNULL,
@@ -1149,6 +1156,12 @@ class Runner:
                outputs[k] = interpolate(v, ctx, status)
             except Unresolved:
                outputs[k] = ''
+      # where the time went: a slow step is one to make faster
+      if not self.opts.dry_run:
+         every = getattr(self.opts, 'times', False)
+         for secs, name in sorted(took, reverse=True)[:None if every else 3]:
+            if every or secs >= 10:
+               self.say('   %4.0f s  %s' % (secs, name))
       if status == 'failure':
          self.failed.append(label)
          self.say('== %s: FAILED' % label)
@@ -1240,6 +1253,14 @@ class Runner:
       for p in files.values():
          open(p, 'a').close()
       run_env = dict(os.environ)
+      # One ccache serves every job here, where on GitHub each job has
+      # its own: a job's "ccache -M 250M" would cap the one they all
+      # share, so they evicted each other, and a clean copy is a new
+      # directory each run, which ccache puts in a debug build's hash, so
+      # nothing from the last run matched. Not where already set.
+      for k, v in (('CCACHE_MAXSIZE', '1G'), ('CCACHE_BASEDIR', workspace),
+                   ('CCACHE_NOHASHDIR', '1')):
+         run_env.setdefault(k, v)
       run_env.update(env)
       gh = ctx['github']
       run_env.update({
@@ -1825,6 +1846,7 @@ def main(argv):
       clean = False
       host = False
       force = False
+      times = False
    opts = Opts()
    opts.matrix = {}
    opts.skip = []
@@ -1855,6 +1877,8 @@ def main(argv):
          opts.host = True
       elif a == '--force':
          opts.force = True
+      elif a == '--times':
+         opts.times = True
       elif a.startswith('-'):
          sys.exit('ci_local: unknown option %s' % a)
       elif target is None:

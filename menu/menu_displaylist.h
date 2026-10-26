@@ -235,6 +235,7 @@ enum menu_displaylist_ctl_state
    DISPLAYLIST_ONSCREEN_NOTIFICATIONS_SETTINGS_LIST,
    DISPLAYLIST_ONSCREEN_NOTIFICATIONS_VIEWS_SETTINGS_LIST,
    DISPLAYLIST_MENU_FILE_BROWSER_SETTINGS_LIST,
+   DISPLAYLIST_MEDIA_PLAYER_SETTINGS_LIST,
    DISPLAYLIST_MENU_VIEWS_SETTINGS_LIST,
    DISPLAYLIST_QUICK_MENU_VIEWS_SETTINGS_LIST,
    DISPLAYLIST_SETTINGS_VIEWS_SETTINGS_LIST,
@@ -394,6 +395,11 @@ void menu_displaylist_info_init(menu_displaylist_info_t *info);
 bool menu_displaylist_ctl(enum menu_displaylist_ctl_state type, menu_displaylist_info_t *info, settings_t *settings);
 
 bool menu_displaylist_has_subsystems(void);
+
+#ifdef HAVE_BLUETOOTH
+/* A Bluetooth scan, its list shown again when it ends. */
+bool menu_displaylist_bluetooth_scan(void);
+#endif
 
 #if defined(HAVE_LIBRETRODB)
 unsigned menu_displaylist_explore(file_list_t *list, settings_t *settings);

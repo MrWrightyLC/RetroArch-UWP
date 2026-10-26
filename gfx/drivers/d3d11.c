@@ -71,11 +71,14 @@
 #include <libretro.h>
 #include <libretro_d3d11.h>
 #include "../common/d3dcompiler_common.h"
+#include <queues/task_queue.h>
+#include <retro_atomic.h>
 #include "../common/d3d11_deferred_proxy.h"
 #include "../common/d3d11_hw_interface.h"
 /* slang_process.h is self-contained - it only defines types and
  * constants used by pass state.  The actual slang_process() call
- * sites remain guarded with HAVE_SLANG+HAVE_SPIRV_CROSS. */
+ * sites remain guarded with HAVE_SLANG and a compiler that prints
+ * text: SPIRV-Cross or rslc. */
 #include "../drivers_shader/slang_process.h"
 #include "../drivers_shader/slang_rect.h"
 #ifdef HAVE_THREADS
@@ -84,7 +87,7 @@
 
 /* Frames a hardware decoder made on a device of its own, through
  * shared NT handles and fences (import_texture) */
-#if defined(HAVE_RMP4) && !defined(__WINRT__)
+#if (defined(HAVE_RMP4) || defined(HAVE_RWEBM)) && !defined(__WINRT__)
 #define D3D11_FRAME_IMPORT
 #include <d3d11_4.h>
 #include "../common/d3d11_video_decode.h"
@@ -741,6 +744,7 @@ typedef struct
       DXGI_FORMAT     format;
       bool            enable;
    } record;
+   d3d_driver_pacing_t   driver_pacing;
 } d3d11_video_t;
 
 #ifdef D3D11_FRAME_IMPORT
@@ -2334,7 +2338,7 @@ static uint32_t d3d11_get_flags(void *data)
    BIT32_SET(flags, GFX_CTX_FLAGS_OVERLAY_BEHIND_MENU_SUPPORTED);
    BIT32_SET(flags, GFX_CTX_FLAGS_BLACK_FRAME_INSERTION);
    BIT32_SET(flags, GFX_CTX_FLAGS_SCREENSHOTS_SUPPORTED);
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
    BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_SLANG);
    BIT32_SET(flags, GFX_CTX_FLAGS_SUBFRAME_SHADERS);
    BIT32_SET(flags, GFX_CTX_FLAGS_FAST_TOGGLE_SHADERS);
@@ -2749,7 +2753,7 @@ static void d3d11_set_hdr_subpixel_layout(void* data, unsigned subpixel_layout)
 }
 
 /* Only the slang passes set these. */
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
 static void d3d11_set_hdr_inverse_tonemap(d3d11_video_t* d3d11, bool inverse_tonemap)
 {
 
@@ -2923,19 +2927,32 @@ typedef struct d3d11_deferred_pass
    d3d11_shader_t    shader;
    pass_semantics_t  semantics;
    D3D11Buffer       buffers[SLANG_CBUFFER_MAX];
+   /* The pass's HLSL and the name it is compiled under, handed from the
+    * step to the build, which frees them */
+   char             *vs_src;
+   char             *ps_src;
+   char             *path;
 } d3d11_deferred_pass_t;
 
+/* A pass is built - its stages compiled, its objects made - on the
+ * task threads, several at once, after the step that processed it.
+ * The load and each build hold a reference to the state; the builds a
+ * load still waits on are counted in building. */
 typedef struct d3d11_deferred_state
 {
+   retro_atomic_int_t        refs;
+   retro_atomic_int_t        building;
+   retro_atomic_int_t        failed;   /* a build failed: the load ends */
    struct video_shader      *shader_preset;
    d3d11_deferred_pass_t     passes[GFX_MAX_SHADERS];
-   d3d11_texture_t           luts[GFX_MAX_TEXTURES];
-   bool                      luts_loaded;
    unsigned                  shader_model;
    enum d3d11_feature_level_hint feat_level_hint;
+   /* read at begin: the step's thread reads no driver state */
+   bool                      frame_rect;
+   bool                      frame_smooth;
 } d3d11_deferred_state_t;
 
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
 /* Feature Level 11.0 and up should all support Shader Model 5.0 */
 static unsigned d3d11_shader_model(d3d11_video_t *d3d11,
       enum d3d11_feature_level_hint *hint)
@@ -2974,10 +2991,14 @@ static unsigned d3d11_hdr_output_mode(const d3d11_video_t *video)
    return 0;
 }
 
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
+static bool d3d11_load_luts(d3d11_video_t *d3d11);
+#endif
+
 static bool d3d11_shader_load_begin(void *data,
       shader_load_deferred_t *deferred)
 {
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
    d3d11_video_t *d3d11 = (d3d11_video_t*)data;
    d3d11_deferred_state_t *ds;
 
@@ -2990,6 +3011,9 @@ static bool d3d11_shader_load_begin(void *data,
    ds = (d3d11_deferred_state_t*)calloc(1, sizeof(*ds));
    if (!ds)
       return false;
+   retro_atomic_int_init(&ds->refs, 1);
+   retro_atomic_int_init(&ds->building, 0);
+   retro_atomic_int_init(&ds->failed, 0);
 
    ds->shader_preset = (struct video_shader*)calloc(
          1, sizeof(*ds->shader_preset));
@@ -3012,94 +3036,57 @@ static bool d3d11_shader_load_begin(void *data,
 
    deferred->total_passes = ds->shader_preset->passes;
 
-   /* Load LUTs synchronously */
-   {
-      unsigned i;
-      for (i = 0; i < ds->shader_preset->luts; i++)
-      {
-         struct texture_image image;
-         /* pix10 is a request the load reads: cleared with the rest */
-         memset(&image, 0, sizeof(image));
-         image.supports_rgba = true;
-
-         if (!image_texture_load(&image,
-                  ds->shader_preset->lut[i].path))
-         {
-            RARCH_ERR("[D3D11] Deferred: failed to load LUT: \"%s\".\n",
-                  ds->shader_preset->lut[i].path);
-            goto error;
-         }
-
-         ds->luts[i].desc.Width  = image.width;
-         ds->luts[i].desc.Height = image.height;
-         ds->luts[i].desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-
-         if (ds->shader_preset->lut[i].mipmap)
-            ds->luts[i].desc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
-
-         d3d11_init_texture(d3d11->device, &ds->luts[i]);
-
-         if (ds->luts[i].staging)
-            d3d11_update_texture(
-                  d3d11->context,
-                  image.width, image.height, 0,
-                  DXGI_FORMAT_R8G8B8A8_UNORM, image.pixels,
-                  &ds->luts[i]);
-
-         image_texture_free(&image);
-      }
-      ds->luts_loaded = true;
-   }
-
    RARCH_LOG("[D3D11] Deferred: prepared %u passes for \"%s\".\n",
          deferred->total_passes, deferred->preset_path);
 
-   deferred->driver_data = ds;
+   /* A pass is D3DCompile and the device's object creation, both
+    * free-threaded; the context is used in the finalizing step only.
+    * So the passes may be built on the task thread, and their builds
+    * several at once, with the compiler loaded here first. */
+   deferred->step_any_thread = d3d_compiler_load();
+   ds->frame_rect            = (d3d11->flags & D3D11_ST_FLAG_HW_IFACE_ENABLE) != 0;
+   ds->frame_smooth          = d3d11->chain.frame_rect.smooth;
+   deferred->driver_data     = ds;
    return true;
-
-error:
-   {
-      unsigned j;
-      for (j = 0; j < ds->shader_preset->luts; j++)
-         d3d11_release_texture(&ds->luts[j]);
-   }
-   free(ds->shader_preset);
-   free(ds);
-   return false;
 #else
    return false;
 #endif
 }
 
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
-static void d3d11_deferred_state_free(
-      d3d11_deferred_state_t *ds,
-      unsigned passes_built)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
+/* The last holder frees what the passes made: the load's, or a build
+ * still running when the load ended. */
+static void d3d11_deferred_state_unref(d3d11_deferred_state_t *ds)
+{
+   unsigned i;
+
+   if (retro_atomic_fetch_add_int(&ds->refs, -1) != 1)
+      return;
+
+   for (i = 0; i < GFX_MAX_SHADERS; i++)
+   {
+      unsigned j;
+      d3d11_release_shader(&ds->passes[i].shader);
+      free(ds->passes[i].semantics.textures);
+      for (j = 0; j < SLANG_CBUFFER_MAX; j++)
+      {
+         free(ds->passes[i].semantics.cbuffers[j].uniforms);
+         Release(ds->passes[i].buffers[j]);
+      }
+      free(ds->passes[i].vs_src);
+      free(ds->passes[i].ps_src);
+      free(ds->passes[i].path);
+   }
+   free(ds);
+}
+
+/* The load lets go: the preset now, the passes with the last build. */
+static void d3d11_deferred_state_free(d3d11_deferred_state_t *ds)
 {
    unsigned i;
 
    if (!ds)
       return;
-
-   for (i = 0; i < passes_built; i++)
-   {
-      unsigned j;
-      d3d11_release_shader(&ds->passes[i].shader);
-      free(ds->passes[i].semantics.textures);
-      ds->passes[i].semantics.textures = NULL;
-      for (j = 0; j < SLANG_CBUFFER_MAX; j++)
-      {
-         free(ds->passes[i].semantics.cbuffers[j].uniforms);
-         ds->passes[i].semantics.cbuffers[j].uniforms = NULL;
-         Release(ds->passes[i].buffers[j]);
-      }
-   }
-
-   if (ds->luts_loaded && ds->shader_preset)
-   {
-      for (i = 0; i < ds->shader_preset->luts; i++)
-         d3d11_release_texture(&ds->luts[i]);
-   }
 
    if (ds->shader_preset)
    {
@@ -3109,32 +3096,148 @@ static void d3d11_deferred_state_free(
          free(ds->shader_preset->pass[i].source.string.fragment);
       }
       free(ds->shader_preset);
+      ds->shader_preset = NULL;
    }
 
-   free(ds);
+   d3d11_deferred_state_unref(ds);
+}
+
+/* Pass @i's stages compiled and its objects made, on whichever thread:
+ * everything it reads was written before the handoff and nothing else
+ * writes it until building drops. */
+static void d3d11_deferred_build_pass(D3D11Device device,
+      d3d11_deferred_state_t *ds, unsigned i)
+{
+   static const D3D11_INPUT_ELEMENT_DESC desc[] = {
+      { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0,
+         offsetof(d3d11_vertex_t, position),
+         D3D11_INPUT_PER_VERTEX_DATA, 0 },
+      { "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0,
+         offsetof(d3d11_vertex_t, texcoord),
+         D3D11_INPUT_PER_VERTEX_DATA, 0 },
+   };
+   d3d11_deferred_pass_t *p = &ds->passes[i];
+   char _path[PATH_MAX_LENGTH];
+   size_t _len = strlcpy(_path, p->path ? p->path : "", sizeof(_path));
+   unsigned j;
+
+   strlcpy_lit(_path + _len, ".vs.hlsl", sizeof(_path) - _len);
+   d3d11_init_shader(device, p->vs_src, 0,
+         _path, "main", NULL, NULL, desc, countof(desc),
+         &p->shader, ds->feat_level_hint);
+
+   strlcpy_lit(_path + _len, ".ps.hlsl", sizeof(_path) - _len);
+   d3d11_init_shader(device, p->ps_src, 0, _path,
+         NULL, "main", NULL, NULL, 0,
+         &p->shader, ds->feat_level_hint);
+
+   free(p->vs_src);
+   free(p->ps_src);
+   free(p->path);
+   p->vs_src = NULL;
+   p->ps_src = NULL;
+   p->path   = NULL;
+
+   if (!p->shader.vs || !p->shader.ps)
+   {
+      RARCH_ERR("[D3D11] Deferred: failed to compile shader for pass %u.\n", i);
+      retro_atomic_store_release_int(&ds->failed, 1);
+      return;
+   }
+
+   for (j = 0; j < SLANG_CBUFFER_MAX; j++)
+   {
+      D3D11_BUFFER_DESC buf_desc;
+      buf_desc.ByteWidth           = p->semantics.cbuffers[j].size;
+      buf_desc.Usage               = D3D11_USAGE_DYNAMIC;
+      buf_desc.BindFlags           = D3D11_BIND_CONSTANT_BUFFER;
+      buf_desc.CPUAccessFlags      = D3D11_CPU_ACCESS_WRITE;
+      buf_desc.MiscFlags           = 0;
+      buf_desc.StructureByteStride = 0;
+
+      if (!buf_desc.ByteWidth)
+         continue;
+
+      device->lpVtbl->CreateBuffer(device, &buf_desc, NULL, &p->buffers[j]);
+   }
+}
+
+struct d3d11_build_task
+{
+   D3D11Device             device;  /* one reference */
+   d3d11_deferred_state_t *ds;      /* one reference */
+   unsigned                pass;
+};
+
+static void d3d11_build_task_handler(retro_task_t *task)
+{
+   struct d3d11_build_task *b = (struct d3d11_build_task*)task->state;
+   d3d11_deferred_build_pass(b->device, b->ds, b->pass);
+   /* publishes the pass to the step that waits on building */
+   retro_atomic_fetch_add_int(&b->ds->building, -1);
+   Release(b->device);
+   d3d11_deferred_state_unref(b->ds);
+   free(b);
+   task->state = NULL;
+   task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
+}
+
+/* Pass @i built beside the frame and the other passes when the task
+ * queue runs on threads; here and now otherwise. */
+static void d3d11_deferred_build(d3d11_video_t *d3d11,
+      d3d11_deferred_state_t *ds, unsigned i)
+{
+   struct d3d11_build_task *b;
+   retro_task_t *task;
+
+   if (     task_queue_is_threaded()
+         && (b = (struct d3d11_build_task*)malloc(sizeof(*b))))
+   {
+      if ((task = task_init()))
+      {
+         b->device = d3d11->device;
+         b->ds     = ds;
+         b->pass   = i;
+         d3d11->device->lpVtbl->AddRef(d3d11->device);
+         retro_atomic_fetch_add_int(&ds->refs, 1);
+         retro_atomic_fetch_add_int(&ds->building, 1);
+         task->handler = d3d11_build_task_handler;
+         task->state   = b;
+         task->flags  |= RETRO_TASK_FLG_MUTE | RETRO_TASK_FLG_PARALLEL;
+         if (task_queue_push(task))
+            return;
+         /* refused: the task is still ours, and the build is too */
+         retro_atomic_fetch_add_int(&ds->building, -1);
+         retro_atomic_fetch_add_int(&ds->refs, -1);
+         Release(d3d11->device);
+         free(task);
+      }
+      free(b);
+   }
+   d3d11_deferred_build_pass(d3d11->device, ds, i);
 }
 #endif
 
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
 /* A hardware core's frame may lie in the corner of a larger texture:
  * the preset's passes are rewritten to read it there where they can,
  * through d3d11->chain.frame_rect. */
 static void d3d11_frame_rect_semantics(d3d11_video_t *d3d11,
-      semantics_map_t *map)
+      semantics_map_t *map, bool enabled, bool smooth)
 {
-   if (!(d3d11->flags & D3D11_ST_FLAG_HW_IFACE_ENABLE))
+   if (!enabled)
       return;
    map->uniforms[SLANG_SEMANTIC_ORIGINAL_RECT]   = d3d11->chain.frame_rect.values;
    map->uniforms[SLANG_SEMANTIC_ORIGINAL_CLAMP]  = d3d11->chain.frame_rect.values + 4;
    map->uniforms[SLANG_SEMANTIC_ORIGINAL_TEXELS] = d3d11->chain.frame_rect.values + 8;
-   map->frame_smooth                             = d3d11->chain.frame_rect.smooth;
+   map->frame_smooth                             = smooth;
 }
 #endif
 
 static bool d3d11_shader_load_step(void *data,
       shader_load_deferred_t *deferred)
 {
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
    d3d11_video_t *d3d11          = (d3d11_video_t*)data;
    d3d11_deferred_state_t *ds    =
       (d3d11_deferred_state_t*)deferred->driver_data;
@@ -3143,6 +3246,18 @@ static bool d3d11_shader_load_step(void *data,
    if (!d3d11 || !ds)
    {
       deferred->state = SHADER_LOAD_FAILED;
+      return false;
+   }
+
+   /* A build that failed ends the load at the next step, as one that
+    * failed in the step itself did; builds still running let go of the
+    * state when they return. */
+   if (     retro_atomic_load_acquire_int(&ds->failed)
+         && deferred->state == SHADER_LOAD_COMPILING)
+   {
+      d3d11_deferred_state_free(ds);
+      deferred->state       = SHADER_LOAD_FAILED;
+      deferred->driver_data = NULL;
       return false;
    }
 
@@ -3159,7 +3274,6 @@ static bool d3d11_shader_load_step(void *data,
          : &d3d11->chain.pass[i - 1].rt;
 
       {
-         unsigned j;
          semantics_map_t semantics_map = {
             {
                { &d3d11->chain.history[0].view, 0,
@@ -3176,9 +3290,7 @@ static bool d3d11_shader_load_step(void *data,
                { &d3d11->chain.pass[0].feedback.view, sizeof(*d3d11->chain.pass),
                   &d3d11->chain.pass[0].feedback.size_data,
                   sizeof(*d3d11->chain.pass) },
-               /* Point at d3d11->chain.luts, not ds->luts — stored
-                * texture_data pointers must remain valid after
-                * ds is freed */
+               /* the LUTs are the chain's, loaded at the install */
                { &d3d11->chain.luts[0].view, sizeof(*d3d11->chain.luts),
                   &d3d11->chain.luts[0].size_data, sizeof(*d3d11->chain.luts) },
             },
@@ -3224,86 +3336,39 @@ static bool d3d11_shader_load_step(void *data,
                &d3d11->chain.pass[i].passthrough;
          semantics_map.uniforms[SLANG_SEMANTIC_SWAP_COUNT] =
             &d3d11->chain.pass[i].swap_count;
-         d3d11_frame_rect_semantics(d3d11, &semantics_map);
+         d3d11_frame_rect_semantics(d3d11, &semantics_map, ds->frame_rect,
+               ds->frame_smooth);
          if (!slang_process(
                   ds->shader_preset, i, RARCH_SHADER_HLSL,
                   ds->shader_model, &semantics_map,
                   &ds->passes[i].semantics))
          {
             RARCH_ERR("[D3D11] Deferred: failed to process pass %u.\n", i);
-            d3d11_deferred_state_free(ds, pass);
+            d3d11_deferred_state_free(ds);
             deferred->state       = SHADER_LOAD_FAILED;
             deferred->driver_data = NULL;
             return false;
          }
 
-         /* Compile HLSL and create shader objects */
-         {
-            static const D3D11_INPUT_ELEMENT_DESC desc[] = {
-               { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0,
-                  offsetof(d3d11_vertex_t, position),
-                  D3D11_INPUT_PER_VERTEX_DATA, 0 },
-               { "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0,
-                  offsetof(d3d11_vertex_t, texcoord),
-                  D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            };
-            char _path[PATH_MAX_LENGTH];
-            const char *slang_path =
-               ds->shader_preset->pass[i].source.path;
-            const char *vs_src =
-               ds->shader_preset->pass[i].source.string.vertex;
-            const char *ps_src =
-               ds->shader_preset->pass[i].source.string.fragment;
-            size_t _len = strlcpy(_path, slang_path, sizeof(_path));
-
-            strlcpy_lit(_path + _len, ".vs.hlsl", sizeof(_path) - _len);
-            d3d11_init_shader(d3d11->device, vs_src, 0,
-                  _path, "main", NULL, NULL, desc, countof(desc),
-                  &ds->passes[i].shader, ds->feat_level_hint);
-
-            strlcpy_lit(_path + _len, ".ps.hlsl", sizeof(_path) - _len);
-            d3d11_init_shader(d3d11->device, ps_src, 0, _path,
-                  NULL, "main", NULL, NULL, 0,
-                  &ds->passes[i].shader, ds->feat_level_hint);
-
-            free(ds->shader_preset->pass[i].source.string.vertex);
-            free(ds->shader_preset->pass[i].source.string.fragment);
-            ds->shader_preset->pass[i].source.string.vertex   = NULL;
-            ds->shader_preset->pass[i].source.string.fragment = NULL;
-
-            if (!ds->passes[i].shader.vs || !ds->passes[i].shader.ps)
-            {
-               RARCH_ERR("[D3D11] Deferred: failed to compile shader"
-                     " for pass %u.\n", i);
-               d3d11_deferred_state_free(ds, pass + 1);
-               deferred->state       = SHADER_LOAD_FAILED;
-               deferred->driver_data = NULL;
-               return false;
-            }
-         }
-
-         /* Create cbuffers */
-         for (j = 0; j < SLANG_CBUFFER_MAX; j++)
-         {
-            D3D11_BUFFER_DESC buf_desc;
-            buf_desc.ByteWidth           =
-               ds->passes[i].semantics.cbuffers[j].size;
-            buf_desc.Usage               = D3D11_USAGE_DYNAMIC;
-            buf_desc.BindFlags           = D3D11_BIND_CONSTANT_BUFFER;
-            buf_desc.CPUAccessFlags      = D3D11_CPU_ACCESS_WRITE;
-            buf_desc.MiscFlags           = 0;
-            buf_desc.StructureByteStride = 0;
-
-            if (!buf_desc.ByteWidth)
-               continue;
-
-            d3d11->device->lpVtbl->CreateBuffer(
-                  d3d11->device, &buf_desc, NULL,
-                  &ds->passes[i].buffers[j]);
-         }
+         /* The HLSL to the build, which compiles it and makes the
+          * pass's objects */
+         ds->passes[i].vs_src = ds->shader_preset->pass[i].source.string.vertex;
+         ds->passes[i].ps_src = ds->shader_preset->pass[i].source.string.fragment;
+         ds->passes[i].path   = strdup(ds->shader_preset->pass[i].source.path);
+         ds->shader_preset->pass[i].source.string.vertex   = NULL;
+         ds->shader_preset->pass[i].source.string.fragment = NULL;
+         d3d11_deferred_build(d3d11, ds, i);
       }
 
       deferred->current_pass++;
+      /* a build made here and now that failed ends the load now */
+      if (retro_atomic_load_acquire_int(&ds->failed))
+      {
+         d3d11_deferred_state_free(ds);
+         deferred->state       = SHADER_LOAD_FAILED;
+         deferred->driver_data = NULL;
+         return false;
+      }
       return true;
    }
 
@@ -3311,7 +3376,19 @@ static bool d3d11_shader_load_step(void *data,
    if (deferred->state != SHADER_LOAD_COMPILING)
    {
       RARCH_LOG("[D3D11] Deferred: cancelled, cleaning up.\n");
-      d3d11_deferred_state_free(ds, pass);
+      d3d11_deferred_state_free(ds);
+      deferred->state       = SHADER_LOAD_FAILED;
+      deferred->driver_data = NULL;
+      return false;
+   }
+
+   /* Passes still compiling: the chain goes live once they are in */
+   if (retro_atomic_load_acquire_int(&ds->building))
+      return true;
+   /* the last of them may have failed since the check above */
+   if (retro_atomic_load_acquire_int(&ds->failed))
+   {
+      d3d11_deferred_state_free(ds);
       deferred->state       = SHADER_LOAD_FAILED;
       deferred->driver_data = NULL;
       return false;
@@ -3326,11 +3403,6 @@ static bool d3d11_shader_load_step(void *data,
    /* Install preset */
    d3d11->chain.shader_preset = ds->shader_preset;
    ds->shader_preset    = NULL;
-
-   /* Install LUTs */
-   memcpy(d3d11->chain.luts, ds->luts, sizeof(ds->luts));
-   memset(ds->luts, 0, sizeof(ds->luts));
-   ds->luts_loaded = false;
 
    /* Install per-pass state */
    {
@@ -3351,6 +3423,16 @@ static bool d3d11_shader_load_step(void *data,
          memset(ds->passes[i].buffers, 0,
                sizeof(ds->passes[i].buffers));
       }
+   }
+
+   /* The LUTs the installed passes read */
+   if (!d3d11_load_luts(d3d11))
+   {
+      d3d11_free_shader_preset(d3d11);
+      d3d11_deferred_state_free(ds);
+      deferred->state       = SHADER_LOAD_FAILED;
+      deferred->driver_data = NULL;
+      return false;
    }
 
 #ifdef HAVE_DXGI_HDR
@@ -3440,7 +3522,7 @@ static bool d3d11_shader_load_step(void *data,
    deferred->state = SHADER_LOAD_DONE;
    RARCH_LOG("[D3D11] Deferred: shader loaded successfully.\n");
 
-   free(ds);
+   d3d11_deferred_state_unref(ds);
    deferred->driver_data = NULL;
    return false;
 #else
@@ -3449,7 +3531,55 @@ static bool d3d11_shader_load_step(void *data,
 #endif
 }
 
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
+/* The preset's LUTs some pass samples or takes the size of, loaded
+ * once every pass is processed; one no pass reads is never decoded. */
+static bool d3d11_load_luts(d3d11_video_t *d3d11)
+{
+   unsigned i;
+   uint8_t read[GFX_MAX_TEXTURES];
+   const struct video_shader *preset = d3d11->chain.shader_preset;
+   memset(read, 0, sizeof(read));
+   for (i = 0; i < preset->passes; i++)
+      slang_semantics_luts_read(&d3d11->chain.pass[i].semantics,
+            &d3d11->chain.luts[0].view, &d3d11->chain.luts[0].size_data,
+            sizeof(*d3d11->chain.luts), preset->luts, read);
+   for (i = 0; i < preset->luts; i++)
+   {
+      struct texture_image image;
+      if (!read[i])
+         continue;
+      memset(&image, 0, sizeof(image));
+      image.supports_rgba        = true;
+
+      if (!image_texture_load(&image, preset->lut[i].path))
+      {
+         RARCH_ERR("[D3D11] Failed to load LUT: \"%s\".\n", preset->lut[i].path);
+         return false;
+      }
+
+      d3d11->chain.luts[i].desc.Width  = image.width;
+      d3d11->chain.luts[i].desc.Height = image.height;
+      d3d11->chain.luts[i].desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+      if (preset->lut[i].mipmap)
+         d3d11->chain.luts[i].desc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+
+      d3d11_release_texture(&d3d11->chain.luts[i]);
+      d3d11_init_texture(d3d11->device, &d3d11->chain.luts[i]);
+
+      if (d3d11->chain.luts[i].staging)
+         d3d11_update_texture(
+               d3d11->context, image.width, image.height, 0, DXGI_FORMAT_R8G8B8A8_UNORM, image.pixels,
+               &d3d11->chain.luts[i]);
+
+      image_texture_free(&image);
+   }
+   return true;
+}
+#endif
+
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
 /* Pass @i of the preset built: its stages processed and compiled, its
  * buffers made. */
 static bool d3d11_pass_build(d3d11_video_t *d3d11, unsigned i,
@@ -3527,7 +3657,9 @@ static bool d3d11_pass_build(d3d11_video_t *d3d11, unsigned i,
          &d3d11->chain.pass[i].passthrough;
    semantics_map.uniforms[SLANG_SEMANTIC_SWAP_COUNT] =
          &d3d11->chain.pass[i].swap_count;
-   d3d11_frame_rect_semantics(d3d11, &semantics_map);
+   d3d11_frame_rect_semantics(d3d11, &semantics_map,
+         (d3d11->flags & D3D11_ST_FLAG_HW_IFACE_ENABLE) != 0,
+         d3d11->chain.frame_rect.smooth);
    if (!slang_process(
             d3d11->chain.shader_preset, i, RARCH_SHADER_HLSL, shader_model,
             &semantics_map,
@@ -3634,7 +3766,7 @@ static void d3d11_frame_rect_rebuild(d3d11_video_t *d3d11)
 
 static bool d3d11_gfx_set_shader(void* data, enum rarch_shader_type type, const char* path)
 {
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
    enum d3d11_feature_level_hint feat_level_hint;
    unsigned         i;
    unsigned         shader_model;
@@ -3769,32 +3901,8 @@ static bool d3d11_gfx_set_shader(void* data, enum rarch_shader_type type, const 
    }
 #endif /* HAVE_DXGI_HDR */
 
-   for (i = 0; i < d3d11->chain.shader_preset->luts; i++)
-   {
-      struct texture_image image;
-      memset(&image, 0, sizeof(image));
-      image.supports_rgba        = true;
-
-      if (!image_texture_load(&image, d3d11->chain.shader_preset->lut[i].path))
-         goto error;
-
-      d3d11->chain.luts[i].desc.Width  = image.width;
-      d3d11->chain.luts[i].desc.Height = image.height;
-      d3d11->chain.luts[i].desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-
-      if (d3d11->chain.shader_preset->lut[i].mipmap)
-         d3d11->chain.luts[i].desc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
-
-      d3d11_release_texture(&d3d11->chain.luts[i]);
-      d3d11_init_texture(d3d11->device, &d3d11->chain.luts[i]);
-
-      if (d3d11->chain.luts[i].staging)
-         d3d11_update_texture(
-               d3d11->context, image.width, image.height, 0, DXGI_FORMAT_R8G8B8A8_UNORM, image.pixels,
-               &d3d11->chain.luts[i]);
-
-      image_texture_free(&image);
-   }
+   if (!d3d11_load_luts(d3d11))
+      goto error;
 
    d3d11->flags |= D3D11_ST_FLAG_INIT_HISTORY | D3D11_ST_FLAG_RESIZE_RTS;
 
@@ -3929,6 +4037,7 @@ static void d3d11_gfx_free(void* data)
    }
    else
    {
+      d3d_driver_pacing_free(&d3d11->driver_pacing, d3d11->device);
       Release(d3d11->context);
       Release(d3d11->device);
    }
@@ -5392,6 +5501,16 @@ static void     d3d11_hw_v2_wait_sync_index(void *data)     { (void)data; }
  * refresh the frame does not: at 120 Hz under a 60 fps core that is
  * every other one. It gives the lock up around its waits as the frame
  * does (d3d11_hw_v2_yield_begin). */
+/* Every present of the swapchain, with Driver Pacing's markers
+ * around it: the frame's own, or one out of band on the same frame */
+static void d3d11_present(d3d11_video_t *d3d11, unsigned sync_interval,
+      unsigned flags)
+{
+   d3d_driver_pacing_present_begin(&d3d11->driver_pacing, d3d11->device);
+   DXGIPresent(d3d11->swapChain, sync_interval, flags);
+   d3d_driver_pacing_present_end(&d3d11->driver_pacing, d3d11->device);
+}
+
 static unsigned d3d11_present_last_body(void *data);
 
 static unsigned d3d11_present_last(void *data)
@@ -5449,7 +5568,7 @@ static unsigned d3d11_present_last_body(void *data)
       Release(back_buffer);
       if (d3d11->hw_v2.present_unlocked)
          d3d11_hw_v2_yield_begin(d3d11);
-      DXGIPresent(d3d11->swapChain, d3d11->swap_interval, present_flags);
+      d3d11_present(d3d11, d3d11->swap_interval, present_flags);
       if (d3d11->hw_v2.present_unlocked)
          d3d11_hw_v2_yield_end(d3d11);
       done++;
@@ -5480,7 +5599,7 @@ static unsigned d3d11_present_last_body(void *data)
       context->lpVtbl->ClearRenderTargetView(context, rtv, d3d11->clearcolor);
       if (d3d11->hw_v2.present_unlocked)
          d3d11_hw_v2_yield_begin(d3d11);
-      DXGIPresent(d3d11->swapChain, d3d11->swap_interval, present_flags);
+      d3d11_present(d3d11, d3d11->swap_interval, present_flags);
       if (d3d11->hw_v2.present_unlocked)
          d3d11_hw_v2_yield_end(d3d11);
       Release(rtv);
@@ -5501,6 +5620,35 @@ static unsigned d3d11_present_last_body(void *data)
  * display's grid the longer it stays. Then, and whenever the statistics
  * cannot be had, the compositor's own last vblank, as the Vulkan
  * driver reads it on Windows. */
+static unsigned d3d11_driver_pacing_set(void *data, unsigned mode)
+{
+   d3d11_video_t *d3d11 = (d3d11_video_t*)data;
+   if (!d3d11)
+      return VIDEO_DRIVER_PACING_REASON_DRIVER;
+   return d3d_driver_pacing_set(&d3d11->driver_pacing, d3d11->device, mode);
+}
+
+static bool d3d11_driver_pacing_wait(void *data, uint64_t frame_id,
+      uint64_t next_id, unsigned max_wait_us)
+{
+   d3d11_video_t *d3d11 = (d3d11_video_t*)data;
+   if (!d3d11)
+      return false;
+   (void)next_id;
+   return d3d_driver_pacing_wait(&d3d11->driver_pacing, d3d11->device,
+         frame_id, max_wait_us);
+}
+
+static void d3d11_driver_pacing_mark(void *data, uint64_t frame_id,
+      unsigned marker)
+{
+   d3d11_video_t *d3d11 = (d3d11_video_t*)data;
+   if (!d3d11)
+      return;
+   d3d_driver_pacing_mark(&d3d11->driver_pacing, d3d11->device,
+         frame_id, marker);
+}
+
 static retro_time_t d3d11_get_last_present_time(void *data)
 {
    DXGI_FRAME_STATISTICS stats;
@@ -6677,6 +6825,94 @@ static void d3d11_set_view_count(void *data, unsigned count)
    d3d11_views_free_chains(d3d11, d3d11->views.chains.count);
 }
 
+static void d3d11_sprites_begin(d3d11_video_t *d3d11)
+{
+   ID3D11DeviceContext *context = d3d11->context;
+   context->lpVtbl->RSSetViewports(context, 1, &d3d11->viewport);
+   {
+      d3d11_shader_t *shader = d3d11_sprite_shader(d3d11);
+      context->lpVtbl->IASetInputLayout(context, shader->layout);
+      context->lpVtbl->VSSetShader(context, shader->vs, NULL, 0);
+      context->lpVtbl->PSSetShader(context, shader->ps, NULL, 0);
+      context->lpVtbl->GSSetShader(context, shader->gs, NULL, 0);
+   }
+   context->lpVtbl->IASetPrimitiveTopology(context,
+         D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+   context->lpVtbl->VSSetConstantBuffers(context, 0, 1, &d3d11->ubo);
+   context->lpVtbl->PSSetConstantBuffers(
+         context, 0, 1, &d3d11->ubo);
+   {
+      UINT stride = sizeof(d3d11_sprite_t);
+      UINT offset = 0;
+      context->lpVtbl->IASetVertexBuffers(
+            context, 0, 1, &d3d11->sprites.vbo, &stride, &offset);
+   }
+   d3d11->flags          |= D3D11_ST_FLAG_SPRITES_ENABLE;
+}
+
+#ifdef HAVE_MENU
+static void d3d11_menu_texture_draw(d3d11_video_t *d3d11)
+{
+   ID3D11DeviceContext *context = d3d11->context;
+   if (    (d3d11->flags & D3D11_ST_FLAG_MENU_ENABLE)
+         && d3d11->menu.texture.handle)
+   {
+      if (d3d11->flags & D3D11_ST_FLAG_MENU_FULLSCREEN)
+         context->lpVtbl->RSSetViewports(context, 1, &d3d11->viewport);
+      else if (d3d11->views.active)
+      {
+         /* d3d11->vp is the whole window while views draw, so fit the
+          * menu to this pass's target here. */
+         struct video_viewport vp;
+         D3D11_VIEWPORT menu_vp;
+         vp.full_dims     = VIDEO_SCALE_PACK(
+               (unsigned)d3d11->viewport.Width,
+               (unsigned)d3d11->viewport.Height);
+         video_driver_update_viewport(&vp, false,
+               (d3d11->flags & D3D11_ST_FLAG_KEEP_ASPECT) ? true : false,
+               false);
+         menu_vp.TopLeftX = (float)VIDEO_POS_X(vp.pos);
+         menu_vp.TopLeftY = (float)VIDEO_POS_Y(vp.pos);
+         menu_vp.Width    = (float)VIDEO_SCALE_W(vp.dims);
+         menu_vp.Height   = (float)VIDEO_SCALE_H(vp.dims);
+         menu_vp.MinDepth = 0.0f;
+         menu_vp.MaxDepth = 1.0f;
+         context->lpVtbl->RSSetViewports(context, 1, &menu_vp);
+      }
+
+      {
+         d3d11_shader_t *shader = &d3d11->shaders[VIDEO_SHADER_STOCK_BLEND];
+         context->lpVtbl->IASetInputLayout(context, shader->layout);
+         context->lpVtbl->VSSetShader(context, shader->vs, NULL, 0);
+         context->lpVtbl->PSSetShader(context, shader->ps, NULL, 0);
+         context->lpVtbl->GSSetShader(context, shader->gs, NULL, 0);
+      }
+      {
+         UINT stride = sizeof(d3d11_vertex_t);
+         UINT offset = 0;
+         d3d11->context->lpVtbl->IASetVertexBuffers(
+               d3d11->context, 0, 1, &d3d11->menu.vbo, &stride, &offset);
+      }
+      context->lpVtbl->VSSetConstantBuffers(context, 0, 1, &d3d11->ubo);
+      {
+         d3d11_texture_t *texture = (d3d11_texture_t*)&d3d11->menu.texture;
+         d3d11->context->lpVtbl->PSSetShaderResources(
+               d3d11->context, 0, 1,
+               &texture->view);
+         d3d11->context->lpVtbl->PSSetSamplers(
+               d3d11->context, 0, 1,
+               (D3D11SamplerState*)&texture->sampler);
+      }
+      context->lpVtbl->OMSetBlendState(context, d3d11->blend_enable,
+            NULL, D3D11_DEFAULT_SAMPLE_MASK);
+      context->lpVtbl->IASetPrimitiveTopology(context,
+            D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+      context->lpVtbl->Draw(context, 4, 0);
+      d3d11_sprites_begin(d3d11);
+   }
+}
+#endif
+
 static bool d3d11_gfx_frame_body(void *data, const void *frame,
       unsigned dims, uint64_t frame_count,
       unsigned pitch, const char *msg, video_frame_info_t *video_info);
@@ -6768,10 +7004,15 @@ static bool d3d11_gfx_frame_body(
     * that the hardware handles — no hidden HDR pass needed. */
    DXGI_FORMAT swapchain_format   = d3d11->chain_formats[d3d11->chain_bit_depth];
    bool use_back_buffer           = shader_hdr_mode == 0
-      || back_buffer_format != swapchain_format
-      && !(back_buffer_format == DXGI_FORMAT_R16G16B16A16_FLOAT
-           && swapchain_format == DXGI_FORMAT_R10G10B10A2_UNORM);
+      || (back_buffer_format != swapchain_format
+         && !(back_buffer_format == DXGI_FORMAT_R16G16B16A16_FLOAT
+            && swapchain_format == DXGI_FORMAT_R10G10B10A2_UNORM));
 #endif
+
+   /* The released frame's simulation ends where its Direct3D work
+    * begins */
+   d3d_driver_pacing_frame_begin(&d3d11->driver_pacing, d3d11->device,
+         video_info->driver_pacing_id, video_info->driver_pacing_interval_us);
 
    if (d3d11->flags & D3D11_ST_FLAG_WAITABLE_SWAPCHAINS)
    {
@@ -6783,7 +7024,7 @@ static bool d3d11_gfx_frame_body(
       d3d11_hw_v2_yield_end(d3d11);
    }
 
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
    if (d3d11->chain.frame_rect.rebuild)
       d3d11_frame_rect_rebuild(d3d11);
 #endif
@@ -7527,80 +7768,9 @@ static bool d3d11_gfx_frame_body(
    context->lpVtbl->OMSetBlendState(context, d3d11->blend_enable,
          NULL, D3D11_DEFAULT_SAMPLE_MASK);
 
-#ifdef HAVE_MENU
-   if (    (d3d11->flags & D3D11_ST_FLAG_MENU_ENABLE)
-         && d3d11->menu.texture.handle)
-   {
-      if (d3d11->flags & D3D11_ST_FLAG_MENU_FULLSCREEN)
-         context->lpVtbl->RSSetViewports(context, 1, &d3d11->viewport);
-      else if (d3d11->views.active)
-      {
-         /* d3d11->vp is the whole window while views draw, so fit the
-          * menu to this pass's target here. */
-         struct video_viewport vp;
-         D3D11_VIEWPORT menu_vp;
-         vp.full_dims     = VIDEO_SCALE_PACK(
-               (unsigned)d3d11->viewport.Width,
-               (unsigned)d3d11->viewport.Height);
-         video_driver_update_viewport(&vp, false,
-               (d3d11->flags & D3D11_ST_FLAG_KEEP_ASPECT) ? true : false,
-               false);
-         menu_vp.TopLeftX = (float)VIDEO_POS_X(vp.pos);
-         menu_vp.TopLeftY = (float)VIDEO_POS_Y(vp.pos);
-         menu_vp.Width    = (float)VIDEO_SCALE_W(vp.dims);
-         menu_vp.Height   = (float)VIDEO_SCALE_H(vp.dims);
-         menu_vp.MinDepth = 0.0f;
-         menu_vp.MaxDepth = 1.0f;
-         context->lpVtbl->RSSetViewports(context, 1, &menu_vp);
-      }
 
-      {
-         d3d11_shader_t *shader = &d3d11->shaders[VIDEO_SHADER_STOCK_BLEND];
-         context->lpVtbl->IASetInputLayout(context, shader->layout);
-         context->lpVtbl->VSSetShader(context, shader->vs, NULL, 0);
-         context->lpVtbl->PSSetShader(context, shader->ps, NULL, 0);
-         context->lpVtbl->GSSetShader(context, shader->gs, NULL, 0);
-      }
-      {
-         UINT stride = sizeof(d3d11_vertex_t);
-         UINT offset = 0;
-         d3d11->context->lpVtbl->IASetVertexBuffers(
-               d3d11->context, 0, 1, &d3d11->menu.vbo, &stride, &offset);
-      }
-      context->lpVtbl->VSSetConstantBuffers(context, 0, 1, &d3d11->ubo);
-      {
-         d3d11_texture_t *texture = (d3d11_texture_t*)&d3d11->menu.texture;
-         d3d11->context->lpVtbl->PSSetShaderResources(
-               d3d11->context, 0, 1,
-               &texture->view);
-         d3d11->context->lpVtbl->PSSetSamplers(
-               d3d11->context, 0, 1,
-               (D3D11SamplerState*)&texture->sampler);
-      }
-      context->lpVtbl->Draw(context, 4, 0);
-   }
-#endif
 
-   context->lpVtbl->RSSetViewports(context, 1, &d3d11->viewport);
-   {
-      d3d11_shader_t *shader = d3d11_sprite_shader(d3d11);
-      context->lpVtbl->IASetInputLayout(context, shader->layout);
-      context->lpVtbl->VSSetShader(context, shader->vs, NULL, 0);
-      context->lpVtbl->PSSetShader(context, shader->ps, NULL, 0);
-      context->lpVtbl->GSSetShader(context, shader->gs, NULL, 0);
-   }
-   context->lpVtbl->IASetPrimitiveTopology(context,
-         D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
-   context->lpVtbl->VSSetConstantBuffers(context, 0, 1, &d3d11->ubo);
-   context->lpVtbl->PSSetConstantBuffers(
-         context, 0, 1, &d3d11->ubo);
-   {
-         UINT stride = sizeof(d3d11_sprite_t);
-         UINT offset = 0;
-         context->lpVtbl->IASetVertexBuffers(
-               context, 0, 1, &d3d11->sprites.vbo, &stride, &offset);
-   }
-   d3d11->flags          |= D3D11_ST_FLAG_SPRITES_ENABLE;
+   d3d11_sprites_begin(d3d11);
 
 #ifdef HAVE_OVERLAY
    /* Touch overlays would straddle both eyes. */
@@ -7626,7 +7796,10 @@ static bool d3d11_gfx_frame_body(
 
 #ifdef HAVE_MENU
    if (d3d11->flags & D3D11_ST_FLAG_MENU_ENABLE)
+   {
       menu_driver_frame(menu_is_alive, video_info);
+      d3d11_menu_texture_draw(d3d11);
+   }
    else
 #endif
       if (statistics_show)
@@ -7833,7 +8006,7 @@ static bool d3d11_gfx_frame_body(
       d3d11_hw_v2_yield_begin(d3d11);
       d3d11_wait_for_vblank(d3d11);
       d3d11_hw_v2_yield_end(d3d11);
-      DXGIPresent(d3d11->swapChain, 0,
+      d3d11_present(d3d11, 0,
             present_flags | ((d3d11->flags & D3D11_ST_FLAG_HAS_ALLOW_TEARING) ? DXGI_PRESENT_ALLOW_TEARING : 0)
       );
    }
@@ -7843,7 +8016,7 @@ static bool d3d11_gfx_frame_body(
        * the call. */
       if (d3d11->hw_v2.present_unlocked)
          d3d11_hw_v2_yield_begin(d3d11);
-      DXGIPresent(d3d11->swapChain, d3d11->swap_interval, present_flags);
+      d3d11_present(d3d11, d3d11->swap_interval, present_flags);
       if (d3d11->hw_v2.present_unlocked)
          d3d11_hw_v2_yield_end(d3d11);
    }
@@ -7892,7 +8065,7 @@ static bool d3d11_gfx_frame_body(
          {
             context->lpVtbl->OMSetRenderTargets(context, 1, &rtv, NULL);
             context->lpVtbl->ClearRenderTargetView(context, rtv, d3d11->clearcolor);
-            DXGIPresent(d3d11->swapChain, d3d11->swap_interval, present_flags);
+            d3d11_present(d3d11, d3d11->swap_interval, present_flags);
          }
       }
 
@@ -8023,6 +8196,7 @@ static bool d3d11_gfx_read_viewport_hdr(void *data, uint16_t *buffer,
    ID3D11Resource* BackBufferResource = NULL;
    D3D11_TEXTURE2D_DESC StagingDesc;
    D3D11_MAPPED_SUBRESOURCE Map;
+   unsigned read_dims;
    bool is_scrgb;
    bool ret = false;
    float max_cll  = 0.0f;
@@ -8035,6 +8209,14 @@ static bool d3d11_gfx_read_viewport_hdr(void *data, uint16_t *buffer,
    if (!(d3d11->flags & D3D11_ST_FLAG_HDR_ENABLE))
       return false;
 
+   /* The redraw may resize the swapchain. Do not retain a backbuffer
+    * across it, or copy a changed extent into the caller's old buffer. */
+   read_dims = d3d11->vp.dims;
+   if (!is_idle)
+      video_driver_cached_frame();
+   if (d3d11->vp.dims != read_dims)
+      return false;
+
    m_SwapChain = d3d11->swapChain;
 #ifdef __cplusplus
    m_SwapChain->lpVtbl->GetBuffer(m_SwapChain, 0, IID_ID3D11Texture2D, (void**)(&BackBuffer));
@@ -8044,9 +8226,6 @@ static bool d3d11_gfx_read_viewport_hdr(void *data, uint16_t *buffer,
 
    if (!BackBuffer)
       return false;
-
-   if (!is_idle)
-      video_driver_cached_frame();
 
    BackBuffer->lpVtbl->GetDesc(BackBuffer, &StagingDesc);
 
@@ -8133,6 +8312,7 @@ static bool d3d11_gfx_read_viewport(void* data, uint8_t* buffer, bool is_idle)
    const uint8_t* BackBufferData;
    uint8_t* bufferRow;
    unsigned slot;
+   unsigned read_dims;
    uint32_t y;
    uint32_t x;
    bool wait;
@@ -8141,6 +8321,8 @@ static bool d3d11_gfx_read_viewport(void* data, uint8_t* buffer, bool is_idle)
 
    if (!d3d11)
       return false;
+
+   read_dims = d3d11->vp.dims;
 
    if (d3d11->record.enable)
    {
@@ -8157,6 +8339,14 @@ static bool d3d11_gfx_read_viewport(void* data, uint8_t* buffer, bool is_idle)
       d3d11->flags |= D3D11_ST_FLAG_READBACK_PENDING;
       if (!is_idle)
          video_driver_cached_frame();
+      /* A cached redraw can apply a pending resize. The caller sized its
+       * buffer from the viewport before this call, so a different extent
+       * cannot be copied into it. */
+      if (d3d11->vp.dims != read_dims)
+      {
+         d3d11->flags &= ~D3D11_ST_FLAG_READBACK_PENDING;
+         return false;
+      }
       if (d3d11->flags & D3D11_ST_FLAG_READBACK_PENDING)
       {
          d3d11->flags &= ~D3D11_ST_FLAG_READBACK_PENDING;
@@ -9860,7 +10050,10 @@ static const video_poke_interface_t d3d11_poke_interface = {
    NULL, /* get_menu_framebuffer */
    NULL, /* menu_mem_alloc */
    0, /* menu_mem_pitch_align */
-   true /* texture_lend_per_write */
+   true, /* texture_lend_per_write */
+   d3d11_driver_pacing_set,
+   d3d11_driver_pacing_wait,
+   d3d11_driver_pacing_mark
 };
 
 static void d3d11_gfx_get_poke_interface(void* data,

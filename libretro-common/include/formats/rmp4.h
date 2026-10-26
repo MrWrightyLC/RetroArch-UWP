@@ -23,10 +23,9 @@
  * The whole input buffer is supplied up front (memory-only, like the
  * rest of libretro-common's format layer) and is borrowed, not copied:
  * it must outlive the demuxer, and returned packet pointers alias into
- * it.  The one exception is Opus codec_private: MP4 stores the decoder
- * setup as a dOps box, which is repacked into the OpusHead layout the
- * Opus decoders expect; that buffer lives inside the demuxer and is
- * valid until rmp4_close.
+ * it. Decoder configuration records are owned by the demuxer and remain
+ * valid until rmp4_close, including when a streaming caller releases
+ * consumed input pages. Opus setup is repacked from dOps to OpusHead.
  */
 #ifndef __LIBRETRO_SDK_FORMAT_RMP4_H__
 #define __LIBRETRO_SDK_FORMAT_RMP4_H__
@@ -81,16 +80,21 @@ typedef struct
    unsigned               channels;
    /* Media-timescale units the track's edit list trims from the
     * start (the usual encoder-delay edit; sample count for audio).
-    * Zero when absent. Only the common single-entry shape is read. */
+    * Zero when absent. A leading empty edit may precede this trim;
+    * arbitrary multi-entry or non-unity-rate edits remain unsupported. */
    uint64_t               media_skip;
-   /* Decoder setup data (Opus: an OpusHead repacked from the dOps box,
-    * owned by the demuxer; Vorbis: the xiph-laced 3 headers from the
-    * esds DecoderSpecificInfo, aliasing the input; VP8/VP9: usually
-    * empty; AV1: the av1C configuration record, aliasing the input). */
+   /* Decoder setup data, owned by the demuxer until rmp4_close.
+    * Opus: repacked OpusHead; Vorbis: xiph-laced headers from esds;
+    * H.264/HEVC/AV1: avcC/hvcC/av1C. VP8/VP9: complete vpcC payload. */
    const uint8_t         *codec_private;
    size_t                 codec_private_size;
    /* Sample-entry fourcc, NUL-terminated (e.g. "vp09", "avc1"). */
    char                   codec_id[24];
+   /* Leading empty edit in movie time, converted to nanoseconds. */
+   int64_t                presentation_delay_ns;
+   /* Duration of the supported nonempty unity-rate edit, excluding the
+    * leading delay. -1 when no such edit declares a play length. */
+   int64_t                presentation_duration_ns;
 } rmp4_track;
 
 typedef struct
@@ -141,6 +145,9 @@ int64_t rmp4_duration_ns(const rmp4_t *mp4);
 
 int rmp4_read_packet(rmp4_t *mp4, rmp4_packet *pkt);
 
+/* Next packet byte range from sample tables; reads no media bytes. */
+void rmp4_read_span(const rmp4_t *mp4, size_t *lo, size_t *hi);
+
 /* Open against a partially-read buffer: only the first 'avail' bytes
  * are valid (the rest may be uninitialised) and are never read.  Box
  * bodies are hopped arithmetically, so a trailing moov (a file muxed
@@ -168,6 +175,30 @@ void rmp4_set_avail(rmp4_t *mp4, size_t avail);
  * track; the array lives until rmp4_close. */
 const int64_t *rmp4_track_pts(const rmp4_t *mp4, int track,
       uint32_t *count);
+
+/* Metadata-only key flag for a track sample: 0/1, -1 if invalid.
+ * Does not read sample bytes or change any packet cursor. */
+int rmp4_track_sample_key(const rmp4_t *mp4, int track, uint32_t sample);
+
+/* Metadata-only half-open file span. Does not read sample bytes or
+ * change cursors. Invalid input leaves the outputs unchanged. */
+int rmp4_track_sample_span(const rmp4_t *mp4, int track, uint32_t sample,
+      size_t *begin, size_t *end);
+
+/* Exact text/other sample duration in nanoseconds, -1 if unavailable.
+ * Video/audio tracks do not retain an extra duration table. */
+int64_t rmp4_track_text_duration(const rmp4_t *mp4, int track, uint32_t sample);
+
+/* Text interval in movie nanoseconds, clipped to the supported edit.
+ * Equal endpoints mean the sample is outside that edit. No media reads. */
+int rmp4_track_text_time(const rmp4_t *mp4, int track, uint32_t sample,
+      int64_t *start, int64_t *end);
+
+/* Read only this track from sample onward until rewind. Other tracks
+ * are parked at their ends. No sample bytes are read; the next read
+ * still obeys the current availability bound. Invalid input leaves
+ * all cursors unchanged. Returns 1 on success, 0 on failure. */
+int rmp4_select_track_sample(rmp4_t *mp4, int track, uint32_t sample);
 
 /* Restart packet reading from the first sample. */
 void rmp4_rewind(rmp4_t *mp4);

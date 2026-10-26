@@ -123,6 +123,8 @@
 #include "../../steam/steam.h"
 #endif
 
+#include "../../input/drivers_hid/winusb_bind.h"
+
 enum
 {
    ACTION_OK_LOAD_PRESET = 0,
@@ -464,6 +466,8 @@ static enum msg_hash_enums action_ok_dl_to_enum(unsigned lbl)
          return MENU_ENUM_LABEL_DEFERRED_MENU_SOUNDS_LIST;
       case ACTION_OK_DL_MENU_FILE_BROWSER_SETTINGS_LIST:
          return MENU_ENUM_LABEL_DEFERRED_MENU_FILE_BROWSER_SETTINGS_LIST;
+      case ACTION_OK_DL_MEDIA_PLAYER_SETTINGS_LIST:
+         return MENU_ENUM_LABEL_DEFERRED_MEDIA_PLAYER_SETTINGS_LIST;
       case ACTION_OK_DL_RETRO_ACHIEVEMENTS_SETTINGS_LIST:
          return MENU_ENUM_LABEL_DEFERRED_RETRO_ACHIEVEMENTS_SETTINGS_LIST;
       case ACTION_OK_DL_CHEEVOS_APPEARANCE_SETTINGS_LIST:
@@ -1854,6 +1858,7 @@ int generic_action_ok_displaylist_push(
       case ACTION_OK_DL_CPU_POLICY_SETTINGS_LIST:
       case ACTION_OK_DL_MENU_SOUNDS_LIST:
       case ACTION_OK_DL_MENU_FILE_BROWSER_SETTINGS_LIST:
+      case ACTION_OK_DL_MEDIA_PLAYER_SETTINGS_LIST:
       case ACTION_OK_DL_RETRO_ACHIEVEMENTS_SETTINGS_LIST:
       case ACTION_OK_DL_CHEEVOS_APPEARANCE_SETTINGS_LIST:
       case ACTION_OK_DL_CHEEVOS_VISIBILITY_SETTINGS_LIST:
@@ -2056,6 +2061,7 @@ static const ok_dl_map_t ok_dl_map[] = {
    { MENU_ENUM_LABEL_CPU_POLICY_ENTRY, ACTION_OK_DL_CPU_POLICY_SETTINGS_LIST },
    { MENU_ENUM_LABEL_MENU_SOUNDS, ACTION_OK_DL_MENU_SOUNDS_LIST },
    { MENU_ENUM_LABEL_MENU_FILE_BROWSER_SETTINGS, ACTION_OK_DL_MENU_FILE_BROWSER_SETTINGS_LIST },
+   { MENU_ENUM_LABEL_MEDIA_PLAYER_SETTINGS, ACTION_OK_DL_MEDIA_PLAYER_SETTINGS_LIST },
    { MENU_ENUM_LABEL_RETRO_ACHIEVEMENTS_SETTINGS, ACTION_OK_DL_RETRO_ACHIEVEMENTS_SETTINGS_LIST },
    { MENU_ENUM_LABEL_CHEEVOS_APPEARANCE_SETTINGS, ACTION_OK_DL_CHEEVOS_APPEARANCE_SETTINGS_LIST },
    { MENU_ENUM_LABEL_CHEEVOS_VISIBILITY_SETTINGS, ACTION_OK_DL_CHEEVOS_VISIBILITY_SETTINGS_LIST },
@@ -3569,6 +3575,13 @@ static int action_ok_bluetooth(const char *path, const char *label,
 
    return 0;
 }
+
+static int action_ok_bluetooth_scan(const char *path, const char *label,
+         unsigned type, size_t idx, size_t entry_idx)
+{
+   menu_displaylist_bluetooth_scan();
+   return 0;
+}
 #endif
 
 #ifdef HAVE_NETWORKING
@@ -4870,6 +4883,33 @@ static int action_ok_input_bt_pair(const char *path,
    menu_st->flags &= ~MENU_ST_FLAG_PREVENT_POPULATE;
    return 0;
 }
+
+#ifdef HAVE_WINUSB_BIND
+/* Information > Input Information: every DualShock 3 plugged in moved
+ * to WinUSB, or given back to Windows' own driver. */
+static int action_ok_input_ds3_enable(const char *path,
+      const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+   winusb_bind_request(WINUSB_BIND_DS3, true);
+   return 0;
+}
+
+static int action_ok_input_ds3_restore(const char *path,
+      const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+   winusb_bind_request(WINUSB_BIND_DS3, false);
+   return 0;
+}
+
+/* Information > Input Information: the Wii U GameCube adapters plugged
+ * in moved to WinUSB. */
+static int action_ok_input_gca_enable(const char *path,
+      const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+   winusb_bind_request(WINUSB_BIND_GCA, true);
+   return 0;
+}
+#endif
 
 static int action_ok_start_recording(const char *path,
       const char *label, unsigned type, size_t idx, size_t entry_idx)
@@ -7021,10 +7061,10 @@ static int action_ok_delete_entry(const char *path,
    char *conf_path           = NULL;
    char *def_conf_path       = NULL;
    char *def_conf_music_path = NULL;
-#if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
+#if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_WEBMPLAYER)
    char *def_conf_video_path = NULL;
 #endif
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
    char *def_conf_img_path   = NULL;
 #endif
    char *def_conf_fav_path   = NULL;
@@ -7038,10 +7078,10 @@ static int action_ok_delete_entry(const char *path,
    conf_path                 = playlist_get_conf_path(playlist);
    def_conf_path             = playlist_get_conf_path(g_defaults.content_history);
    def_conf_music_path       = playlist_get_conf_path(g_defaults.music_history);
-#if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
+#if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_WEBMPLAYER)
    def_conf_video_path       = playlist_get_conf_path(g_defaults.video_history);
 #endif
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
    def_conf_img_path         = playlist_get_conf_path(g_defaults.image_history);
 #endif
    def_conf_fav_path         = playlist_get_conf_path(g_defaults.content_favorites);
@@ -7050,11 +7090,11 @@ static int action_ok_delete_entry(const char *path,
       playlist               = g_defaults.content_history;
    else if (string_is_equal(conf_path, def_conf_music_path))
       playlist               = g_defaults.music_history;
-#if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
+#if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_WEBMPLAYER)
    else if (string_is_equal(conf_path, def_conf_video_path))
       playlist               = g_defaults.video_history;
 #endif
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
    else if (string_is_equal(conf_path, def_conf_img_path))
       playlist               = g_defaults.image_history;
 #endif
@@ -9715,6 +9755,11 @@ static int menu_cbs_init_bind_ok_compare_label(menu_file_list_cbs_t *cbs,
 #endif
          {MENU_ENUM_LABEL_RUN_MUSIC,                           action_ok_audio_run},
          {MENU_ENUM_LABEL_INPUT_BT_PAIR,                       action_ok_input_bt_pair},
+#ifdef HAVE_WINUSB_BIND
+         {MENU_ENUM_LABEL_INPUT_DS3_ENABLE,                    action_ok_input_ds3_enable},
+         {MENU_ENUM_LABEL_INPUT_DS3_RESTORE,                   action_ok_input_ds3_restore},
+         {MENU_ENUM_LABEL_INPUT_GCA_ENABLE,                    action_ok_input_gca_enable},
+#endif
 #ifdef HAVE_AUDIOMIXER
          {MENU_ENUM_LABEL_ADD_TO_MIXER_AND_COLLECTION,         action_ok_audio_add_to_mixer_and_collection},
          {MENU_ENUM_LABEL_ADD_TO_MIXER_AND_COLLECTION_AND_PLAY,action_ok_audio_add_to_mixer_and_collection_and_play},
@@ -9949,6 +9994,7 @@ static int menu_cbs_init_bind_ok_compare_label(menu_file_list_cbs_t *cbs,
          {MENU_ENUM_LABEL_FILE_BROWSER_OPEN_PICKER,            action_ok_open_picker},
 #ifdef HAVE_BLUETOOTH
          {MENU_ENUM_LABEL_BLUETOOTH_SETTINGS,                  action_ok_bluetooth_list},
+         {MENU_ENUM_LABEL_BLUETOOTH_SCAN,                      action_ok_bluetooth_scan},
 #endif
 #ifdef HAVE_NETWORKING
 #ifdef HAVE_WIFI

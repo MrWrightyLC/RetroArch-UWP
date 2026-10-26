@@ -22,6 +22,7 @@
 #include <stdint.h>
 
 #include <boolean.h>
+#include <libretro.h>
 #include <retro_common_api.h>
 #include <retro_miscellaneous.h>
 #include <file/config_file.h>
@@ -163,6 +164,8 @@ typedef struct settings
       unsigned input_keyboard_index[MAX_USERS];
       /* 0 off, 1 the left stick, 2 the right: enum input_aim_stick */
       unsigned input_aim_stick[MAX_USERS];
+      /* 0 off, 1 a touchscreen, 2 a mouse: enum input_touchpad */
+      unsigned input_touchpad[MAX_USERS];
 
       unsigned input_libretro_device[MAX_USERS];
       unsigned input_analog_dpad_mode[MAX_USERS];
@@ -278,6 +281,10 @@ typedef struct settings
       unsigned video_max_swapchain_images;
       unsigned video_filter_threads;
       unsigned video_swap_interval;
+      unsigned video_driver_pacing;
+      unsigned video_temporal_upscaler;
+      unsigned video_temporal_upscaler_quality;
+      unsigned video_temporal_upscaler_preset;
       unsigned video_hard_sync_frames;
       unsigned video_frame_delay;
       unsigned video_scanline_sync_offset;
@@ -289,6 +296,12 @@ typedef struct settings
       unsigned video_rotation;
       unsigned video_stereo_mode;
       unsigned video_screen_layout;
+#ifdef HAVE_VIDEO_WINDOWS
+      unsigned video_screen_window_mode[RETRO_VIDEO_VIEWS_MAX];
+      unsigned video_screen_window_pos[RETRO_VIDEO_VIEWS_MAX];
+      unsigned video_screen_window_dims[RETRO_VIDEO_VIEWS_MAX];
+      unsigned video_screen_window_monitor[RETRO_VIDEO_VIEWS_MAX];
+#endif
       unsigned video_openxr_refresh_rate;
       unsigned video_openxr_controllers;
       unsigned video_openxr_laser;
@@ -313,6 +326,11 @@ typedef struct settings
       unsigned video_overscan_correction_bottom;
 #endif
       unsigned video_shader_delay;
+      unsigned video_shader_simulated_input_resolution_width;
+      unsigned video_shader_simulated_input_resolution_height;
+#if defined(HAVE_RSLC) && defined(HAVE_GLSLANG)
+      unsigned video_shader_compiler;
+#endif
 #ifdef HAVE_SCREENSHOTS
       unsigned notification_show_screenshot_duration;
       unsigned notification_show_screenshot_flash;
@@ -330,6 +348,8 @@ typedef struct settings
       unsigned menu_icon_thumbnails;
       unsigned gfx_thumbnail_upscale_threshold;
       unsigned menu_thumbnail_preview_threads;
+      unsigned media_player_seek_seconds;
+      unsigned media_player_controls_timeout;
       unsigned menu_rgui_thumbnail_downscaler;
       unsigned menu_rgui_thumbnail_delay;
       unsigned menu_rgui_color_theme;
@@ -541,6 +561,7 @@ typedef struct settings
       int input_overlay_lightgun_port;
 #endif
       int input_turbo_bind;
+      int media_player_subtitle_delay;
    } ints;
 
    struct
@@ -641,6 +662,10 @@ typedef struct settings
    struct
    {
       bool placeholder;
+#ifdef HAVE_VIDEO_WINDOWS
+      bool video_windows_enable;
+      bool video_screen_window_fullscreen[RETRO_VIDEO_VIEWS_MAX];
+#endif
 
       /* Video */
       bool video_fullscreen;
@@ -669,6 +694,7 @@ typedef struct settings
       bool video_dingux_ipu_keep_aspect;
       bool video_scale_integer;
       bool video_shader_enable;
+      bool video_shader_simulated_input_resolution;
       bool video_shader_deferred_loading;
       bool video_shader_watch_files;
       bool video_shader_remember_last_dir;
@@ -1052,6 +1078,10 @@ typedef struct settings
       /* Multimedia */
       bool multimedia_builtin_mediaplayer_enable;
       bool multimedia_builtin_imageviewer_enable;
+      bool media_player_continuous;
+      bool media_player_crt_switch;
+      bool media_player_refresh_rate;
+      bool media_player_subtitles;
 
       /* Bundle */
       bool bundle_finished;
@@ -1403,6 +1433,9 @@ typedef struct settings
       char directory_osk_overlay[DIR_MAX_LENGTH];
       char directory_screenshot[DIR_MAX_LENGTH];
       char directory_system[DIR_MAX_LENGTH];
+      char directory_dlss[DIR_MAX_LENGTH];
+      char directory_fsr[DIR_MAX_LENGTH];
+      char directory_xess[DIR_MAX_LENGTH];
       char directory_cache[DIR_MAX_LENGTH];
       char directory_playlist[DIR_MAX_LENGTH];
       char directory_content_favorites[DIR_MAX_LENGTH];
@@ -1684,6 +1717,7 @@ void config_load(void);
  *   when launching a salamander build */
 void config_load_file_salamander(void);
 void config_save_file_salamander(void);
+void config_clear_salamander_pending(void);
 #endif
 
 void retroarch_config_init(void);

@@ -196,6 +196,7 @@ GENERIC_DEFERRED_PUSH(deferred_push_overlay_lightgun_settings_list, DISPLAYLIST_
 GENERIC_DEFERRED_PUSH(deferred_push_overlay_mouse_settings_list,    DISPLAYLIST_OVERLAY_MOUSE_SETTINGS_LIST)
 #endif
 GENERIC_DEFERRED_PUSH(deferred_push_menu_file_browser_settings_list,DISPLAYLIST_MENU_FILE_BROWSER_SETTINGS_LIST)
+GENERIC_DEFERRED_PUSH(deferred_push_media_player_settings_list,DISPLAYLIST_MEDIA_PLAYER_SETTINGS_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_menu_views_settings_list,       DISPLAYLIST_MENU_VIEWS_SETTINGS_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_quick_menu_views_settings_list, DISPLAYLIST_QUICK_MENU_VIEWS_SETTINGS_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_settings_views_settings_list, DISPLAYLIST_SETTINGS_VIEWS_SETTINGS_LIST)
@@ -332,7 +333,7 @@ static int general_push(menu_displaylist_info_t *info,
 #if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined (HAVE_AUDIOMIXER)
    bool multimedia_builtin_mediaplayer_enable = settings->bools.multimedia_builtin_mediaplayer_enable;
 #endif
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
    bool multimedia_builtin_imageviewer_enable = settings->bools.multimedia_builtin_imageviewer_enable;
 #endif
    if (!menu)
@@ -527,7 +528,7 @@ static int general_push(menu_displaylist_info_t *info,
    if (id != PUSH_ARCHIVE_OPEN)
    {
 #ifdef HAVE_RWEBM
-      string_ext_list_merge_dedup(ext_filter, &_len, ext_size, "webm");
+      string_ext_list_merge_dedup(ext_filter, &_len, ext_size, "webm|mkv");
 #endif
 #ifdef HAVE_RMP4
       string_ext_list_merge_dedup(ext_filter, &_len, ext_size, "mp4|m4v");
@@ -535,15 +536,24 @@ static int general_push(menu_displaylist_info_t *info,
    }
 #endif
 
-#ifdef HAVE_IMAGEVIEWER
+#if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
    if (multimedia_builtin_imageviewer_enable && id != PUSH_ARCHIVE_OPEN)
    {
-      struct retro_system_info sysinfo = {0};
-      libretro_imageviewer_retro_get_system_info(&sysinfo);
-      if (*sysinfo.valid_extensions)
-      {
-         string_ext_list_merge_dedup(ext_filter, &_len, ext_size, sysinfo.valid_extensions);
-      }
+#ifdef HAVE_RPNG
+      string_ext_list_merge_dedup(ext_filter, &_len, ext_size, "png");
+#endif
+#ifdef HAVE_RJPEG
+      string_ext_list_merge_dedup(ext_filter, &_len, ext_size, "jpg|jpeg");
+#endif
+#ifdef HAVE_RBMP
+      string_ext_list_merge_dedup(ext_filter, &_len, ext_size, "bmp");
+#endif
+#ifdef HAVE_RTGA
+      string_ext_list_merge_dedup(ext_filter, &_len, ext_size, "tga");
+#endif
+#ifdef HAVE_RWEBP
+      string_ext_list_merge_dedup(ext_filter, &_len, ext_size, "webp");
+#endif
    }
 #endif
 
@@ -688,6 +698,7 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
       {MENU_ENUM_LABEL_DEFERRED_OVERLAY_MOUSE_SETTINGS_LIST, deferred_push_overlay_mouse_settings_list},
 #endif
       {MENU_ENUM_LABEL_DEFERRED_MENU_FILE_BROWSER_SETTINGS_LIST, deferred_push_menu_file_browser_settings_list},
+      {MENU_ENUM_LABEL_DEFERRED_MEDIA_PLAYER_SETTINGS_LIST, deferred_push_media_player_settings_list},
       {MENU_ENUM_LABEL_DEFERRED_MENU_VIEWS_SETTINGS_LIST, deferred_push_menu_views_settings_list},
       {MENU_ENUM_LABEL_DEFERRED_SETTINGS_VIEWS_SETTINGS_LIST, deferred_push_settings_views_settings_list},
       {MENU_ENUM_LABEL_DEFERRED_QUICK_MENU_VIEWS_SETTINGS_LIST, deferred_push_quick_menu_views_settings_list},

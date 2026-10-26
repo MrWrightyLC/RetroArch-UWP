@@ -202,4 +202,24 @@ recording_state_t *recording_state_get_ptr(void);
 
 extern const record_driver_t *record_drivers[];
 
+/* Common native GPU controller hooks. Keep one call at frame/runloop sites;
+ * platform backends own their worker and snapshot retirement. */
+RETRO_BEGIN_DECLS
+extern const record_driver_t record_nvenc;
+extern const record_driver_t record_metal;
+struct video_frame_info;
+void recording_gpu_frame_info(struct video_frame_info *info,bool capture);
+void recording_gpu_poll(void);
+void recording_gpu_stop(void);
+bool recording_gpu_pending(void);
+/* Main owner: coalesce reinit flags while native users retire. The existing
+ * GPU poll applies the reinit once, or drops it during content/quit teardown. */
+bool recording_gpu_defer_reinit(int flags);
+void recording_gpu_reinit_poll(void);
+bool recording_gpu_defer_start(const record_driver_t *driver);
+bool recording_gpu_cancel_start(void);
+RETRO_END_DECLS
+static INLINE bool recording_is_native_gpu(const record_driver_t *driver)
+{ return driver==&record_nvenc || driver==&record_metal; }
+
 #endif

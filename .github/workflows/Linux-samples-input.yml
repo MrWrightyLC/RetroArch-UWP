@@ -23,67 +23,35 @@ jobs:
   samples-input:
     name: Build and run samples/input
     runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential libusb-1.0-0-dev libudev-dev libsdl2-dev libx11-dev libxtst-dev libxi-dev xvfb gcc-mingw-w64-x86-64 wine64 ccache
     timeout-minutes: 20
 
     steps:
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          pkgs="build-essential libusb-1.0-0-dev libudev-dev libsdl2-dev libx11-dev libxtst-dev libxi-dev xvfb gcc-mingw-w64-x86-64 wine64"
-          if dpkg -s $pkgs >/dev/null 2>&1; then
-            echo "All packages already present on runner image; skipping apt."
-            exit 0
-          fi
-          for i in 1 2 3; do
-            sudo timeout 90 apt-get update -y \
-              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && break
-            echo "apt-get update failed (attempt $i); retrying in 10s"
-            sleep 10
-          done
-          # Fetch first, under a bound: a download is safe to stop and
-          # resumes, an install is not. A mirror that stalls is left for
-          # the main archive on the next attempt.
-          for i in 1 2 3; do
-            sudo timeout 240 apt-get install -y --download-only \
-              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
-              $pkgs && break
-            [ $i = 3 ] && exit 1
-            echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
-            if [ ! -d /etc/apt/ra-orig ]; then
-              sudo mkdir /etc/apt/ra-orig
-              sudo cp -a /etc/apt/sources.list.d /etc/apt/ra-orig/
-              [ ! -f /etc/apt/sources.list ] || sudo cp -a /etc/apt/sources.list /etc/apt/ra-orig/
-            fi
-            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
-              [ -f "$f" ] || continue
-              sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
-                -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
-            done
-            # A refresh cut short or refused leaves apt no package lists: it
-            # is retried, without translations or command-not-found data, and
-            # the mirror is put back when the archive will not answer either.
-            upd="-o Acquire::Retries=3 -o Acquire::http::Timeout=30
-              -o Acquire::Languages=none
-              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false
-              -o APT::Update::Error-Mode=any"
-            ok=0
-            for j in 1 2; do
-              sudo timeout 120 apt-get update -y $upd && { ok=1; break; }
-            done
-            if [ $ok = 0 ]; then
-              sudo rm -rf /etc/apt/sources.list.d
-              sudo cp -a /etc/apt/ra-orig/sources.list.d /etc/apt/
-              [ ! -f /etc/apt/ra-orig/sources.list ] || sudo cp -a /etc/apt/ra-orig/sources.list /etc/apt/
-              sudo rm -rf /etc/apt/ra-orig
-              sudo timeout 120 apt-get update -y $upd || true
-            fi
-          done
-          sudo apt-get install -y \
-            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
-            $pkgs
-
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
 
       - name: Link with lld
         run: sh .github/workflows/scripts/use-lld.sh
@@ -172,7 +140,6 @@ jobs:
       - name: Enable ccache
         run: |
           set -eu
-          command -v ccache >/dev/null 2>&1 || sudo apt-get install -y -qq ccache
           export CCACHE_DIR="$HOME/.ccache"
           echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
@@ -359,6 +326,23 @@ jobs:
           make clean
           echo "[pass] android_pad_removed_test (ASan, TSan)"
 
+      - name: Build and run android_block_timeout_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/android_block_timeout
+        run: |
+          set -eu
+          # The input block timeout on Android, without waiting: the
+          # poll never waits in the foreground; a pad's presses whose
+          # newest came within the timeout of the poll wait one poll for
+          # the rest of the press, older ones are shown at once, none
+          # waits longer, and a press let go before it was shown is
+          # shown for one poll.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./android_block_timeout_test
+          make clean
+          echo "[pass] android_block_timeout_test (ASan)"
+
       - name: Build and run android_kbd_keys_test (ASan + UBSan)
         shell: bash
         working-directory: samples/input/android_kbd_keys
@@ -496,9 +480,48 @@ jobs:
         shell: bash
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           make -C samples/input/hotkey_menu clean check SANITIZER=address,undefined
           make -C samples/input/hotkey_menu clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
           make -C samples/input/hotkey_menu clean
+
+      - name: Build and run pointer_second_test (ASan + UBSan, mingw + Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # A core's pointer read where the input driver has a second
+          # list (Android's second display): its fingers go after the
+          # overlay's, after none while the overlay blocks the pointer,
+          # else after the driver's main list; a driver with no second
+          # list answers with its main list alone. The test runs
+          # input_state_device() extracted from input_driver.c.
+          make -C samples/input/pointer_second clean check SANITIZER=address,undefined
+          make -C samples/input/pointer_second clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/input/pointer_second clean
+
+      - name: Build and run android_focus_test (ASan + UBSan, mingw + Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # RetroArch's focus on Android from its two windows, the
+          # Activity's and the second display's, through the sequences
+          # the AYN Thor's focus modes and a one-focus system produce.
+          make -C samples/input/android_focus clean check SANITIZER=address,undefined
+          make -C samples/input/android_focus clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/input/android_focus clean
+
+      - name: Build and run android_second_surface_test (ASan + UBSan, mingw + Wine)
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # The second display's surface going: surfaceDestroyed never
+          # waits for the renderer, and the next poll lets it go.
+          make -C samples/frontend/android_second_surface clean check SANITIZER=address,undefined
+          make -C samples/frontend/android_second_surface clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make -C samples/frontend/android_second_surface clean
 
       - name: Build and run key_lane_test (plain, ASan + UBSan, TSan)
         shell: bash
@@ -592,6 +615,23 @@ jobs:
           make clean
           echo "[pass] device_registry_test (ASan)"
 
+      - name: Build and run device_pool_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/device_pool
+        run: |
+          set -eu
+          # The device numbers shared between the joypad driver and the
+          # sources beside it: the driver's pads keep their slots'
+          # numbers, pads beside it are given free ones from the top
+          # down and their own again when they come back, and a driver
+          # pad arriving on a number one of them holds moves that pad.
+          # Thousands of mixed arrivals and departures never give a
+          # number twice.
+          make clean all SANITIZER=address,undefined
+          timeout 120 ./device_pool_test
+          make clean
+          echo "[pass] device_pool_test (ASan)"
+
       - name: Build and run android_stylus_map_test (ASan + UBSan)
         shell: bash
         working-directory: samples/input/android_stylus_map
@@ -669,6 +709,7 @@ jobs:
         shell: bash
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./winraw_mouse_buttons_test
           make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
@@ -677,11 +718,38 @@ jobs:
           WINEDEBUG=-all wine ./winraw_mouse_buttons_test.exe
           make clean
 
+      - name: Check converted pad handlers against the copying ones
+        working-directory: samples/input/connect_parity
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./connect_parity_test
+          make clean CC=x86_64-w64-mingw32-gcc LDFLAGS=-static && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS=-static
+          WINEDEBUG=-all wine ./connect_parity_test.exe
+          make clean
+
+      - name: Check the sensor snapshot hand-over
+        working-directory: samples/input/sensor_snap
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./sensor_snap_test
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 ./sensor_snap_test
+          make clean CC=x86_64-w64-mingw32-gcc LDFLAGS="-static -lpthread" && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS="-static -lpthread"
+          WINEDEBUG=-all wine ./sensor_snap_test.exe
+          make clean
+
       - name: Check WinRaw mouse position-source draining
         working-directory: samples/input/winraw_mouse_pending
         shell: bash
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           make clean all check
           make clean
           make SANITIZER=address,undefined check
@@ -783,6 +851,21 @@ jobs:
           make clean
           echo "[pass] sony_pad_output_test"
 
+      - name: Build and run hid_report_desc_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/input/hid_report_desc
+        run: |
+          set -eu
+          # A gamepad's reports read from its HID report descriptor
+          # (input/common/hid_report_desc.h, which hidraw reads pads
+          # with no handler through): axes numbered as on the Mac, a
+          # hat, buttons by usage, reports with IDs, and nothing read
+          # past a cut descriptor or a short report.
+          make clean && make -j$(nproc) all SANITIZER=address,undefined
+          timeout 60 make check
+          make clean
+          echo "[pass] hid_report_desc_test"
+
       - name: Build and run winraw_joypad_rumble_test (mingw + Wine)
         shell: bash
         working-directory: samples/input/winraw_joypad_rumble
@@ -812,6 +895,24 @@ jobs:
           WINEDEBUG=-all timeout 300 make check
           make clean
           echo "[pass] winraw_joypad_rumble_test (wine)"
+
+      - name: Build and run winraw_joypad_sixaxis_test (mingw + Wine)
+        shell: bash
+        working-directory: samples/input/winraw_joypad_sixaxis
+        run: |
+          set -eu
+          # A DualShock 3 on Sony's sixaxis.sys, or DsHidMini standing
+          # in for it, sends no input reports: the raw input joypad
+          # driver's thread asks for its feature report every few ms
+          # and the poll takes the newest, laid out as the pad's own
+          # HID description. Its motors and light go as that driver's
+          # commands. One on Windows' own HID driver is asked once and
+          # left alone; one whose reports come is no longer asked.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          make clean && make -j$(nproc) all
+          WINEDEBUG=-all timeout 300 make check
+          make clean
+          echo "[pass] winraw_joypad_sixaxis_test (wine)"
 
       - name: Build and run sony_pad_motion_test
         shell: bash
@@ -854,6 +955,7 @@ jobs:
         working-directory: samples/input/net_retropad_repeat
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           # The Remote RetroPad core sends a control's state when it
           # changes, by UDP. The real core is driven by a frontend of
           # a few callbacks and its messages read back over loopback:
@@ -874,6 +976,7 @@ jobs:
         working-directory: samples/input/output_writer
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
           timeout 30 make check
           make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
@@ -979,6 +1082,7 @@ jobs:
         working-directory: samples/input/xinput_rumble
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           # The XInput joypad driver writes rumble from a thread of its
           # own. The real driver is given an XInputSetState that takes
           # 60 ms: the call returns at once, the latest strength is the

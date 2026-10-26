@@ -20,6 +20,67 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
+  metal-frame-lease:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      APT_PKGS: clang libgnustep-base-dev libblocksruntime-dev ffmpeg
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Strict C89 geometry with Clang
+        run: CC=clang python3 samples/gfx/metal_frame/run.py
+      - name: VideoToolbox HEVC parameter ownership and session setup
+        run: |
+          python3 samples/gfx/videotoolbox_hevc/codec_fixtures.py --verify
+          python3 samples/gfx/videotoolbox_hevc/hdr_codec_fixtures.py --verify
+          python3 samples/gfx/videotoolbox_hevc/sequence_fixtures.py --verify
+          CC=clang python3 samples/gfx/videotoolbox_hevc/run.py --apple-limits
+          python3 samples/gfx/videotoolbox_hevc/run.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 samples/gfx/videotoolbox_hevc/run.py
+          python3 samples/gfx/videotoolbox_hevc/run.py --threadless
+          CFLAGS='-DRETRO_ATOMIC_FORCE_VOLATILE -DRETRO_ATOMIC_SUPPRESS_WARNING' python3 samples/gfx/videotoolbox_hevc/run.py
+          TSAN_OPTIONS=halt_on_error=1 CFLAGS='-fsanitize=thread -fno-omit-frame-pointer' RUNNER="setarch $(uname -m) -R" python3 samples/gfx/videotoolbox_hevc/run.py
+      - name: Native recording reinit ownership
+        run: |
+          make -C samples/record/gpu_reinit check CC=gcc SANITIZER=address,undefined
+          make -C samples/record/gpu_reinit clean
+          make -C samples/record/gpu_reinit check CC=clang SANITIZER=address,undefined
+      - name: HEVC software and hardware sequencing regression
+        working-directory: libretro-common/samples/formats/h265
+        run: |
+          make -j2 all SANITIZER=address,undefined
+          ./rh265_malformed_test
+          ./rh265_weight_test
+          ./rh265_lossless_test
+          ./rh265_lossless_test_nothreads
+          ./rh265_lossless_test_volatile
+      - name: Retained Metal lease ownership and completion
+        run: python3 samples/gfx/metal_frame/run.py --mock
+
   video-thread-state:
     name: The video thread reads its snapshot
     runs-on: ubuntu-latest
@@ -47,6 +108,78 @@ jobs:
           # checker with that reason, and the list has to shrink when
           # one of them stops doing it.
           tools/check.sh tools/video_thread_state_check.c
+
+  drm-vkms-live:
+    name: The DRM driver on a real kernel (vkms)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      APT_PKGS: libdrm-dev qemu-system-x86 busybox-static zstd cpio
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      # The kernel the VM boots: Ubuntu's current HWE kernel, fetched
+      # once per version rather than every run
+      - name: Kernel version
+        id: kernel
+        run: echo "kver=$(sh samples/gfx/drm_vkms_live/run_vm.sh --kernel-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore kernel
+        id: kernel-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: samples/gfx/drm_vkms_live/.kernel
+          key: vkms-kernel-${{ steps.kernel.outputs.kver }}
+
+      - name: Build and run drm_vkms_live_test in a VM
+        shell: bash
+        working-directory: samples/gfx/drm_vkms_live
+        run: |
+          set -eu
+          # gfx/drivers/drm_gfx.c against the kernel itself: Ubuntu's
+          # current HWE kernel boots in qemu with vkms, its overlay
+          # planes and its writeback connector, and what the CRTC
+          # composes is read back and compared with the frame - as it
+          # is, turned each way, scanned out of the threaded wrapper's
+          # frame memory, flipped without vsync, under the input overlay
+          # on a plane of its own, at a CRT modeline, and in RGB565 -
+          # and with the screenshot readback. The fake kernel in
+          # drm_surface_lifetime cannot say what a kernel refuses: a
+          # turn set on its own, outside the commit that places the
+          # plane, was refused here.
+          make SANITIZER=address,undefined
+          make check SANITIZER=address,undefined
+
+      - name: Save kernel
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: samples/gfx/drm_vkms_live/.kernel
+          key: vkms-kernel-${{ steps.kernel.outputs.kver }}
 
   surface-requirements:
     name: Producers ask the surface layer
@@ -103,28 +236,189 @@ jobs:
       - name: Regression test
         run: make -C samples/gfx/vulkan_swapchain_extent check
 
+  vulkan-driver-pacing:
+    name: Vulkan driver pacing backend (fake VK_NV_low_latency2 and NVAPI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APT_PKGS: gcc-mingw-w64-x86-64 wine64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Regression test
+        run: |
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # The mode and sleep state machine of the Driver Pacing
+          # backend, on fake entry points: one sleep and one bounded
+          # wait a content frame, markers on the released frame only,
+          # a replaced swapchain starting over, errors falling back.
+          make -C samples/gfx/vulkan_driver_pacing check
+          make -C samples/gfx/vulkan_driver_pacing clean
+          make -C samples/gfx/vulkan_driver_pacing SANITIZER=address,undefined check
+          make -C samples/gfx/vulkan_driver_pacing clean
+          # Windows: presenting through DXGI, the mode, sleep and
+          # markers go through NVAPI (a stand-in nvapi64.dll)
+          make -C samples/gfx/vulkan_driver_pacing CC=x86_64-w64-mingw32-gcc RUNNER=wine check
+          make -C samples/gfx/vulkan_driver_pacing clean
+
+  vulkan-upscaler:
+    name: Vulkan temporal upscaler glue (lavapipe, stand-in NGX, FSR and XeSS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APT_PKGS: libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers gcc-mingw-w64-x86-64 wine64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Regression test
+        run: |
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # gfx/common/vulkan_ngx.c, vulkan_ffx.c, vulkan_xess.c, the
+          # dispatch of vulkan_upscaler.c and gfx/video_upscaler.c on
+          # lavapipe under the validation layer, against stand-in NGX,
+          # FidelityFX API and XeSS libraries: the session, the core's
+          # request, a frame's feature and dispatch parameters, resizes
+          # retiring the old output, refused frames, teardown.
+          make -C samples/gfx/vulkan_upscaler check
+          make -C samples/gfx/vulkan_upscaler clean
+          make -C samples/gfx/vulkan_upscaler SANITIZER=address,undefined check
+          make -C samples/gfx/vulkan_upscaler clean
+          # Windows: the same glue built with mingw; Wine has no Vulkan
+          # device here, so the run only proves the build and the skip
+          make -C samples/gfx/vulkan_upscaler CC=x86_64-w64-mingw32-gcc RUNNER=wine check
+          make -C samples/gfx/vulkan_upscaler clean
+
+  d3d12-upscaler:
+    name: Direct3D 12 temporal upscaler glue (Wine vkd3d on lavapipe, stand-in NGX, FSR and XeSS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APT_PKGS: gcc-mingw-w64-x86-64 wine64 xvfb xauth mesa-vulkan-drivers libvulkan1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Regression test
+        run: |
+          # gfx/common/d3d12_ngx.c, d3d12_ffx.c, d3d12_xess.c, the
+          # dispatch of d3d12_upscaler.c and gfx/video_upscaler.c,
+          # cross-built with mingw, on Wine's D3D12 (vkd3d over
+          # lavapipe, which wants a display) against stand-in NGX,
+          # FidelityFX API and XeSS libraries: the session, the core's
+          # request, a frame's feature and dispatch on the frame's list
+          # with the output read back, resizes retiring the old output,
+          # refused frames, teardown.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          export WINEDEBUG=-all
+          timeout 120 xvfb-run -a sh -c 'wineboot -i && wineserver -w'
+          make -C samples/gfx/d3d12_upscaler
+          xvfb-run -a make -C samples/gfx/d3d12_upscaler check
+          make -C samples/gfx/d3d12_upscaler clean
+
   slang-rect:
     name: Presets read frames where they lie
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-    steps:
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: |
-          set -eu
-          pkgs="build-essential libegl-dev libgl-dev libegl-mesa0 libgl1-mesa-dri"
-          pkgs="$pkgs gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 wine64"
-          for i in 1 2 3; do
-            sudo timeout 90 apt-get update -y \
-              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && break
-            sleep 10
-          done
-          sudo apt-get install -y -qq \
-            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 $pkgs
+    env:
+      APT_PKGS: build-essential libegl-dev libgl-dev libegl-mesa0 libgl1-mesa-dri libspirv-cross-c-shared-dev gcc-mingw-w64-x86-64 wine64
 
+    steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
 
       - name: Link with lld
         run: sh .github/workflows/scripts/use-lld.sh
@@ -145,14 +439,32 @@ jobs:
              timeout 600 make check CHECK_ARGS=--require-gl
           make clean
 
-      - name: Build and run slang_rect_test (mingw-w64, Wine)
+      - name: Build and run rslc_remap_test (ASan + UBSan, llvmpipe)
         shell: bash
-        working-directory: samples/gfx/slang_rect
+        working-directory: samples/gfx/rslc_remap
         run: |
           set -eu
-          make clean CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ \
-             LDFLAGS=-static
-          WINEDEBUG=-all timeout 300 wine ./slang_rect_test.exe
+          # rslc's frame-rectangle remap, which rewrites a stage in the
+          # compiler for every destination: each test shader of
+          # ../slang_rect, sampled each way, comes back as slang_rect.c
+          # says of rslc's own module, prints as GLSL, GLSL ES, HLSL and
+          # MSL, places the rectangle past both stages' blocks, fails
+          # cleanly out of memory; and drawn by Mesa from rslc's GLSL,
+          # every rewritten stage reads the frame bit for bit as the
+          # stage it was reads a texture of its own.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+             timeout 600 make check CHECK_ARGS=--require-gl
+          make clean
+
+      - name: Build and run rslc_remap_test (mingw-w64, Wine)
+        shell: bash
+        working-directory: samples/gfx/rslc_remap
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean CC=x86_64-w64-mingw32-gcc && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS=-static
+          WINEDEBUG=-all timeout 300 wine ./rslc_remap_test.exe
           make clean
 
   slang-last-pass-target:
@@ -160,22 +472,48 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-    steps:
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: |
-          set -eu
-          pkgs="build-essential libgl-dev gcc-mingw-w64-x86-64 wine64"
-          for i in 1 2 3; do
-            sudo timeout 90 apt-get update -y \
-              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && break
-            sleep 10
-          done
-          sudo apt-get install -y -qq \
-            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 $pkgs
+    env:
+      APT_PKGS: build-essential libgl-dev gcc-mingw-w64-x86-64 wine64
 
+    steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Build and run slang_hlsl_backend_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/slang_hlsl_backend
+        run: |
+          set -eu
+          # The real slang_process(): rslc hands a pass back as HLSL for
+          # the Direct3D 10/11/12 drivers, and a preset's simulated
+          # SourceSize reaches the first pass only, from
+          # storage that outlives the semantics the D3D drivers copy.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+             timeout 300 make check SANITIZER=address,undefined
+          make clean
 
       - name: Build and run slang_last_pass_target_test (ASan + UBSan)
         shell: bash
@@ -184,7 +522,7 @@ jobs:
           set -eu
           # The Vulkan and glcore slang chains give a preset's last pass
           # a render target and a hidden copy to the backbuffer only when
-          # glslang_last_pass_needs_target() says so: viewport at 1.0
+          # scale/format or compiled feedback requires it: viewport at 1.0
           # renders direct; other scales, a preset or shader format, and
           # a read of the last pass's feedback keep the target.
           make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
@@ -197,8 +535,32 @@ jobs:
         working-directory: samples/gfx/slang_last_pass_target
         run: |
           set -eu
-          make clean CC=x86_64-w64-mingw32-gcc && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS=-static
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean CC=x86_64-w64-mingw32-gcc && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS="-static -Wl,--gc-sections"
           WINEDEBUG=-all timeout 300 wine ./slang_last_pass_target_test.exe
+          make clean
+
+      - name: Build and run shader_chain_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/shader_chain
+        run: |
+          set -eu
+          # The blob table: a .slang two passes name compiles once, and
+          # a chain built while the one it replaces is alive compiles
+          # only the passes the live chain does not have.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+             timeout 120 make check
+          make clean
+
+      - name: Build and run shader_chain_test (mingw-w64, Wine)
+        shell: bash
+        working-directory: samples/gfx/shader_chain
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean CC=x86_64-w64-mingw32-gcc && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS="-static"
+          WINEDEBUG=-all timeout 300 wine ./shader_chain_test.exe
           make clean
 
       - name: Build and run gl2/gl3 last_pass_fbo tests (ASan + UBSan)
@@ -221,6 +583,7 @@ jobs:
         working-directory: samples/gfx/gl_last_pass_fbo
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           make clean CC=x86_64-w64-mingw32-gcc && make -j$(nproc) all CC=x86_64-w64-mingw32-gcc LDFLAGS=-static
           WINEDEBUG=-all timeout 300 wine ./gl2_last_pass_fbo_test.exe
           WINEDEBUG=-all timeout 300 wine ./gl3_last_pass_fbo_test.exe
@@ -230,6 +593,7 @@ jobs:
         shell: bash
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           CC=x86_64-w64-mingw32-gcc RUNNER="wine" WINEDEBUG=-all \
              python3 samples/gfx/gles_texture_lend/run.py
 
@@ -238,6 +602,7 @@ jobs:
         working-directory: samples/gfx/gl2_pbo_readback
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           # The Linux runs are in the samples-gfx job; this is the
           # Windows build, the GL 1.1 entry points through import
           # pointers (gl11_fakes.h).
@@ -287,75 +652,38 @@ jobs:
   samples-gfx:
     name: Build and run samples/gfx
     runs-on: ubuntu-latest
-    # The gfx_thumbnail_preview step alone is ~5 min: two sanitizer
-    # builds, the video harness under each, and the windowed-animation
-    # harness under ASan over ~70 MB of lossless frames.  20 was cut
-    # too close once the animation harness joined; the run was
-    # cancelled mid-TSan pass.
+    # gfx_thumbnail_preview runs as its own job (thumbnail-preview):
+    # at 5-9 min it was the longest step here, and with package
+    # installation on a slow runner it took the job past 30 min.
     timeout-minutes: 30
+    env:
+      APT_PKGS: build-essential libx11-dev libxrandr-dev libdrm-dev xserver-xorg-core xserver-xorg-video-dummy x11-xserver-utils libsdl2-dev libxinerama-dev libwayland-dev libegl-dev libgles-dev libgbm-dev gcc-mingw-w64-x86-64 wine64 openbox cmake ninja-build ccache libgl-dev xvfb libdbus-1-dev dbus python3-dbus python3-gi weston xwayland mutter libvkd3d1 mesa-vulkan-drivers fonts-dejavu-core fonts-dejavu-mono
 
     steps:
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          pkgs="build-essential libx11-dev libxrandr-dev libdrm-dev"
-          pkgs="$pkgs xserver-xorg-core xserver-xorg-video-dummy x11-xserver-utils libsdl2-dev libxinerama-dev"
-          pkgs="$pkgs libwayland-dev libegl-dev libgles-dev"
-          pkgs="$pkgs gcc-mingw-w64-x86-64 wine64 openbox cmake ninja-build"
-          if dpkg -s $pkgs >/dev/null 2>&1; then
-            echo "All packages already present on runner image; skipping apt."
-            exit 0
-          fi
-          for i in 1 2 3; do
-            sudo timeout 90 apt-get update -y \
-              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && break
-            echo "apt-get update failed (attempt $i); retrying in 10s"
-            sleep 10
-          done
-          # Fetch first, under a bound: a download is safe to stop and
-          # resumes, an install is not. A mirror that stalls is left for
-          # the main archive on the next attempt.
-          for i in 1 2 3; do
-            sudo timeout 240 apt-get install -y --download-only \
-              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
-              $pkgs && break
-            [ $i = 3 ] && exit 1
-            echo "package download failed or stalled (attempt $i); retrying from archive.ubuntu.com"
-            if [ ! -d /etc/apt/ra-orig ]; then
-              sudo mkdir /etc/apt/ra-orig
-              sudo cp -a /etc/apt/sources.list.d /etc/apt/ra-orig/
-              [ ! -f /etc/apt/sources.list ] || sudo cp -a /etc/apt/sources.list /etc/apt/ra-orig/
-            fi
-            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
-              [ -f "$f" ] || continue
-              sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
-                -e 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
-            done
-            # A refresh cut short or refused leaves apt no package lists: it
-            # is retried, without translations or command-not-found data, and
-            # the mirror is put back when the archive will not answer either.
-            upd="-o Acquire::Retries=3 -o Acquire::http::Timeout=30
-              -o Acquire::Languages=none
-              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false
-              -o APT::Update::Error-Mode=any"
-            ok=0
-            for j in 1 2; do
-              sudo timeout 120 apt-get update -y $upd && { ok=1; break; }
-            done
-            if [ $ok = 0 ]; then
-              sudo rm -rf /etc/apt/sources.list.d
-              sudo cp -a /etc/apt/ra-orig/sources.list.d /etc/apt/
-              [ ! -f /etc/apt/ra-orig/sources.list ] || sudo cp -a /etc/apt/ra-orig/sources.list /etc/apt/
-              sudo rm -rf /etc/apt/ra-orig
-              sudo timeout 120 apt-get update -y $upd || true
-            fi
-          done
-          sudo apt-get install -y \
-            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
-            $pkgs
-
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
 
       - name: Link with lld
         run: sh .github/workflows/scripts/use-lld.sh
@@ -371,7 +699,6 @@ jobs:
       - name: Enable ccache
         run: |
           set -eu
-          command -v ccache >/dev/null 2>&1 || sudo apt-get install -y -qq ccache
           export CCACHE_DIR="$HOME/.ccache"
           echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
@@ -503,6 +830,15 @@ jobs:
           timeout 60 ./video_views_test
           echo "[pass] video_views_test"
 
+      - name: Build and run video_windows_test (ASan+UBSan)
+        shell: bash
+        working-directory: samples/gfx/video_windows
+        run: |
+          set -eu
+          make clean all SANITIZER=address,undefined
+          timeout 60 ./video_windows_test
+          echo "[pass] video_windows_test"
+
       - name: Build and run video_xr_test (ASan+UBSan)
         shell: bash
         working-directory: samples/gfx/video_xr
@@ -540,6 +876,20 @@ jobs:
           test -x vulkan_swapchain_clamp_test
           timeout 60 ./vulkan_swapchain_clamp_test
           echo "[pass] vulkan_swapchain_clamp_test"
+
+      - name: Build and run vulkan_output_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/vulkan_output
+        run: |
+          set -eu
+          # The second output's swapchain (vulkan_output_* in
+          # gfx/common/vulkan_common.c), the real code against a fake
+          # device: nothing it does in a frame waits, and nothing is
+          # destroyed before the fence that covers it.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          test -x vulkan_output_test
+          timeout 60 ./vulkan_output_test
+          echo "[pass] vulkan_output_test"
 
       - name: Build and run vulkan_chain_alloc_test (ASan + UBSan)
         shell: bash
@@ -611,7 +961,6 @@ jobs:
         working-directory: samples/gfx/gl2_pbo_readback
         run: |
           set -eu
-          sudo apt-get install -y -qq libgl-dev
           # gfx/drivers/gl2.c's PBO readback ring against a scripted
           # GL: a slot is read only once the fence placed after its
           # readback has signalled, and never waited on in the map. A
@@ -639,6 +988,7 @@ jobs:
       - name: Menu framebuffer loans (ASan/UBSan, TSan)
         shell: bash
         run: |
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 samples/gfx/threaded_video/menu_framebuffer.py
           CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 samples/gfx/threaded_video/vulkan_menu.py
           CFLAGS='-fsanitize=thread -fno-omit-frame-pointer' python3 samples/gfx/threaded_video/menu_framebuffer.py
@@ -1167,7 +1517,6 @@ jobs:
              grep -q FocusChangeMask gfx/drivers_context/$f \
                 || { echo "::error::$f does not select FocusChangeMask"; exit 1; }
           done
-          sudo apt-get install -y -qq xvfb > /dev/null
           Xvfb :97 -screen 0 1024x768x24 > /tmp/xvfb97.log 2>&1 &
           XVFB_PID=$!
           sleep 1
@@ -1236,9 +1585,10 @@ jobs:
                 LSAN_OPTIONS=suppressions=lsan.supp \
                 timeout 120 ./display_servers_sdl2_live_test)
           echo "[pass] display_servers_sdl2_live_test"
-          # The SDL3 server against an SDL3 built from a pinned release
-          # (the runner image ships no libsdl3-dev): video and events
-          # only, X11 backend.
+          # The SDL3 server, audio driver and keyboard against an SDL3
+          # built from a pinned release (the runner image ships no
+          # libsdl3-dev): video, events and the dummy audio device, X11
+          # backend.
           SDL3_VER=3.2.20
           if [ ! -f /opt/sdl3/lib/pkgconfig/sdl3.pc ]; then
              curl -sL -o /tmp/sdl3.tar.gz \
@@ -1246,7 +1596,7 @@ jobs:
              tar -C /tmp -xzf /tmp/sdl3.tar.gz
              cmake -S "/tmp/SDL3-$SDL3_VER" -B /tmp/sdl3-build -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=ON -DSDL_STATIC=OFF \
-                -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_AUDIO=OFF -DSDL_CAMERA=OFF \
+                -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_AUDIO=ON -DSDL_CAMERA=OFF \
                 -DSDL_WAYLAND=OFF -DSDL_X11=ON -DSDL_OPENGL=OFF -DSDL_OPENGLES=OFF \
                 -DSDL_VULKAN=OFF -DSDL_RENDER=OFF -DCMAKE_INSTALL_PREFIX=/opt/sdl3 \
                 > /tmp/sdl3-cmake.log
@@ -1260,15 +1610,38 @@ jobs:
                 LSAN_OPTIONS=suppressions=lsan.supp \
                 timeout 120 ./display_servers_sdl3_live_test)
           echo "[pass] display_servers_sdl3_live_test"
+          (cd samples/audio/sdl3_counters \
+             && PKG_CONFIG_PATH=/opt/sdl3/lib/pkgconfig make clean all SANITIZER=address,undefined \
+             && LD_LIBRARY_PATH=/opt/sdl3/lib SDL_AUDIO_DRIVER=dummy \
+                ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+                LSAN_OPTIONS=suppressions=../../gfx/display_servers_sdl3_live/lsan.supp \
+                timeout 120 ./sdl3_counters_test \
+             && make clean)
+          echo "[pass] sdl3_counters_test"
+          (cd samples/input/sdl3_keyboard \
+             && PKG_CONFIG_PATH=/opt/sdl3/lib/pkgconfig make clean all SANITIZER=address,undefined \
+             && LD_LIBRARY_PATH=/opt/sdl3/lib \
+                ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+                LSAN_OPTIONS=suppressions=../../gfx/display_servers_sdl3_live/lsan.supp \
+                timeout 120 ./sdl3_keyboard_test \
+             && make clean)
+          echo "[pass] sdl3_keyboard_test"
           # The Win32 server, its vendor timing paths and the engine
           # cross-built with mingw-w64 and run under Wine on the same
           # display: Wine backs EnumDisplaySettingsExA and
           # ChangeDisplaySettingsExA with the server's RandR modes, so
           # the CDS listed-mode switch is real; ADL, ATI legacy and
           # PowerStrip are linked and must decline.
+          # Its own Wine prefix: one a Wine program started before the
+          # display was up keeps that display's single mode, and Wine
+          # lists only it.
+          WINE_LIVE_PREFIX=$(mktemp -d)
           (cd samples/gfx/display_servers_win32_live \
              && make clean all \
-             && WINEDEBUG=-all timeout 300 wine ./display_servers_win32_live_test.exe)
+             && WINEPREFIX=$WINE_LIVE_PREFIX WINEDEBUG=-all timeout 300 \
+                wine ./display_servers_win32_live_test.exe)
+          WINEPREFIX=$WINE_LIVE_PREFIX wineserver -k || true
+          rm -rf "$WINE_LIVE_PREFIX"
           echo "[pass] display_servers_win32_live_test (Wine)"
           # The vendor timing paths against stand-ins: a mock
           # atiadlxx.dll that re-plugs the monitor after a forced set,
@@ -1308,8 +1681,6 @@ jobs:
           # and its XWayland: Mutter names XWayland's outputs after its
           # connectors (DP-1, Meta-0), so only the XWAYLAND extension
           # says what the server is.
-          sudo apt-get install -y -qq libdbus-1-dev dbus python3-dbus \
-             python3-gi weston xwayland mutter > /dev/null
           (cd samples/gfx/mutter_displayconfig \
              && make clean all SANITIZER=address,undefined \
              && ASAN_OPTIONS=detect_leaks=1 \
@@ -1338,7 +1709,6 @@ jobs:
           # one's answer, three threads toggling leave what the last one
           # asked, close and reopen release the old inhibit, and no
           # service answers FAILED.
-          sudo apt-get install -y -qq libdbus-1-dev dbus > /dev/null
           make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
              timeout 300 ./run.sh
@@ -1346,10 +1716,23 @@ jobs:
           TSAN_OPTIONS=halt_on_error=1 timeout 300 ./run.sh
           echo "[pass] dbus_screensaver_test"
 
+      - name: Single GL context initialization ownership
+        shell: bash
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CC=gcc CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/threaded_video/gl_context_init.py
+          CC=clang CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/threaded_video/gl_context_init.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/threaded_video/gl_context_init.py
+          CC=gcc CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/threaded_video/gl_context_drain.py
+          CC=clang CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/threaded_video/gl_context_drain.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/threaded_video/gl_context_drain.py
+
       - name: D3D menu source formats (Linux and mingw + Wine)
         shell: bash
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/threaded_video/d3d_menu_format.py
           CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/threaded_video/d3d_menu_format.py
           CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/threaded_video/d3d12_menu.py
@@ -1364,6 +1747,7 @@ jobs:
         shell: bash
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           make -C samples/gfx/d3d8_cleanup clean check SANITIZER=address,undefined
           make -C samples/gfx/d3d8_cleanup clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
           make -C samples/gfx/d3d8_cleanup clean
@@ -1372,6 +1756,7 @@ jobs:
         shell: bash
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           make -C samples/gfx/d3d_feedback clean check SANITIZER=address,undefined
           make -C samples/gfx/d3d_feedback clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
           make -C samples/gfx/d3d_feedback clean
@@ -1380,6 +1765,7 @@ jobs:
         shell: bash
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           make -C samples/gfx/d3d12_mipmaps clean check SANITIZER=address,undefined
           make -C samples/gfx/d3d12_mipmaps clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
           make -C samples/gfx/d3d12_mipmaps clean
@@ -1388,6 +1774,7 @@ jobs:
         shell: bash
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           # H.264, HEVC and VP9 submission buffers, byte by byte
           # and against dxva.h, and the backend itself on a D3D11 that
           # records what it is told. The GPU oracle builds here and
@@ -1400,18 +1787,43 @@ jobs:
         shell: bash
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/movie_gpu_handoff/run.py
+          CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=thread -fno-omit-frame-pointer" python3 samples/gfx/movie_gpu_handoff/run.py
           CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/movie_gpu_handoff/run.py
 
       - name: D3D12 descriptor cache resource lifetime (Linux and mingw + Wine)
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d12_descriptor_cache/run.py
           CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/d3d12_descriptor_cache/run.py
+
+      - name: D3D12 pass descriptor tables on their own slots (Linux and mingw + Wine)
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d12_pass_tables/run.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/d3d12_pass_tables/run.py
+
+      - name: D3D12 repeated screenshots and recording slots (Linux and mingw + Wine)
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d12_readback_slot/run.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/d3d12_readback_slot/run.py
+
+      - name: D3D12 frame ring, one frame in flight or two (Linux and mingw + Wine)
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d12_frame_ring/run.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/d3d12_frame_ring/run.py
 
       - name: D3D10/11 failed maps and swapchain recovery (Linux and mingw + Wine)
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d_failure_paths/run.py
           CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/d3d_failure_paths/run.py
             CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d_failure_paths/upload.py
@@ -1424,6 +1836,7 @@ jobs:
       - name: D3D9 HLSL failed locks (Linux and mingw + Wine)
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           CFLAGS="-O1 -g -std=c89 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" python3 samples/gfx/d3d9_failed_lock/run.py
           CC=x86_64-w64-mingw32-gcc RUNNER=wine python3 samples/gfx/d3d9_failed_lock/run.py
 
@@ -1431,6 +1844,7 @@ jobs:
         shell: bash
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           make -C samples/gfx/vulkan_video_caps clean check SANITIZER=address,undefined
           make -C samples/gfx/vulkan_video_caps clean check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
           make -C samples/gfx/vulkan_video_caps clean
@@ -1452,6 +1866,7 @@ jobs:
         shell: bash
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           make -C samples/gfx/record_gpu_queue clean check
           make -C samples/gfx/record_gpu_queue clean check THREADS=1 SANITIZE=-fsanitize=address,undefined
           make -C samples/gfx/record_gpu_queue clean check THREADS=1 SANITIZE=-fsanitize=thread
@@ -1461,6 +1876,7 @@ jobs:
         shell: bash
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           make -C samples/gfx/nvenc_d3d12 check
           make -C samples/gfx/nvenc_d3d12 check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
 
@@ -1476,7 +1892,6 @@ jobs:
           # implements deferred contexts over OpenGL. Requires the ring
           # and the immediate context to show every frame, and the ring
           # as it used to be to fail.
-          sudo apt-get install -y -qq xvfb > /dev/null
           samples/gfx/d3d11_hw_ring/run.sh
 
       - name: libretro_d3d11.h version 2, the contract run (mingw + Wine, headless)
@@ -1491,7 +1906,6 @@ jobs:
           # D3D11 device (wined3d), and requires every frame and every
           # readback to be right, and a core that ignores what
           # lock_context tells it to be caught.
-          sudo apt-get install -y -qq xvfb > /dev/null
           REQUIRE_D3D11=1 samples/gfx/d3d11_hw_interface_v2/run.sh
 
       - name: libretro_d3d12.h version 2, the contract run (mingw + Wine + vkd3d, headless)
@@ -1505,7 +1919,6 @@ jobs:
           # over Mesa's software Vulkan driver - and requires every frame
           # to arrive intact, and a core that ignores wait_sync_index to
           # be caught.
-          sudo apt-get install -y -qq xvfb libvkd3d1 mesa-vulkan-drivers > /dev/null
           REQUIRE_D3D12=1 samples/gfx/d3d12_hw_interface_v2/run.sh
 
       - name: D3D texture pokes marshal onto the video thread (mingw, object check)
@@ -1531,8 +1944,8 @@ jobs:
           # script - then makes and destroys the window through twenty
           # fullscreen toggles. Any difference from the recorded trace
           # fails.
-          sudo apt-get install -y -qq xvfb > /dev/null
           samples/gfx/win32_window_proc/run.sh
+          python3 samples/gfx/win32_window_proc/modal_frame_run.py
 
       - name: Build and run window_driver_test for Windows (Wine)
         shell: bash
@@ -1609,12 +2022,167 @@ jobs:
           # the live surface's dumb buffers, framebuffers and mappings,
           # the framebuffer the plane scans out is never removed from
           # under it, and the driver's free leaves nothing - LeakSanitizer
-          # holds the plane queries' libdrm objects to the same.
+          # holds the plane queries' libdrm objects to the same. Rows the
+          # kernel pads are written at its stride, each frame read at its
+          # own pitch, the next page lent to the core and flipped without
+          # a copy, a dupe survived, and no allocation made per flip. The
+          # menu scans out RGUI's RGBA4444 as it is where the plane takes
+          # it, is lent to RGUI, follows the frame's size, and asks the
+          # plane once rather than every menu frame. Every framebuffer is
+          # made in its surface's own format, which no legacy depth names
+          # for RGBX4444. The input overlay goes on a plane of its own,
+          # raised above the frame's and blending premultiplied, covering
+          # only its images, composed when something changes and flipped
+          # in the frame's own commit; where no plane can take it, it is
+          # blended into the frame. Init passes over a card with no
+          # display, keeps the console's mode or a fullscreen size's,
+          # switches mode with the planes, flips without atomic commits
+          # where the card has none, fails cleanly with no plane for
+          # frames, and the free turns the plane off and gives the
+          # console back its framebuffer and mode. A core's rotation is
+          # made by the plane where its rotation property takes it, and
+          # the frame still lent; otherwise, or under a blended overlay,
+          # the copy turns it and nothing is lent. The menu is shown
+          # unturned, the plane is left unturned, and a screenshot reads
+          # the frame back as it is shown. Without vsync, commits do not
+          # wait: one per vblank, none refused, a frame that comes before
+          # the last is on screen written over, the page written next
+          # never the one on screen or on its way; a resize, the menu, a
+          # mode switch and the free wait for the flip first, and vsync
+          # turned back on waits again. The threaded wrapper's frame
+          # memory is scanned out where a frame lies, from inside a
+          # buffer too, never written while shown or on its way, freed
+          # only once the plane has left it, and copied where the display
+          # refuses the pitch or the copy turns the frame. The CRT
+          # switch's modeline is set at init and on a mode switch, HDMI
+          # timings from the config, malformed ones passed over, and the
+          # aspect the switch puts taken up with the next frame; content
+          # running under the menu is never flipped over it, and its last
+          # frame goes up when the menu closes. On-screen messages are
+          # drawn into the frame where they are seen, at the size the
+          # screen shows, upright on a frame the plane turns, and a frame
+          # in the wrapper's memory is copied to be drawn on. A blended
+          # overlay is blended into a core's views as into a frame. The
+          # driver is built with sign-compare as an error and linked
+          # without rthreads, so it stays clean of both. A turn goes in
+          # the commit that places the plane, never on its own, and a
+          # frame placed otherwise in a frame memory buffer still shown
+          # is copied rather than its framebuffer removed.
           make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
              timeout 60 ./drm_surface_lifetime_test
           make clean
           echo "[pass] drm_surface_lifetime_test"
+
+      - name: Build and run drm_crtc_pick_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/drm_crtc_pick
+        run: |
+          set -eu
+          # gfx/common/drm_common.c against a fake kernel: a connector
+          # nothing drives yet (a display plugged in after boot) gets an
+          # encoder and a CRTC that is off, a CRTC that was off is
+          # switched off again on restore, a size the display lacks falls
+          # back to mode 0, only a display in use going away (or
+          # coming back) restarts the video driver on a hotplug, and the
+          # flip wait notes a hotplug in its own poll without spinning on
+          # the unread socket.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./drm_crtc_pick_test
+          make clean
+          echo "[pass] drm_crtc_pick_test"
+
+      - name: Build and run exynos_g2d_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/exynos_g2d
+        run: |
+          set -eu
+          # gfx/drivers/exynos_gfx.c against a fake kernel and a G2D that
+          # draws into the GEM buffers: the frame at its aspect ratio, a
+          # core rendering into the buffer the G2D reads, vsync off
+          # neither waiting nor queueing flips, messages and statistics
+          # cleared and blended over only what they cover, the menu's
+          # alpha, screenshots, mode switches and CRT modelines, and a
+          # free and a failed init that leave nothing behind. Behind an
+          # IOMMU, frames read from the core's own memory - the kernel
+          # reuses a mapping unsynced, so a frame must never come
+          # through one - and the input overlay blended by the G2D,
+          # mirrored where its quad is; a core's rotation, turned as
+          # the frame is copied.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./exynos_g2d_test
+          make clean
+          echo "[pass] exynos_g2d_test"
+
+      - name: Build and run egl_gbm_frames_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/egl_gbm_frames
+        run: |
+          set -eu
+          # gfx/common/egl_gbm_frames.c against a fake GBM, EGL and GPU:
+          # a format the GPU samples where the CPU writes it is taken, one
+          # mapped through staging memory refused for the rest of the run;
+          # a buffer a texture holds, one a draw may still read and the
+          # last frame's are never lent; the check puts the GL state back,
+          # and the free leaves no buffer, map, image, fence or fd.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./egl_gbm_frames_test
+          make clean
+          echo "[pass] egl_gbm_frames_test"
+
+      - name: egl_gbm_frames check on a real GL (Mesa EGL, GLES 2 and desktop GL)
+        shell: bash
+        run: |
+          set -eu
+          # The check gfx/common/egl_gbm_frames.c runs before a format is
+          # first used, on llvmpipe: GBM and the dma-buf import are
+          # stand-ins, the shader, target, draw and readback the GL's own.
+          # A buffer sampled as written passes in both formats; one whose
+          # writes are never seen fails, and is not tried again.
+          T=$(mktemp -d)
+          for api in es2 gl; do
+             if [ $api = es2 ]; then
+                D="-DHAVE_OPENGLES -DHAVE_OPENGLES2"
+                L="libretro-common/glsym/glsym_es2.c -lEGL -lGLESv2"
+             else
+                D="-DHAVE_OPENGL"
+                L="libretro-common/glsym/glsym_gl.c -lEGL -lGL"
+             fi
+             cc -std=gnu89 -O1 -g1 -Wall -Werror=implicit-function-declaration \
+                -fsanitize=address,undefined -fno-omit-frame-pointer \
+                -DHAVE_KMS -DHAVE_EGL $D -I. -Ilibretro-common/include \
+                -Igfx/include $(pkg-config --cflags libdrm) \
+                samples/gfx/egl_gbm_frames/mesa_check.c gfx/common/egl_gbm_frames.c \
+                libretro-common/glsym/rglgen.c $L \
+                -Wl,--wrap=eglGetProcAddress,--wrap=eglQueryString,--wrap=glDrawArrays \
+                -o "$T/check_$api"
+             for mode in seen blind; do
+                EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1 \
+                   ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
+                   "$T/check_$api" $mode
+             done
+          done
+          rm -rf "$T"
+
+      - name: Build and run gl2_kms_frames_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/gl2_kms_frames
+        run: |
+          set -eu
+          # gfx/drivers/gl2.c's frames in scanout memory against a
+          # scripted egl_gbm_frames: on KMS a plain software frame is lent
+          # from the buffers, never to a core that reads it back, a
+          # hardware core, mipmaps or a 10-bit source; a lent frame becomes
+          # the frame texture's storage with no upload, and any other gets
+          # the texture's own storage back before it goes up.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./gl2_kms_frames_test
+          make clean
+          echo "[pass] gl2_kms_frames_test"
 
       - name: Build and run wayland_wlr_output_test (ASan + UBSan)
         shell: bash
@@ -1847,8 +2415,6 @@ jobs:
           # OpenVG and SDL2 drivers - OpenVG onto a software OpenVG in
           # the test, SDL2 through its own software renderer - and check
           # every glyph texel lands where it should.
-          sudo apt-get install -y -qq fonts-dejavu-core fonts-dejavu-mono \
-             > /dev/null 2>&1 || sudo apt-get install -y -qq fonts-dejavu-core > /dev/null
           make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
           ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
           UBSAN_OPTIONS=print_stacktrace=1 timeout 120 make check SANITIZER=address,undefined
@@ -1951,6 +2517,7 @@ jobs:
         working-directory: samples/gfx/gfx_surface_still
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           # A still keeps the texture up until the new one has landed,
           # updates a same-size image in place, and is freed by the
           # completion of an upload or decode still out when it goes.
@@ -2050,6 +2617,128 @@ jobs:
           [ "$rc" = 0 ]
           make clean
 
+      - name: Shared media transport controls (C89, ASan, UBSan, TSan)
+        shell: bash
+        working-directory: samples/gfx/media_controls
+        run: |
+          set -eu
+          make -B check THREADS=0
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 make -B check SANITIZER=address,undefined
+          TSAN_OPTIONS=halt_on_error=1 make -B check SANITIZER=thread
+
+      - name: MinGW strict C89 float math
+        run: CC=x86_64-w64-mingw32-gcc WINEDEBUG=-all python3 samples/gfx/mingw_c89_math/run.py
+
+      - name: Vulkan synchronous readback slot
+        run: python3 samples/gfx/vulkan_readback_slot/run.py
+
+      - name: D3D11 resized readback destination guard
+        run: python3 samples/gfx/d3d11_readback_resize/run.py
+
+      - name: Build and run hw_ring_fence_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/gfx/hw_ring_fence
+        run: |
+          set -u
+          set -o pipefail
+          # The hardware ring's fence handoff between the video thread
+          # and the core's thread (gfx/video_thread_hw_fence.h), the
+          # tree's own header, with two threads at one slot: a fence is
+          # signalled only while idle, waited only once signalled, and
+          # never inside two calls at once - with no lock. The single
+          # re-signalled fence it replaced is built too and must fail.
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          timeout 120 make check SANITIZER=address,undefined
+          echo "[pass] hw_ring_fence_test (ASan + UBSan)"
+          # The two threads share nothing but atomics, and TSan is
+          # what says so.
+          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 make check SANITIZER=thread
+          echo "[pass] hw_ring_fence_test (TSan)"
+          make clean
+
+      - name: Build and run hw_ring_queue_test (ASan + UBSan, TSan)
+        working-directory: samples/gfx/hw_ring_queue
+        shell: bash
+        run: |
+          set -euo pipefail
+          make clean
+          make check SANITIZER=address,undefined
+          make clean
+          make check SANITIZER=thread
+          make clean
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+
+  thumbnail-preview:
+    name: The file browser's video preview (gfx_thumbnail_preview)
+    runs-on: ubuntu-latest
+    # Two sanitizer builds, the video harness under each, and the
+    # windowed-animation harness under ASan over ~70 MB of lossless
+    # frames: 5 to 9 minutes, in parallel with samples-gfx rather than
+    # inside its budget.
+    timeout-minutes: 20
+    env:
+      APT_PKGS: ffmpeg ccache zlib1g-dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 250M
+          ccache -z
+
       - name: Build and run gfx_thumbnail_preview_test (ASan + UBSan, TSan)
         shell: bash
         working-directory: samples/gfx/gfx_thumbnail_preview
@@ -2110,7 +2799,6 @@ jobs:
           # window boundary the assertions rest on (the feeder moves
           # at AUDIO_BYTES_PER_TICK, not per frame).  The job timeout
           # goes to 20 min to leave headroom for the slowest runner.
-          sudo apt-get install -y -o Acquire::Retries=3 -o Acquire::http::Timeout=30 ffmpeg
           make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
           make fixtures
           test -x gfx_thumbnail_preview_test
@@ -2119,6 +2807,15 @@ jobs:
           AUDIO_BYTES_PER_TICK=65536 FRAMES=120 timeout 300 \
              ./gfx_thumbnail_preview_test fixtures/*.mp4 fixtures/anim_lossless.webp
           echo "[pass] gfx_thumbnail_preview_test (ASan)"
+          mkdir -p fixtures/packet_span
+          ffmpeg -v error -y -f lavfi \
+             -i 'testsrc2=size=1280x720:rate=1,noise=alls=100:allf=t+u:all_seed=10' \
+             -t 3 -c:v libx264 -preset ultrafast -qp 0 -pix_fmt yuv420p \
+             -moov_size 16777216 fixtures/packet_span/large.mp4
+          for bin in gfx_thumbnail_preview_test gfx_thumbnail_preview_test_threaded; do
+             ASAN_OPTIONS=detect_leaks=1 MP4_PACKET_SPAN=1 timeout 120 \
+                ./$bin fixtures/packet_span/large.mp4
+          done
           # HDR previews: with HDR_OUTPUT the stub driver keeps half
           # floats and shows them as linear scRGB, and the PQ-tagged
           # fixture must animate as them on the PQ EOTF of its grey; its
@@ -2223,6 +2920,39 @@ jobs:
              ./preview_audio_oracle_test fixtures/trailing_small.mp4 fixtures/trailing_large.mp4
           echo "[pass] preview_audio_oracle_test (ASan)"
           ./preview_audio_feed_test fixtures/audio_large_packet.m4a
+          ./preview_audio_feed_test --prepared-only fixtures/audio_seek_gap.m4a
+          make audio-timeline-check SANITIZER=address,undefined
+          ./preview_audio_feed_test --prepared-webm fixtures/audio-movie-timeline/timeline-aac-0.mkv fixtures/audio-movie-timeline/timeline-aac-1.mkv
+          ./preview_audio_feed_test --prepared-webm fixtures/audio_seek_opus.weba fixtures/audio_seek_vorbis.weba fixtures/audio_seek_opus_window.webm fixtures/audio_seek_vorbis_window.webm
+          CPU_GAP=1 ./gfx_thumbnail_preview_test fixtures/video_gap_head.webm
+          CPU_GAP=1 ./gfx_thumbnail_preview_test_threaded fixtures/video_gap_head.webm
+          CPU_GAP=1 CPU_GAP_FRAMES=48 ./gfx_thumbnail_preview_test fixtures/video_gap_pin.webm
+          CPU_GAP=1 CPU_GAP_FRAMES=48 ./gfx_thumbnail_preview_test_threaded fixtures/video_gap_pin.webm
+          CPU_GAP=1 CPU_GROUP=1 CPU_GAP_FRAMES=48 ./gfx_thumbnail_preview_test fixtures/video_group.webm
+          CPU_GAP=1 CPU_GROUP=1 CPU_GAP_FRAMES=48 ./gfx_thumbnail_preview_test_threaded fixtures/video_group.webm
+          GROUP_SEEK=1 ./gfx_thumbnail_preview_test fixtures/video_group.webm
+          GROUP_SEEK=1 ./gfx_thumbnail_preview_test_threaded fixtures/video_group.webm
+          for codec in opus vorbis; do
+            python3 webm_audio_padding.py --audio-group-void fixtures/audio_group_"$codec".webm fixtures/audio_refill_"$codec".webm
+          done
+          python3 webm_audio_padding.py --audio-group-void fixtures/audio_group_aac.mkv fixtures/audio_refill_aac.mkv
+          ./preview_audio_feed_test --continuous-webm fixtures/audio_refill_opus.webm
+          ./preview_audio_feed_test --continuous-webm fixtures/audio_refill_vorbis.webm
+          AUDIO_MOVIE_LOOPS=1 ./preview_audio_feed_test --continuous-webm fixtures/audio_refill_aac.mkv
+          ./preview_audio_feed_test --prepared-webm fixtures/audio_group_aac.mkv
+          ./preview_audio_feed_test --prepared-webm fixtures/audio_group_opus.webm fixtures/audio_group_vorbis.webm
+          AUDIO_FEED_RACE=1 ./preview_audio_feed_test_threaded --continuous-webm fixtures/audio_refill_opus.webm
+          AUDIO_FEED_RACE=1 ./preview_audio_feed_test_threaded --continuous-webm fixtures/audio_refill_vorbis.webm
+          make -B -j2 preview_audio_feed_test preview_audio_feed_test_threaded COUNT_IO=1 SANITIZER=address,undefined
+          ./preview_audio_feed_test --seek-batch
+          ./preview_audio_feed_test_threaded --seek-batch
+          CPU_MEDIA=1 TRANSPORT_PAUSE=1 TRANSPORT_SEEK=1 ./gfx_thumbnail_preview_test fixtures/trailing_small.mp4
+          CPU_MEDIA=1 TRANSPORT_PAUSE=1 TRANSPORT_SEEK=1 ./gfx_thumbnail_preview_test_threaded fixtures/trailing_small.mp4
+          python3 movie_timeline_fixtures.py fixtures/movie-timeline
+          for fixture in video-timeline-1.mp4 video-timeline-libopus.webm video-timeline-libvorbis.webm; do
+            FRONTEND_TIMELINE=1 ./gfx_thumbnail_preview_test fixtures/movie-timeline/"$fixture"
+            FRONTEND_TIMELINE=1 ./gfx_thumbnail_preview_test_threaded fixtures/movie-timeline/"$fixture"
+          done
           # clean keeps fixtures/ by design; regenerate anyway so the
           # step cannot silently run against an empty glob.
           make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
@@ -2236,6 +2966,16 @@ jobs:
           THREADS=4 FRAMES=180 PACE_HZ=60 PACE_MAX_STALL_MS=1500 NOAUDIO=1 timeout 300 \
              ./gfx_thumbnail_preview_test_threaded fixtures/bframes_h264.mp4 fixtures/bframes_hevc.mp4
           echo "[pass] gfx_thumbnail_preview_test_threaded (TSan, 4 threads)"
+          CPU_MEDIA=1 TRANSPORT_PAUSE=1 TRANSPORT_SEEK=1 TSAN_OPTIONS=halt_on_error=1 timeout 120 ./gfx_thumbnail_preview_test_threaded fixtures/trailing_small.mp4
+          for fixture in video-timeline-1.mp4 video-timeline-libopus.webm video-timeline-libvorbis.webm; do
+            FRONTEND_TIMELINE=1 TSAN_OPTIONS=halt_on_error=1 timeout 120 ./gfx_thumbnail_preview_test_threaded fixtures/movie-timeline/"$fixture"
+          done
+          for codec in opus vorbis; do
+            AUDIO_MOVIE_LOOPS=1 AUDIO_FEED_RACE=1 TSAN_OPTIONS=halt_on_error=1 timeout 120 \
+              ./preview_audio_feed_test_threaded --continuous-webm fixtures/audio_refill_"$codec".webm
+          done
+          AUDIO_MOVIE_LOOPS=1 AUDIO_FEED_RACE=1 TSAN_OPTIONS=halt_on_error=1 timeout 120 \
+            ./preview_audio_feed_test_threaded --continuous-webm fixtures/audio_refill_aac.mkv
           # The pool and the tile-column threads under TSan: the
           # shared frame buffers and contexts are written in disjoint
           # columns, the counts merged after the join.
@@ -2255,47 +2995,8 @@ jobs:
              ./preview_audio_decode_test fixtures/trailing_large.mp4 262144 island'
           echo "[pass] preview_audio_decode_test (TSan)"
 
-      - name: Build and run hw_ring_fence_test (ASan + UBSan, TSan)
-        shell: bash
-        working-directory: samples/gfx/hw_ring_fence
-        run: |
-          set -u
-          set -o pipefail
-          # The hardware ring's fence handoff between the video thread
-          # and the core's thread (gfx/video_thread_hw_fence.h), the
-          # tree's own header, with two threads at one slot: a fence is
-          # signalled only while idle, waited only once signalled, and
-          # never inside two calls at once - with no lock. The single
-          # re-signalled fence it replaced is built too and must fail.
-          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
-          timeout 120 make check SANITIZER=address,undefined
-          echo "[pass] hw_ring_fence_test (ASan + UBSan)"
-          # The two threads share nothing but atomics, and TSan is
-          # what says so.
-          make clean SANITIZER=thread && make -j$(nproc) all SANITIZER=thread
-          TSAN_OPTIONS=halt_on_error=1 timeout 120 make check SANITIZER=thread
-          echo "[pass] hw_ring_fence_test (TSan)"
-          make clean
-
-      - name: Build and run hw_ring_queue_test (ASan + UBSan, TSan)
-        working-directory: samples/gfx/hw_ring_queue
-        shell: bash
-        run: |
-          set -euo pipefail
-          make clean
-          make check SANITIZER=address,undefined
-          make clean
-          make check SANITIZER=thread
-          make clean
-
-      - name: ccache statistics
-        if: ${{ !cancelled() }}
-        continue-on-error: true
-        run: ccache -sv
-
       - name: Save ccache
-        # Only master's pushes keep a cache: pull requests restore
-        # master's, so one push does not evict the next one's.
+        # Only master's pushes keep a cache, as in samples-gfx
         if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: actions/cache/save@v4
         with:
